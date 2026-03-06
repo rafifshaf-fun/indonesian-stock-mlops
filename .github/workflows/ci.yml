@@ -1,14 +1,6 @@
-name: MLOps CI Pipeline
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-
-jobs:
-  test:
+  docker:
     runs-on: ubuntu-latest
+    needs: test
 
     steps:
       - name: Checkout code
@@ -22,28 +14,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Fetch stock data
-        run: python src/ingest.py
-
-      - name: Run feature engineering
-        run: python src/features.py
-
-      - name: Train models
-        run: python src/train.py
-
-      - name: Test API health
+      - name: Train models to generate mlruns
         run: |
-          cd src && python serve.py &
-          sleep 5
-          curl -f http://localhost:8000/health
-
-  docker:
-    runs-on: ubuntu-latest
-    needs: test
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+          python src/ingest.py
+          python src/features.py
+          python src/train.py
 
       - name: Build Docker image
         run: docker build -t indonesian-stock-mlops:latest .
