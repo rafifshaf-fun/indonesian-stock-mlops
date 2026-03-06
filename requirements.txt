@@ -142,6 +142,7 @@ SQLAlchemy==2.0.48
 sqlparse==0.5.5
 sqltrie==0.11.2
 starlette==0.52.1
+ta==0.11.0
 tabulate==0.10.0
 threadpoolctl==3.6.0
 tomlkit==0.14.0
