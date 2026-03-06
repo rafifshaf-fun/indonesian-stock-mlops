@@ -1,3 +1,42 @@
+name: MLOps CI Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch stock data
+        run: python src/ingest.py
+
+      - name: Run feature engineering
+        run: python src/features.py
+
+      - name: Train models
+        run: python src/train.py
+
+      - name: Test API health
+        run: |
+          cd src && python serve.py &
+          sleep 5
+          curl -f http://localhost:8000/health
+
   docker:
     runs-on: ubuntu-latest
     needs: test
