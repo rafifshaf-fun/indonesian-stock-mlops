@@ -8,8 +8,11 @@ from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from xgboost import XGBClassifier
 import os
 
-mlflow.set_tracking_uri("./mlruns")
-FEATURES_PATH = "data/processed/features.csv"
+# Absolute path regardless of where script is run from
+MLRUNS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "mlruns")
+mlflow.set_tracking_uri(MLRUNS_PATH)
+
+FEATURES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "processed", "features.csv")
 MLFLOW_EXPERIMENT = "indonesian-stock-prediction"
 
 def load_features(path: str) -> pd.DataFrame:
@@ -29,15 +32,13 @@ def train(ticker: str = "BBCA.JK"):
 
     X, y = prepare_xy(df)
 
-    # Use TimeSeriesSplit — never shuffle time series data!
     tscv = TimeSeriesSplit(n_splits=5)
-    
+
     params = {
         "n_estimators": 100,
         "max_depth": 4,
         "learning_rate": 0.05,
         "subsample": 0.8,
-        "use_label_encoder": False,
         "eval_metric": "logloss",
         "random_state": 42
     }
@@ -69,14 +70,12 @@ def train(ticker: str = "BBCA.JK"):
             f1s.append(f1_score(y_val, preds))
             aucs.append(roc_auc_score(y_val, proba))
 
-        # Log averaged metrics across folds
         mlflow.log_metric("avg_accuracy", np.mean(accs))
         mlflow.log_metric("avg_f1", np.mean(f1s))
         mlflow.log_metric("avg_roc_auc", np.mean(aucs))
 
         print(f"Accuracy: {np.mean(accs):.4f} | F1: {np.mean(f1s):.4f} | AUC: {np.mean(aucs):.4f}")
 
-        # Train final model on all data and log it
         scaler_final = StandardScaler()
         X_all = scaler_final.fit_transform(X)
         final_model = XGBClassifier(**params)
@@ -87,15 +86,15 @@ def train(ticker: str = "BBCA.JK"):
 
 if __name__ == "__main__":
     TICKERS = [
-    "AADI.JK", "ADMR.JK", "ADRO.JK", "AKRA.JK", "AMMN.JK",
-    "AMRT.JK", "ANTM.JK", "ARTO.JK", "ASII.JK", "BBCA.JK",
-    "BBNI.JK", "BBRI.JK", "BBTN.JK", "BMRI.JK", "BREN.JK",
-    "BRIS.JK", "BRPT.JK", "CPIN.JK", "CTRA.JK", "EXCL.JK",
-    "GOTO.JK", "ICBP.JK", "INCO.JK", "INDF.JK", "INKP.JK",
-    "ISAT.JK", "ITMG.JK", "JPFA.JK", "JSMR.JK", "KLBF.JK",
-    "MAPA.JK", "MAPI.JK", "MBMA.JK", "MDKA.JK", "MEDC.JK",
-    "PGAS.JK", "PGEO.JK", "PTBA.JK", "SIDO.JK", "SMGR.JK",
-    "SMRA.JK", "TLKM.JK", "TOWR.JK", "UNTR.JK", "UNVR.JK",
-]
+        "AADI.JK", "ADMR.JK", "ADRO.JK", "AKRA.JK", "AMMN.JK",
+        "AMRT.JK", "ANTM.JK", "ARTO.JK", "ASII.JK", "BBCA.JK",
+        "BBNI.JK", "BBRI.JK", "BBTN.JK", "BMRI.JK", "BREN.JK",
+        "BRIS.JK", "BRPT.JK", "CPIN.JK", "CTRA.JK", "EXCL.JK",
+        "GOTO.JK", "ICBP.JK", "INCO.JK", "INDF.JK", "INKP.JK",
+        "ISAT.JK", "ITMG.JK", "JPFA.JK", "JSMR.JK", "KLBF.JK",
+        "MAPA.JK", "MAPI.JK", "MBMA.JK", "MDKA.JK", "MEDC.JK",
+        "PGAS.JK", "PGEO.JK", "PTBA.JK", "SIDO.JK", "SMGR.JK",
+        "SMRA.JK", "TLKM.JK", "TOWR.JK", "UNTR.JK", "UNVR.JK",
+    ]
     for ticker in TICKERS:
         train(ticker)
