@@ -2,6 +2,6 @@ global:
   scrape_interval: 15s
 
 scrape_configs:
-  - job_name: "stock-prediction-api"
+  - job_name: "stock-api"
     static_configs:
       - targets: ["api:8000"]

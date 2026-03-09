@@ -8,9 +8,8 @@ from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from xgboost import XGBClassifier
 import os
 
-# Absolute path regardless of where script is run from
 MLRUNS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "mlruns")
-mlflow.set_tracking_uri(MLRUNS_PATH)
+mlflow.set_tracking_uri(f"file:///{MLRUNS_PATH.replace(os.sep, '/')}")
 
 FEATURES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "processed", "features.csv")
 MLFLOW_EXPERIMENT = "indonesian-stock-prediction"
@@ -74,7 +73,7 @@ def train(ticker: str = "BBCA.JK"):
         mlflow.log_metric("avg_f1", np.mean(f1s))
         mlflow.log_metric("avg_roc_auc", np.mean(aucs))
 
-        print(f"Accuracy: {np.mean(accs):.4f} | F1: {np.mean(f1s):.4f} | AUC: {np.mean(aucs):.4f}")
+        print(f"[{ticker}] Accuracy: {np.mean(accs):.4f} | F1: {np.mean(f1s):.4f} | AUC: {np.mean(aucs):.4f}")
 
         scaler_final = StandardScaler()
         X_all = scaler_final.fit_transform(X)

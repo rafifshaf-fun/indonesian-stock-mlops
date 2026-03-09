@@ -14,7 +14,7 @@ from prometheus_client import Counter, Histogram
 from ta import add_all_ta_features
 from ta.utils import dropna
 
-mlflow.set_tracking_uri("http://host.docker.internal:5000")
+mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow:5000"))
 
 app = FastAPI(title="Indonesian Stock Prediction API", version="1.0.0")
 Instrumentator().instrument(app).expose(app)
@@ -50,12 +50,29 @@ def load_best_model(ticker: str):
     if not runs:
         raise HTTPException(status_code=404, detail=f"No model found for ticker {ticker}")
     run_id = runs[0].info.run_id
-    model = mlflow.sklearn.load_model(f"runs:/{run_id}/model")
+    experiment_id = experiment.experiment_id
+
+    # Scan models/ directory to find the model matching this run_id
+    models_dir = f"/mlruns/{experiment_id}/models"
+    model_path = None
+    for model_folder in os.listdir(models_dir):
+        mlmodel_file = f"{models_dir}/{model_folder}/artifacts/MLmodel"
+        if os.path.exists(mlmodel_file):
+            with open(mlmodel_file, "r") as f:
+                content = f.read()
+            if f"run_id: {run_id}" in content:
+                model_path = f"{models_dir}/{model_folder}/artifacts"
+                break
+
+    if not model_path:
+        raise HTTPException(status_code=404, detail=f"Model files not found for {ticker}")
+
+    model = mlflow.sklearn.load_model(model_path)
     model_cache[ticker] = model
     return model
 
 class PredictRequest(BaseModel):
-    ticker: str  # e.g. "BBCA.JK"
+    ticker: str
 
 class PredictResponse(BaseModel):
     ticker: str
@@ -83,38 +100,26 @@ def list_tickers():
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(request: PredictRequest):
-    # Fetch latest market data and compute features automatically
     df = yf.download(request.ticker, period="60d", auto_adjust=True, progress=False)
-
     if df.empty:
         raise HTTPException(status_code=400, detail=f"No data found for {request.ticker}")
-
-    # Flatten MultiIndex columns if present
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.droplevel(1)
-
     df = dropna(df)
     df = add_all_ta_features(
         df, open="Open", high="High", low="Low",
         close="Close", volume="Volume", fillna=True
     )
-
-    # Use the latest row as prediction input
     latest = df.iloc[[-1]].select_dtypes(include=[np.number])
-
     model = load_best_model(request.ticker)
-
     try:
         prediction = int(model.predict(latest)[0])
         probability = float(model.predict_proba(latest)[0][1])
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Prediction error: {str(e)}")
-
     signal = "BUY" if prediction == 1 else "SELL"
-
     PREDICTION_COUNTER.labels(ticker=request.ticker, signal=signal).inc()
     CONFIDENCE_HISTOGRAM.labels(ticker=request.ticker).observe(probability)
-
     return PredictResponse(
         ticker=request.ticker,
         prediction=prediction,
