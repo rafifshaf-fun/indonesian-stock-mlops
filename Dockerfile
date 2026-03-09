@@ -11,4 +11,7 @@ WORKDIR /app/src
 
 EXPOSE 8000
 
+COPY src/ ./src/
+COPY src/config.py ./config.py   
+
 CMD ["python", "serve.py"]

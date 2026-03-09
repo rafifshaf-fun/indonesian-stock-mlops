@@ -8,6 +8,7 @@ from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from xgboost import XGBClassifier
 import os
 
+mlflow.set_tracking_uri("./mlruns")
 FEATURES_PATH = "data/processed/features.csv"
 MLFLOW_EXPERIMENT = "indonesian-stock-prediction"
 
