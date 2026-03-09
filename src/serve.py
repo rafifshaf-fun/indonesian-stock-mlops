@@ -6,8 +6,10 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 import uvicorn
+from prometheus_fastapi_instrumentator import Instrumentator
 
 app = FastAPI(title="Indonesian Stock Prediction API", version="1.0.0")
+Instrumentator().instrument(app).expose(app)
 
 MLFLOW_EXPERIMENT = "indonesian-stock-prediction"
 model_cache = {}
