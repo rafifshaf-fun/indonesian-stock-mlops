@@ -1,0 +1,10 @@
+artifact_location: file:///C:/Users/LAdmininstrator/indonesian-stock-mlops/src/../mlruns/732412168231795740/models/m-a54c95cbbe5349ff951cacd46f89fd0d/artifacts
+creation_timestamp: 1773091752519
+experiment_id: '732412168231795740'
+last_updated_timestamp: 1773091761098
+model_id: m-a54c95cbbe5349ff951cacd46f89fd0d
+model_type: null
+name: model
+source_run_id: 1785b142df9f4a988d23d6fc08dc2779
+status: 2
+status_message: null

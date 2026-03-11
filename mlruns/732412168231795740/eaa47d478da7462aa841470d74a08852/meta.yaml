@@ -1,0 +1,14 @@
+artifact_uri: file:///C:/Users/LAdmininstrator/indonesian-stock-mlops/src/../mlruns/732412168231795740/eaa47d478da7462aa841470d74a08852/artifacts
+end_time: 1773091542647
+entry_point_name: ''
+experiment_id: '732412168231795740'
+lifecycle_stage: active
+run_id: eaa47d478da7462aa841470d74a08852
+run_name: xgb_BBRI.JK
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1773091530188
+status: 3
+tags: []
+user_id: LAdmininstrator

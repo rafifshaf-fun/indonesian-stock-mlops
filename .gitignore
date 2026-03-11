@@ -1,4 +1,4 @@
 venv/
 data/raw/stocks.csv
 venv/
-mlruns/
+mlruns/**/artifacts/

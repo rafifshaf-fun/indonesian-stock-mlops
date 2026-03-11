@@ -1,0 +1,14 @@
+artifact_uri: file:///C:/Users/LAdmininstrator/indonesian-stock-mlops/src/../mlruns/732412168231795740/dbfe14fb72884a29a037f96dc0c1bd5a/artifacts
+end_time: 1773091862468
+entry_point_name: ''
+experiment_id: '732412168231795740'
+lifecycle_stage: active
+run_id: dbfe14fb72884a29a037f96dc0c1bd5a
+run_name: xgb_MDKA.JK
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1773091850178
+status: 3
+tags: []
+user_id: LAdmininstrator
