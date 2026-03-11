@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import mlflow
 import mlflow.sklearn
+import os
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
@@ -10,7 +11,8 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ── Switch to SQLite backend (fixes FutureWarning) ──
-mlflow.set_tracking_uri("sqlite:///mlflow.db")
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+mlflow.set_tracking_uri(f"sqlite:///{BASE_DIR}/mlflow.db")
 
 FEATURES_PATH = "data/processed/features.csv"
 MLFLOW_EXPERIMENT = "indonesian-stock-prediction"
