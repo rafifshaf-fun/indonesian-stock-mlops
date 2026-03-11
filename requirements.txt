@@ -11,3 +11,5 @@ pydantic
 dvc
 prometheus-fastapi-instrumentator
 pandas-datareader
+fredapi
+pytrends

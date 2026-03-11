@@ -4,7 +4,7 @@ services:
     ports:
       - "5000:5000"
     volumes:
-      - .:/app          # mount entire project so mlflow.db is accessible
+      - .:/app          
     working_dir: /app
     command: >
       mlflow ui
@@ -17,14 +17,17 @@ services:
 
   api:
     build: .
+    env_file:
+      - .env  
     ports:
       - "8000:8000"
     depends_on:
       - mlflow
     environment:
       - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - FRED_API_KEY=${FRED_API_KEY}
     volumes:
-      - .:/app          # mount entire project so serve.py can reach mlflow.db
+      - .:/app          
     working_dir: /app
     command: python src/serve.py
     restart: always

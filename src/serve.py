@@ -131,7 +131,7 @@ def predict(request: PredictRequest):
         df, open="Open", high="High", low="Low", close="Close", volume="Volume", fillna=True
     )
 
-    latest = df.iloc[-1].select_dtypes(include=np.number)
+    latest = df.select_dtypes(include=[np.number]).iloc[-1]
     model = load_best_model(request.ticker)
 
     try:
