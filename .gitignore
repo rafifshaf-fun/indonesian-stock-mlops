@@ -3,3 +3,7 @@ data/raw/stocks.csv
 venv/
 mlruns/**/artifacts/
 mlflow.db
+.env
+docker-compose.override.yml
+*.env
+.env.*
