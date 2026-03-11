@@ -14,18 +14,18 @@ from prometheus_client import Counter, Histogram
 from ta import add_all_ta_features
 from ta.utils import dropna
 
+# ── Dynamic path resolution — works locally and inside Docker ──
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MLRUNS_DIR = os.path.join(BASE_DIR, "mlruns")
+
 mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow:5000"))
 
 app = FastAPI(title="Indonesian Stock Prediction API", version="1.0.0")
 Instrumentator().instrument(app).expose(app)
 
 try:
-    PREDICTION_COUNTER = Counter(
-        "stock_predictions_total", "Total predictions made", ["ticker", "signal"]
-    )
-    CONFIDENCE_HISTOGRAM = Histogram(
-        "prediction_confidence", "Model confidence score", ["ticker"]
-    )
+    PREDICTION_COUNTER = Counter("stock_predictions_total", "Total predictions made", ["ticker", "signal"])
+    CONFIDENCE_HISTOGRAM = Histogram("prediction_confidence", "Model confidence score", ["ticker"])
 except ValueError:
     from prometheus_client import REGISTRY
     PREDICTION_COUNTER = REGISTRY._names_to_collectors.get("stock_predictions_total")
@@ -34,34 +34,47 @@ except ValueError:
 MLFLOW_EXPERIMENT = "indonesian-stock-prediction"
 model_cache = {}
 
+
 def load_best_model(ticker: str):
     if ticker in model_cache:
         return model_cache[ticker]
+
     client = mlflow.tracking.MlflowClient()
     experiment = client.get_experiment_by_name(MLFLOW_EXPERIMENT)
+
     if not experiment:
         raise HTTPException(status_code=404, detail="Experiment not found")
+
     runs = client.search_runs(
         experiment_ids=[experiment.experiment_id],
         filter_string=f"params.ticker = '{ticker}'",
         order_by=["metrics.avg_roc_auc DESC"],
         max_results=1
     )
+
     if not runs:
         raise HTTPException(status_code=404, detail=f"No model found for ticker {ticker}")
+
     run_id = runs[0].info.run_id
     experiment_id = experiment.experiment_id
 
-    # Scan models/ directory to find the model matching this run_id
-    models_dir = f"/mlruns/{experiment_id}/models"
+    # ── Use dynamic path relative to project root ──
+    models_dir = os.path.join(MLRUNS_DIR, experiment_id, "models")
+
+    if not os.path.exists(models_dir):
+        raise HTTPException(
+            status_code=404,
+            detail=f"No model artifacts found for {ticker}. Run train.py locally first."
+        )
+
     model_path = None
     for model_folder in os.listdir(models_dir):
-        mlmodel_file = f"{models_dir}/{model_folder}/artifacts/MLmodel"
+        mlmodel_file = os.path.join(models_dir, model_folder, "artifacts", "MLmodel")
         if os.path.exists(mlmodel_file):
             with open(mlmodel_file, "r") as f:
                 content = f.read()
             if f"run_id: {run_id}" in content:
-                model_path = f"{models_dir}/{model_folder}/artifacts"
+                model_path = os.path.join(models_dir, model_folder, "artifacts")
                 break
 
     if not model_path:
@@ -71,8 +84,10 @@ def load_best_model(ticker: str):
     model_cache[ticker] = model
     return model
 
+
 class PredictRequest(BaseModel):
     ticker: str
+
 
 class PredictResponse(BaseModel):
     ticker: str
@@ -80,9 +95,11 @@ class PredictResponse(BaseModel):
     probability_up: float
     signal: str
 
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
 
 @app.get("/tickers")
 def list_tickers():
@@ -98,28 +115,35 @@ def list_tickers():
         "SMRA.JK", "TLKM.JK", "TOWR.JK", "UNTR.JK", "UNVR.JK",
     ]}
 
+
 @app.post("/predict", response_model=PredictResponse)
 def predict(request: PredictRequest):
     df = yf.download(request.ticker, period="60d", auto_adjust=True, progress=False)
+
     if df.empty:
         raise HTTPException(status_code=400, detail=f"No data found for {request.ticker}")
+
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.droplevel(1)
+
     df = dropna(df)
     df = add_all_ta_features(
-        df, open="Open", high="High", low="Low",
-        close="Close", volume="Volume", fillna=True
+        df, open="Open", high="High", low="Low", close="Close", volume="Volume", fillna=True
     )
-    latest = df.iloc[[-1]].select_dtypes(include=[np.number])
+
+    latest = df.iloc[-1].select_dtypes(include=np.number)
     model = load_best_model(request.ticker)
+
     try:
-        prediction = int(model.predict(latest)[0])
-        probability = float(model.predict_proba(latest)[0][1])
+        prediction = int(model.predict([latest])[0])
+        probability = float(model.predict_proba([latest])[0][1])
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Prediction error: {str(e)}")
+
     signal = "BUY" if prediction == 1 else "SELL"
     PREDICTION_COUNTER.labels(ticker=request.ticker, signal=signal).inc()
     CONFIDENCE_HISTOGRAM.labels(ticker=request.ticker).observe(probability)
+
     return PredictResponse(
         ticker=request.ticker,
         prediction=prediction,
@@ -127,9 +151,11 @@ def predict(request: PredictRequest):
         signal=signal
     )
 
+
 @app.get("/")
 def root():
     return {"message": "Indonesian Stock Prediction API", "docs": "/docs", "health": "/health"}
+
 
 if __name__ == "__main__":
     uvicorn.run("serve:app", host="0.0.0.0", port=8000, reload=False)

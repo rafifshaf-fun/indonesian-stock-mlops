@@ -26,6 +26,7 @@ services:
     volumes:
       - .:/app          # mount entire project so serve.py can reach mlflow.db
     working_dir: /app
+    command: python src/serve.py
     restart: always
 
   prometheus:
