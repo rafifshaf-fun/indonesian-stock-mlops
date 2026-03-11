@@ -4,13 +4,16 @@ services:
     ports:
       - "5000:5000"
     volumes:
-      - ./mlruns:/mlruns
+      - .:/app          # mount entire project so mlflow.db is accessible
+    working_dir: /app
     command: >
       mlflow ui
       --host 0.0.0.0
       --port 5000
-      --backend-store-uri /mlruns
+      --backend-store-uri sqlite:///mlflow.db
+      --artifacts-destination /app/mlruns
       --allowed-hosts *
+    restart: always
 
   api:
     build: .
@@ -21,7 +24,9 @@ services:
     environment:
       - MLFLOW_TRACKING_URI=http://mlflow:5000
     volumes:
-      - ./mlruns:/mlruns
+      - .:/app          # mount entire project so serve.py can reach mlflow.db
+    working_dir: /app
+    restart: always
 
   prometheus:
     image: prom/prometheus:latest
@@ -31,6 +36,7 @@ services:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
     depends_on:
       - api
+    restart: always
 
   grafana:
     image: grafana/grafana:latest
@@ -42,6 +48,7 @@ services:
       - grafana_data:/var/lib/grafana
     depends_on:
       - prometheus
+    restart: always
 
 volumes:
   grafana_data:

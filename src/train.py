@@ -10,13 +10,13 @@ from xgboost import XGBClassifier
 import warnings
 warnings.filterwarnings("ignore")
 
-# ── Switch to SQLite backend (fixes FutureWarning) ──
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-mlflow.set_tracking_uri(f"sqlite:///{BASE_DIR}/mlflow.db")
+# ── Use cwd-relative path — works on both Windows and Linux CI ──
+MLFLOW_DB = os.path.join(os.getcwd(), "mlflow.db")
+mlflow.set_tracking_uri(f"sqlite:///{MLFLOW_DB}")
 
 FEATURES_PATH = "data/processed/features.csv"
 MLFLOW_EXPERIMENT = "indonesian-stock-prediction"
-MIN_ROWS = 50  # minimum rows needed to train
+MIN_ROWS = 50
 
 
 def load_features(path: str) -> pd.DataFrame:
@@ -36,19 +36,16 @@ def train(ticker: str = "BBCA.JK"):
     df = df[df["ticker"] == ticker].copy()
     df = df.sort_index()
 
-    # ── GUARD: skip if not enough data ──
     if len(df) < MIN_ROWS:
         print(f"⚠️  Skipping {ticker} — only {len(df)} rows (need {MIN_ROWS})")
         return
 
     X, y = prepare_xy(df)
 
-    # ── GUARD: skip if feature matrix is empty ──
     if X.shape[0] == 0 or X.shape[1] == 0:
-        print(f"⚠️  Skipping {ticker} — empty feature matrix after preprocessing")
+        print(f"⚠️  Skipping {ticker} — empty feature matrix")
         return
 
-    # ── GUARD: skip if only one class in target ──
     if y.nunique() < 2:
         print(f"⚠️  Skipping {ticker} — target has only one class")
         return
@@ -78,9 +75,8 @@ def train(ticker: str = "BBCA.JK"):
             X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
             y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
 
-            # ── GUARD: skip fold if val set has only one class ──
             if y_val.nunique() < 2:
-                print(f"  ⚠️  Skipping fold {fold} for {ticker} — single class in val")
+                print(f"  ⚠️  Skipping fold {fold} — single class in val")
                 continue
 
             scaler = StandardScaler()
@@ -98,7 +94,7 @@ def train(ticker: str = "BBCA.JK"):
             aucs.append(roc_auc_score(y_val, proba))
 
         if not accs:
-            print(f"⚠️  No valid folds for {ticker}, skipping MLflow log")
+            print(f"⚠️  No valid folds for {ticker}, skipping")
             return
 
         mlflow.log_metric("avg_accuracy", np.mean(accs))
@@ -107,14 +103,14 @@ def train(ticker: str = "BBCA.JK"):
 
         print(f"✅ {ticker} | Accuracy: {np.mean(accs):.4f} | F1: {np.mean(f1s):.4f} | AUC: {np.mean(aucs):.4f}")
 
-        # Train final model on all data
         scaler_final = StandardScaler()
         X_all = scaler_final.fit_transform(X)
         final_model = XGBClassifier(**params)
         final_model.fit(X_all, y)
 
-        mlflow.sklearn.log_model(final_model, name="model")
-        print(f"  📦 Model logged to MLflow for {ticker}")
+        # ── Use artifact_path (stable across mlflow versions) ──
+        mlflow.sklearn.log_model(final_model, artifact_path="model")
+        print(f"  📦 Model logged for {ticker}")
 
 
 if __name__ == "__main__":
