@@ -1,61 +1,39 @@
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import pandas_datareader.data as web
 from ta import add_all_ta_features
 from ta.utils import dropna
-from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings("ignore")
 
-
-# ─────────────────────────────────────────
-# SECTION 1: OHLCV loader
-# ─────────────────────────────────────────
 
 def load_data(path: str) -> pd.DataFrame:
     df = pd.read_csv(path, header=[0, 1], index_col=0, parse_dates=True)
     return df
 
 
-# ─────────────────────────────────────────
-# SECTION 2: NEW — yfinance fundamentals
-# ─────────────────────────────────────────
-
 def fetch_fundamentals(ticker: str) -> dict:
-    """
-    Fetch fundamental ratios from yfinance .info
-    Returns a flat dict of scalar values — forward-filled across all dates
-    """
     try:
         info = yf.Ticker(ticker).info
         return {
-            "pe_ratio":       info.get("trailingPE", np.nan),
-            "pb_ratio":       info.get("priceToBook", np.nan),
-            "dividend_yield": info.get("dividendYield", np.nan) or 0.0,
-            "market_cap":     info.get("marketCap", np.nan),
-            "debt_to_equity": info.get("debtToEquity", np.nan),
+            "pe_ratio":         info.get("trailingPE", np.nan),
+            "pb_ratio":         info.get("priceToBook", np.nan),
+            "dividend_yield":   info.get("dividendYield", np.nan) or 0.0,
+            "market_cap":       info.get("marketCap", np.nan),
+            "debt_to_equity":   info.get("debtToEquity", np.nan),
             "return_on_equity": info.get("returnOnEquity", np.nan),
-            "revenue_growth": info.get("revenueGrowth", np.nan),
-            "profit_margins": info.get("profitMargins", np.nan),
+            "revenue_growth":   info.get("revenueGrowth", np.nan),
+            "profit_margins":   info.get("profitMargins", np.nan),
         }
     except Exception as e:
         print(f"  ⚠️  Fundamentals failed for {ticker}: {e}")
-        return {
-            "pe_ratio": np.nan, "pb_ratio": np.nan,
-            "dividend_yield": 0.0, "market_cap": np.nan,
-            "debt_to_equity": np.nan, "return_on_equity": np.nan,
-            "revenue_growth": np.nan, "profit_margins": np.nan,
-        }
+        return {k: np.nan for k in [
+            "pe_ratio", "pb_ratio", "dividend_yield", "market_cap",
+            "debt_to_equity", "return_on_equity", "revenue_growth", "profit_margins"
+        ]}
 
-
-# ─────────────────────────────────────────
-# SECTION 3: NEW — USD/IDR macro rate
-# ─────────────────────────────────────────
 
 def fetch_usdidr(start: str, end: str) -> pd.Series:
-    """
-    Fetch USD/IDR exchange rate from Yahoo Finance
-    Falls back to empty series if unavailable
-    """
     try:
         usdidr = yf.download("IDR=X", start=start, end=end, progress=False)
         series = usdidr["Close"].squeeze()
@@ -66,10 +44,6 @@ def fetch_usdidr(start: str, end: str) -> pd.Series:
         return pd.Series(name="usdidr_rate", dtype=float)
 
 
-# ─────────────────────────────────────────
-# SECTION 4: Core feature engineering
-# ─────────────────────────────────────────
-
 def engineer_features_for_ticker(
     df: pd.DataFrame,
     ticker: str,
@@ -77,11 +51,14 @@ def engineer_features_for_ticker(
     usdidr: pd.Series
 ) -> pd.DataFrame:
 
-    # Extract single ticker OHLCV
     ticker_df = df[ticker].copy()
     ticker_df = dropna(ticker_df)
 
-    # Add all technical indicators (RSI, MACD, Bollinger, etc.)
+    # ── GUARD: need at least 50 rows for TA indicators ──
+    if len(ticker_df) < 50:
+        print(f"  ⚠️  Skipping {ticker} — only {len(ticker_df)} rows after dropna")
+        return None
+
     ticker_df = add_all_ta_features(
         ticker_df,
         open="Open", high="High", low="Low",
@@ -89,18 +66,18 @@ def engineer_features_for_ticker(
         fillna=True
     )
 
-    # ── Attach fundamentals (same value across all rows — forward-filled) ──
+    # ── Attach fundamentals (scalar, forward-filled across all rows) ──
     for col, val in fundamentals.items():
         ticker_df[col] = val
 
-    # ── Attach USD/IDR rate aligned by date ──
+    # ── Attach USD/IDR aligned by date ──
     if not usdidr.empty:
         ticker_df = ticker_df.join(usdidr, how="left")
         ticker_df["usdidr_rate"] = ticker_df["usdidr_rate"].ffill().bfill()
     else:
         ticker_df["usdidr_rate"] = np.nan
 
-    # ── Target: 1 if next day close is higher ──
+    # ── Target label ──
     ticker_df["target"] = (ticker_df["Close"].shift(-1) > ticker_df["Close"]).astype(int)
     ticker_df = ticker_df.iloc[:-1]
     ticker_df["ticker"] = ticker
@@ -108,14 +85,9 @@ def engineer_features_for_ticker(
     return ticker_df
 
 
-# ─────────────────────────────────────────
-# SECTION 5: Build full feature set
-# ─────────────────────────────────────────
-
 def build_feature_set(raw_path: str, output_path: str, tickers: list):
     df = load_data(raw_path)
 
-    # Determine date range for macro data
     start = str(df.index.min().date())
     end   = str(df.index.max().date())
 
@@ -128,22 +100,24 @@ def build_feature_set(raw_path: str, output_path: str, tickers: list):
     for ticker in tickers:
         print(f"⚙️  Processing {ticker}...")
         try:
-            print(f"  📊 Fetching fundamentals...")
             fundamentals = fetch_fundamentals(ticker)
-
             featured = engineer_features_for_ticker(df, ticker, fundamentals, usdidr)
+
+            if featured is None or len(featured) < 50:
+                print(f"  ❌ Skipping {ticker} — insufficient data after engineering")
+                continue
+
             all_features.append(featured)
-            print(f"  ✅ {ticker} done — {featured.shape[1]} features, {len(featured)} rows")
+            print(f"  ✅ Done — {featured.shape[1]} features, {len(featured)} rows")
         except Exception as e:
             print(f"  ❌ Skipping {ticker}: {e}")
 
+    if not all_features:
+        raise ValueError("No tickers produced valid features — check your raw data!")
+
     combined = pd.concat(all_features)
     combined.to_csv(output_path)
-    print(f"\n✅ Feature set saved → {output_path}")
-    print(f"   Shape: {combined.shape}")
-    print(f"   Features added: pe_ratio, pb_ratio, dividend_yield, market_cap,")
-    print(f"                   debt_to_equity, return_on_equity, revenue_growth,")
-    print(f"                   profit_margins, usdidr_rate")
+    print(f"\n✅ Saved → {output_path} | Shape: {combined.shape}")
 
 
 if __name__ == "__main__":
