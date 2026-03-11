@@ -2,3 +2,4 @@ venv/
 data/raw/stocks.csv
 venv/
 mlruns/**/artifacts/
+mlflow.db

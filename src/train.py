@@ -10,13 +10,14 @@ from xgboost import XGBClassifier
 import warnings
 warnings.filterwarnings("ignore")
 
-# ── Use cwd-relative path — works on both Windows and Linux CI ──
+# ── Use cwd-relative SQLite path — works on Windows and Linux ──
 MLFLOW_DB = os.path.join(os.getcwd(), "mlflow.db")
 mlflow.set_tracking_uri(f"sqlite:///{MLFLOW_DB}")
 
 FEATURES_PATH = "data/processed/features.csv"
 MLFLOW_EXPERIMENT = "indonesian-stock-prediction"
 MIN_ROWS = 50
+IS_CI = bool(os.environ.get("CI"))  # GitHub Actions sets this automatically
 
 
 def load_features(path: str) -> pd.DataFrame:
@@ -103,14 +104,18 @@ def train(ticker: str = "BBCA.JK"):
 
         print(f"✅ {ticker} | Accuracy: {np.mean(accs):.4f} | F1: {np.mean(f1s):.4f} | AUC: {np.mean(aucs):.4f}")
 
+        # Train final model on all data
         scaler_final = StandardScaler()
         X_all = scaler_final.fit_transform(X)
         final_model = XGBClassifier(**params)
         final_model.fit(X_all, y)
 
-        # ── Use artifact_path (stable across mlflow versions) ──
-        mlflow.sklearn.log_model(final_model, artifact_path="model")
-        print(f"  📦 Model logged for {ticker}")
+        # ── Skip artifact logging on CI — avoids Windows path conflicts ──
+        if not IS_CI:
+            mlflow.sklearn.log_model(final_model, artifact_path="model")
+            print(f"  📦 Model artifact logged for {ticker}")
+        else:
+            print(f"  ⏭️  CI mode — metrics only, skipping model artifact")
 
 
 if __name__ == "__main__":
