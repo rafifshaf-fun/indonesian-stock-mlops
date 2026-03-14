@@ -13,3 +13,4 @@ prometheus-fastapi-instrumentator
 pandas-datareader
 fredapi
 pytrends
+matplotlib

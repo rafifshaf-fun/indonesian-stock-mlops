@@ -1,4 +1,5 @@
 import requests
+import time
 
 API_URL = "http://localhost:8000/predict"
 
@@ -14,10 +15,26 @@ TICKERS = [
     "SMRA.JK", "TLKM.JK", "TOWR.JK", "UNTR.JK", "UNVR.JK",
 ]
 
+print("Fetching latest tickers data against training model and returning signal...")
 for ticker in TICKERS:
     try:
-        response = requests.post(API_URL, json={"ticker": ticker})
-        data = response.json()
-        print(f"{ticker}: {data['signal']} ({data['probability_up']:.2%})")
+        response = requests.post(
+            "http://localhost:8000/predict", 
+            json={"ticker": ticker}, 
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            print(f"✅ {ticker}: {data['signal']} ({data['probability_up']*100:.2f}%)")
+        else:
+            print(f"⚠️ {ticker}: FAILED - {response.text}")
+            
+    except requests.exceptions.ReadTimeout:
+        print(f"⚠️ {ticker}: TIMEOUT - Yahoo Finance might be rate-limiting.")
     except Exception as e:
-        print(f"{ticker}: ERROR - {e}")
+        print(f"⚠️ {ticker}: ERROR - {str(e)}")
+        
+    # THE CRITICAL FIX: Sleep for 2 seconds between requests
+    # This stops Yahoo Finance from blocking your IP address!
+    time.sleep(2)
