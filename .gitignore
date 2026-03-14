@@ -6,4 +6,5 @@ mlflow.db
 .env
 docker-compose.override.yml
 *.env
-.env.*
+.env.*data/processed/
+data/raw/
