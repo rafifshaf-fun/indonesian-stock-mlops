@@ -36,15 +36,22 @@ jobs:
       - name: Train models & log to MLflow
         run: python src/train.py
 
-      - name: Commit mlruns metrics back to repo
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      - name: Commit metrics
         run: |
           git config --global user.email "actions@github.com"
           git config --global user.name "GitHub Actions"
+          
+          # Track the new SQLite database
+          git add -f mlflow.db
+          
+          # Safely handle mlruns just in case
+          mkdir -p mlruns
           git add -f mlruns/
-          git reset HEAD mlruns/**/artifacts/
-          git diff --staged --quiet || git commit -m "ci: update mlruns metrics [skip ci]"
+          git reset HEAD mlruns/**/artifacts/ || true
+          
+          git diff --staged --quiet || git commit -m "ci: update MLflow metrics [skip ci]"
           git push
+
 
       - name: Test API health
         run: |
