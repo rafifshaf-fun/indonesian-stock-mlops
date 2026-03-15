@@ -71,7 +71,6 @@ This project demonstrates production-grade MLOps practices including **Purged Ti
 
 ## 🗂️ Project Structure
 
-```
 ├── src/
 │   ├── ingest.py          # Fetch raw OHLCV data from yfinance
 │   ├── features.py        # Feature engineering (TA + macro + trends)
