@@ -1,12 +1,32 @@
 # 🇮🇩 Indonesian Stock Prediction — MLOps Pipeline
 
-An end-to-end MLOps system that predicts **BUY/SELL signals** for 45 Indonesian blue-chip stocks (IDX) using machine learning, real-time monitoring, and automated retraining.
+![Python](https://img.shields.io/badge/Python-3.11-blue?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-Async-009688?logo=fastapi&logoColor=white)
+![XGBoost](https://img.shields.io/badge/XGBoost-Native-orange)
+![MLflow](https://img.shields.io/badge/MLflow-Tracking-blue?logo=mlflow)
+![Grafana](https://img.shields.io/badge/Grafana-Monitoring-F46800?logo=grafana&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-Containerized-2496ED?logo=docker&logoColor=white)
+
+An end-to-end MLOps system that predicts **BUY/SELL signals** for 45 Indonesian blue-chip stocks (IDX) using machine learning, real-time monitoring, and automated retraining. 
+
+This project demonstrates production-grade MLOps practices including **Purged Time-Series Cross Validation**, **Async Model Serving**, and **Model Registry Management**.
+
+---
+
+## ✨ Key Features & Upgrades (v1.2)
+
+- 🤖 **Native XGBoost Modeling** — Switched to `mlflow.xgboost` native flavor for better performance, explicit feature naming, and accurate feature importance logging.
+- 📊 **Advanced Feature Engineering (200+)** — Includes 100+ technical indicators, real-time Yahoo Finance fundamentals, USD/IDR exchange rates, and custom `Google Trends` sentiment tracking.
+- 🏦 **External Macro Data Caching** — Automatically fetches and caches WTI Oil, Gold, Coal, US10Y Yields, and Bank Indonesia Interest Rates via FRED API to enrich model context.
+- ⚡ **Asynchronous API** — Completely overhauled `serve.py` using `asyncio` and FastAPI Background Tasks. The server no longer freezes during heavy concurrent requests or background data fetching.
+- 🛡️ **Bulletproof Inference** — Implemented robust fallback mechanisms. If Yahoo Finance or FRED APIs go down, the model safely imputes missing data to guarantee 100% prediction uptime.
+- 📡 **Real-time Observability** — Grafana dashboard built on Prometheus metrics tracking signal distributions, API latency, and model confidence drift.
 
 ---
 
 ## 🏗️ Architecture
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │                        Data Sources                         │
 │  yfinance (OHLCV + Fundamentals) │ FRED API │ Bank Indonesia │ Google Trends │
@@ -35,9 +55,6 @@ An end-to-end MLOps system that predicts **BUY/SELL signals** for 45 Indonesian 
 │              Prometheus + Grafana Monitoring                │
 │    Confidence Scores │ Signal Counts │ API Latency          │
 └─────────────────────────────────────────────────────────────┘
-```
-
----
 
 ## ✨ Features
 
@@ -54,7 +71,6 @@ An end-to-end MLOps system that predicts **BUY/SELL signals** for 45 Indonesian 
 
 ## 🗂️ Project Structure
 
-```
 ├── src/
 │   ├── ingest.py          # Fetch raw OHLCV data from yfinance
 │   ├── features.py        # Feature engineering (TA + macro + trends)
@@ -73,8 +89,6 @@ An end-to-end MLOps system that predicts **BUY/SELL signals** for 45 Indonesian 
 ├── start.bat              # Windows one-click startup
 └── .env                   # API keys (never committed)
 ```
-
----
 
 ## 🚀 Quick Start
 
@@ -199,7 +213,8 @@ docker-compose up -d --build
 
 ## 📸 Screenshots
 
-> MLflow experiment comparison, Grafana dashboard, and API Swagger UI screenshots here.
+![Grafana Dashboard](assets/grafana1.png)
+![Grafana Dashboard](assets/grafana2.png)
 
 ---
 
