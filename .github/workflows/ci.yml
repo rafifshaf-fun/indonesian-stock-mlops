@@ -33,6 +33,9 @@ jobs:
       - name: Run feature engineering
         run: python src/features.py
 
+      - name: Upgrade MLflow DB schema
+        run: mlflow db upgrade sqlite:///mlflow.db
+
       - name: Train models & log to MLflow
         run: python src/train.py
 
