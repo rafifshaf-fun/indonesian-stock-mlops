@@ -213,7 +213,8 @@ docker-compose up -d --build
 
 ## 📸 Screenshots
 
-> MLflow experiment comparison, Grafana dashboard, and API Swagger UI screenshots here.
+![Grafana Dashboard](assets/grafana1.png)
+![Grafana Dashboard](assets/grafana2.png)
 
 ---
 
