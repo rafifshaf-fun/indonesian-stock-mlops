@@ -1,26 +1,20 @@
+import sys, os
+sys.path.insert(0, os.path.dirname(__file__))
+
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
-import os
 import warnings
+from config import (
+    TICKERS, IHSG_TICKER, DATA_RAW_PATH, START_DATE,
+    FEATURE_FLAGS, CACHE_CONFIG, get_logger,
+)
 
 warnings.filterwarnings("ignore")
+logger = get_logger(__name__)
 
-#LQ45 2 February 2026
-TICKERS = [
-    "AADI.JK", "ADMR.JK", "ADRO.JK", "AKRA.JK", "AMMN.JK",
-    "AMRT.JK", "ANTM.JK", "ARTO.JK", "ASII.JK", "BBCA.JK",
-    "BBNI.JK", "BBRI.JK", "BBTN.JK", "BMRI.JK", "BREN.JK",
-    "BRIS.JK", "BRPT.JK", "CPIN.JK", "CTRA.JK", "EXCL.JK",
-    "GOTO.JK", "ICBP.JK", "INCO.JK", "INDF.JK", "INKP.JK",
-    "ISAT.JK", "ITMG.JK", "JPFA.JK", "JSMR.JK", "KLBF.JK",
-    "MAPA.JK", "MAPI.JK", "MBMA.JK", "MDKA.JK", "MEDC.JK",
-    "PGAS.JK", "PGEO.JK", "PTBA.JK", "SIDO.JK", "SMGR.JK",
-    "SMRA.JK", "TLKM.JK", "TOWR.JK", "UNTR.JK", "UNVR.JK",
-]
-
-DATA_PATH = "data/raw/stocks.csv"
-GLOBAL_START_DATE = "2020-01-01"
+DATA_PATH = DATA_RAW_PATH
+GLOBAL_START_DATE = START_DATE
 
 def get_last_date(path: str) -> str:
     """Reads the existing dataset to find the last fetched date."""
@@ -109,6 +103,97 @@ def fetch_and_update(tickers: list, path: str):
     df_combined.to_csv(path)
     print(f" ✅ Saved {len(df_combined)} total rows to {path}")
 
+def fetch_ihsg_index():
+    """Fetch IHSG (^JKSE) index data for market context features."""
+    path = "data/raw/ihsg.csv"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    end_date = (datetime.today() + timedelta(days=1)).strftime("%Y-%m-%d")
+    start_date = GLOBAL_START_DATE
+
+    if os.path.exists(path):
+        try:
+            existing = pd.read_csv(path, index_col=0, parse_dates=True)
+            if not existing.empty:
+                start_date = existing.index[-1].strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
+    if start_date >= (datetime.today() - timedelta(days=1)).strftime("%Y-%m-%d"):
+        logger.info("IHSG data already up to date.")
+        return
+
+    logger.info("Fetching IHSG (%s) from %s to %s...", IHSG_TICKER, start_date, end_date)
+    try:
+        df = yf.download(IHSG_TICKER, start=start_date, end=end_date, progress=False)
+        if df.empty:
+            logger.warning("No IHSG data returned.")
+            return
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(1)
+
+        if os.path.exists(path):
+            old = pd.read_csv(path, index_col=0, parse_dates=True)
+            df = pd.concat([old, df])
+            df = df[~df.index.duplicated(keep="last")]
+            df.sort_index(inplace=True)
+
+        df.to_csv(path)
+        logger.info("IHSG data saved: %d rows to %s", len(df), path)
+    except Exception as e:
+        logger.warning("Failed to fetch IHSG: %s", e)
+
+def download_intraday_data(ticker: str, interval: str = "5m", period: str = "5d",
+                           cache_dir: str = "data/intraday") -> pd.DataFrame:
+    """Download intraday data for a ticker with caching.
+
+    Args:
+        ticker: Stock ticker (e.g. 'BBCA.JK')
+        interval: Intraday interval ('1m', '5m', '15m', '60m')
+        period: Lookback period ('1d', '5d', '1mo')
+        cache_dir: Directory to cache intraday parquet files
+
+    Returns:
+        DataFrame with intraday OHLCV data, or empty DataFrame on failure.
+    """
+    import time as _time
+
+    cache_file = os.path.join(cache_dir, f"{ticker}_{interval}.parquet")
+    ttl = CACHE_CONFIG.get("intraday_ttl_hours", 4) * 3600
+
+    # Check cache
+    if os.path.exists(cache_file):
+        try:
+            cache_age = _time.time() - os.path.getmtime(cache_file)
+            if cache_age < ttl:
+                df = pd.read_parquet(cache_file)
+                if not df.empty:
+                    return df
+        except Exception:
+            pass  # Cache invalid, refetch
+
+    # Download with rate limiting
+    _time.sleep(CACHE_CONFIG.get("rate_limit_delay_seconds", 2))
+    try:
+        df = yf.download(ticker, interval=interval, period=period, progress=False)
+        if df.empty:
+            return pd.DataFrame()
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(1)
+
+        os.makedirs(cache_dir, exist_ok=True)
+        df.to_parquet(cache_file)
+        return df
+    except Exception as e:
+        logger.warning("Intraday download failed for %s: %s", ticker, e)
+        return pd.DataFrame()
+
 if __name__ == "__main__":
     print(f"Checking {len(TICKERS)} LQ45 tickers...")
     fetch_and_update(TICKERS, DATA_PATH)
+
+    if FEATURE_FLAGS.get("market_context", True):
+        print(f"Fetching IHSG index ({IHSG_TICKER})...")
+        fetch_ihsg_index()

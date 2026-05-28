@@ -8,7 +8,6 @@ xgboost
 fastapi
 uvicorn
 pydantic
-dvc
 prometheus-fastapi-instrumentator
 pandas-datareader
 fredapi

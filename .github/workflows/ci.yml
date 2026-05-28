@@ -25,19 +25,25 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          pip install pyarrow  # Parquet support
 
       - name: Fetch stock data
         run: python src/ingest.py
 
-      - name: Run feature engineering
-        run: python src/features.py
+      - name: Run feature engineering (CI mode)
+        env:
+          FRED_API_KEY: dd8911c26b5abd28eab62d670dd0371e
+        run: python src/features.py --mode ci --format csv
 
       - name: Upgrade MLflow DB schema
         run: mlflow db upgrade sqlite:///mlflow.db
 
       - name: Train models & log to MLflow
-        run: python src/train.py
+        env:
+          CI: "true"
+        run: python src/train.py --features data/processed/features.csv
 
       - name: Commit metrics
         run: |
