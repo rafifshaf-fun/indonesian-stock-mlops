@@ -58,43 +58,73 @@ This project demonstrates production-grade MLOps practices including **Purged Ti
 
 ## ✨ Features
 
-- 🤖 **ML Model** — XGBoost classifier trained with TimeSeriesSplit cross-validation per ticker
-- 📊 **200+ Features** — Technical indicators, fundamentals, macro data, FX rates, sentiment
-- 🏦 **Multi-source Data** — Yahoo Finance, FRED API, Bank Indonesia, Google Trends
-- 🔁 **Auto-retrain on Boot** — Fresh model every time you start the stack via `start.bat`
+- 🤖 **ML Model** — Per-ticker XGBoost classifiers with purged TimeSeriesSplit CV and isotonic calibration
+- 📊 **172+ Features** — Technical indicators, ICT Smart Money Concepts, Enhanced MAs, macro, FX, fundamentals
+- 🏦 **Multi-source Data** — Yahoo Finance, FRED API, Bank Indonesia, NewsAPI + VADER sentiment
+- 📰 **Sentiment Overlay** — News sentiment adjusts prediction confidence by ±10% in real-time
 - 📈 **MLflow Tracking** — Full experiment history, run comparison, model registry
-- 📡 **Real-time Monitoring** — Grafana dashboard with confidence scores, signal counts, API latency
-- 🐳 **Fully Dockerized** — One command to spin up the entire stack
-- ✅ **CI/CD Pipeline** — GitHub Actions runs tests and builds on every push
+- 📡 **Real-time Monitoring** — Grafana dashboard with BUY/SELL counts, confidence gauges, API latency
+- 🐳 **Fully Dockerized** — `docker compose up -d` to spin up the entire stack
+- ⚡ **Prediction Cache** — SQLite-backed daily cache for sub-second predictions after first hit
+- 🔧 **Unified CLI** — `python cli.py predict|backtest|sentiment|train|serve|status|list`
 
 ---
 
 ## 🗂️ Project Structure
 
+## 🗂️ Project Structure
+
+```
 ├── src/
-│   ├── ingest.py          # Fetch raw OHLCV data from yfinance
-│   ├── features.py        # Feature engineering (TA + macro + trends)
-│   ├── train.py           # XGBoost training + MLflow logging
-│   ├── serve.py           # FastAPI prediction server
-│   └── seed_metrics.py    # Seed Prometheus metrics on startup
+│   ├── features/              # Modular feature engineering package
+│   │   ├── __init__.py         #   Re-exports all feature functions
+│   │   ├── fetchers.py         #   fetch_fundamentals, fetch_usdidr, fetch_news_sentiment, etc.
+│   │   ├── indicators.py       #   compute_ta_features, compute_custom_features
+│   │   ├── enhanced_mas.py     #   compute_enhanced_mas (~15 features)
+│   │   ├── ict.py              #   compute_ict_features (~25 ICT/Smart Money features)
+│   │   ├── volume_profile.py   #   compute_volume_profile_features (~20 features)
+│   │   ├── market.py           #   compute_market_context, compute_cross_stock_features
+│   │   └── pipeline.py         #   engineer_features_for_ticker, build_feature_set
+│   ├── ingest.py               # Fetch raw OHLCV data from yfinance
+│   ├── train.py                # XGBoost training + MLflow logging + Optuna tuning
+│   ├── serve.py                # FastAPI prediction server with sentiment overlay
+│   ├── backtest.py             # Walk-forward backtesting engine
+│   ├── news_sentiment.py       # NewsAPI + VADER sentiment analysis
+│   └── config.py               # Single source of truth: tickers, sectors, feature flags
+├── cli.py                      # Unified CLI (predict, backtest, sentiment, train, serve)
+├── predict.py                  # Standalone prediction script (API or local mode)
 ├── data/
-│   ├── raw/               # Raw OHLCV CSVs
-│   └── processed/         # Engineered feature CSVs
-├── mlruns/                # MLflow experiment artifacts
-├── .github/workflows/
-│   └── ci.yml             # GitHub Actions CI pipeline
+│   ├── raw/                    # Raw OHLCV CSVs
+│   ├── processed/              # Engineered feature Parquet/CSV
+│   └── prediction_cache.db     # Daily prediction cache (sub-second responses)
+├── mlruns/                     # MLflow experiment artifacts and model registry
+├── models/
+│   └── by_ticker/              # Human-readable model directory (run scripts/link_models.py)
+├── scripts/
+│   ├── build_model_index.py    # Build ticker → model folder mapping
+│   ├── link_models.py          # Create readable model dirs
+│   ├── tune.py                 # Optuna hyperparameter tuning
+│   └── seed_metrics.py         # Seed Prometheus metrics
+├── monitoring/
+│   ├── prometheus.yml
+│   ├── grafana-dashboard.json
+│   └── grafana/                # Auto-provisioned Grafana datasources + dashboards
 ├── docker-compose.yml
 ├── Dockerfile
 ├── requirements.txt
-├── start.bat              # Windows one-click startup
-└── .env                   # API keys (never committed)
+├── requirements-docker.txt
+├── start.bat                   # Full launcher menu (train/retrain/tune/start)
+├── run.bat                     # Quick Docker start (no retraining)
+├── predict.bat                 # Quick prediction wrapper
+├── cli.py                      # Unified CLI entry point
+└── .env                        # API keys (never committed)
 ```
 
 ## 🚀 Quick Start
 
 ### Prerequisites
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running
-- Windows OS (for `start.bat`); Linux/Mac users run commands manually
+- Python 3.11 (only needed for local training)
 
 ### 1. Clone the repo
 ```bash
@@ -104,110 +134,155 @@ cd indonesian-stock-mlops
 
 ### 2. Set up environment variables
 ```bash
-# Create .env file (never commit this)
-cp .env.example .env
+# Copy and edit .env (never commit this file)
+# Add keys for optional features:
+#   FRED_API_KEY    → macro/commodity data (https://fred.stlouisfed.org)
+#   NEWSAPI_KEY     → news sentiment scores (https://newsapi.org)
 ```
-Edit `.env`:
-```
-FRED_API_KEY=your_fred_api_key_here
-```
-Get a free FRED API key at → https://fred.stlouisfed.org/docs/api/api_key.html
 
 ### 3. Start the stack
-```bash
-# Windows — double-click or run:
-start.bat
 
-# Linux / Mac
-docker-compose up -d --build
-docker-compose exec api python src/ingest.py
-docker-compose exec api python src/features.py
-docker-compose exec api python src/train.py
-docker-compose exec api python src/seed_metrics.py
+**Windows — double-click or run:**
+```bat
+start.bat          # Full menu: train/retrain/tune/start
+run.bat            # Quick start: just Docker + wait
+predict.bat BBCA.JK  # Single prediction
 ```
 
-Training all 45 tickers takes ~5–10 minutes on first run.
+**Linux / Mac:**
+```bash
+docker compose up -d
+python cli.py status                    # Check if API is running
+python cli.py predict BBCA.JK           # Single prediction
+python cli.py predict --all             # All 45 tickers
+python cli.py backtest                  # Full backtest (0.50 threshold)
+python cli.py sentiment BBCA.JK         # News sentiment score
+python cli.py list                      # List all tickers by sector
+```
+
+Training all 45 tickers takes ~15-20 minutes on first run (CPU). Models are cached after training.
 
 ---
 
 ## 🌐 Service URLs
 
-| Service | URL | Description |
+| Service | URL | Notes |
 |---|---|---|
-| Prediction API | http://localhost:8000 | FastAPI REST API |
-| API Docs | http://localhost:8000/docs | Interactive Swagger UI |
-| MLflow UI | http://localhost:5000 | Experiment tracking & model registry |
-| Grafana | http://localhost:3000 | Real-time monitoring dashboard |
-| Prometheus | http://localhost:9090 | Raw metrics scraper |
+| Prediction API | `http://127.0.0.1:8000` | Use 127.0.0.1 not localhost on Windows |
+| API Docs | `http://127.0.0.1:8000/docs` | Interactive Swagger UI |
+| Cache Status | `http://127.0.0.1:8000/cache` | Prediction cache coverage |
+| MLflow UI | `http://localhost:5000` | Experiment tracking |
+| Grafana | `http://localhost:3000` | admin/admin |
+| Prometheus | `http://localhost:9090` | Raw metrics |
 
 ---
 
 ## 📡 API Usage
 
-### Get a prediction
+### Prediction (with sentiment overlay)
 ```bash
-curl -X POST http://localhost:8000/predict \
+curl -X POST http://127.0.0.1:8000/predict \
   -H "Content-Type: application/json" \
   -d '{"ticker": "BBCA.JK"}'
 ```
 
-**Response:**
+**Response (v2.2+):**
 ```json
 {
   "ticker": "BBCA.JK",
-  "prediction": 1,
-  "probability_up": 0.6371,
-  "signal": "BUY"
+  "prediction": 0,
+  "probability_up": 0.4789,
+  "signal": "SELL",
+  "sentiment_score": 0.1523,
+  "probability_adjusted": 0.4941,
+  "signal_adjusted": "SELL"
 }
 ```
 
-### List available tickers
+| Field | Description |
+|---|---|
+| `prediction` | 0 = SELL, 1 = BUY |
+| `probability_up` | Model confidence (0-1) |
+| `sentiment_score` | VADER news sentiment (-1 to +1, 0 if unavailable) |
+| `probability_adjusted` | Model confidence ±10% based on sentiment |
+| `signal_adjusted` | Signal after sentiment overlay |
+
+### Batch Prediction
 ```bash
-curl http://localhost:8000/tickers
+curl -X POST http://127.0.0.1:8000/predict/batch \
+  -H "Content-Type: application/json" \
+  -d '{"tickers": ["BBCA.JK", "BBRI.JK", "TLKM.JK"]}'
+```
+
+### List tickers
+```bash
+curl http://127.0.0.1:8000/tickers
+```
+
+---
+
+## 🖥️ CLI Usage
+
+```bash
+# Prediction
+python cli.py predict BBCA.JK                   # Via API
+python cli.py predict BBCA.JK --local           # Local model
+python cli.py predict --all --json              # All 45, JSON output
+
+# Backtest (walk-forward simulation)
+python cli.py backtest                           # Threshold 0.50
+python cli.py backtest --threshold 0.65          # Higher confidence
+
+# Sentiment
+python cli.py sentiment BBCA.JK                 # Single ticker
+python cli.py sentiment --all                    # All 45
+
+# Training
+python cli.py train                              # Train all models
+python cli.py train --ticker BBCA.JK --tune      # Tune single ticker
+
+# Status
+python cli.py status                             # Check API health
+python cli.py list                               # List all tickers
 ```
 
 ---
 
 ## 📊 Data Sources
 
-| Source | Data | Update Frequency |
+| Source | Data | Update |
 |---|---|---|
-| Yahoo Finance | OHLCV prices, PE/PB ratio, market cap, ROE | Daily |
-| Yahoo Finance | USD/IDR exchange rate | Daily |
-| FRED API | WTI oil, gold, coal, nickel, VIX, Fed rate, US 10Y, BI rate proxy | Daily/Monthly |
-| Bank Indonesia | BI 7-Day Reverse Repo Rate | Per RDG meeting |
-| Google Trends | Search interest per company (geo: ID) | Weekly |
+| Yahoo Finance | OHLCV, PE/PB, market cap, ROE, USD/IDR | Daily |
+| FRED API | WTI oil, gold, coal, nickel, VIX, US 10Y | Daily |
+| Bank Indonesia | BI 7-Day Reverse Repo Rate | Per meeting |
+| NewsAPI | English + Indonesian news headlines | Per request |
+| VADER | Lexicon-based sentiment on headlines | Per request |
 
 ---
 
 ## 🧠 Model Details
 
-- **Algorithm** — XGBoost Classifier
-- **Target** — Binary: 1 (next day close > today) / 0 (next day close ≤ today)
-- **Validation** — TimeSeriesSplit (5 folds) to prevent data leakage
-- **Features** — 210+ including all `ta` library indicators + macro + fundamental + sentiment
-- **Tracked Metrics** — avg_accuracy, avg_f1, avg_roc_auc per ticker per run
+- **Algorithm** — XGBoost Classifier (per-ticker, 45 models)
+- **Target** — Binary: 1 (next day close > today) / 0 (otherwise)
+- **Validation** — Purged TimeSeriesSplit (5 folds, 10-day gap)
+- **Calibration** — Isotonic regression for probability calibration
+- **Features** — 172+ after pruning (correlation >0.95 + low-variance filter)
+- **Tuning** — Optuna (20 trials, top-10 tickers via `--tune`)
+- **Sentiment overlay** — ±10% adjustment from VADER news sentiment
 
----
+## 🔧 Configuration (`src/config.py`)
 
-## 🔧 Configuration
-
-| Variable | Default | Description |
+| Flag | Default | Description |
 |---|---|---|
-| `FRED_API_KEY` | — | Required for macro + commodity features |
-| `MLFLOW_TRACKING_URI` | `http://mlflow:5000` | MLflow server address |
-
----
-
-## 🛠️ Rebuilding After Dependency Changes
-
-```bat
-:: Windows
-start.bat build
-
-:: Linux/Mac
-docker-compose up -d --build
-```
+| `ta_indicators` | true | 75 TA indicators from `ta` library |
+| `enhanced_mas` | true | 15 enhanced moving average features |
+| `ict_suite` | true | 25 ICT Smart Money Concepts features |
+| `volume_profile` | true | 20 intraday volume profile features |
+| `market_context` | true | 15 market/cross-stock features |
+| `news_sentiment` | true | VADER sentiment from NewsAPI |
+| `fred_macro` | true | FRED macro indicators |
+| `bi_rate` | true | Bank Indonesia rate scraping |
+| `google_trends` | true | Google Trends sentiment |
 
 ---
 

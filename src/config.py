@@ -84,6 +84,7 @@ FEATURE_FLAGS = {
     "google_trends": True,          # Google Trends sentiment
     "fred_macro": True,             # FRED macroeconomic indicators
     "bi_rate": True,                # Bank Indonesia rate scraping
+    "news_sentiment": True,          # NewsAPI + VADER sentiment scores
 }
 
 # ── Cache Configuration ────────────────────────────────────────────────────────

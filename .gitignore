@@ -6,7 +6,11 @@ docker-compose.override.yml
 data/processed/features.csv
 data/processed/features.parquet
 data/intraday/
+data/sentiment/
+data/prediction_cache.db
+mlflow.db
 mlruns/**/artifacts/
+app/
 __pycache__/
 *.pyc
 .venv/

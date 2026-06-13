@@ -1,27 +1,27 @@
 @echo off
 setlocal enabledelayedexpansion
-title Indonesian Stock MLOps v2.0
+title Indonesian Stock MLOps v2.2
 color 0A
 
 echo =========================================
-echo    INDONESIAN STOCK MLOPS STACK v2.0
+echo    INDONESIAN STOCK MLOPS v2.2
 echo =========================================
 echo.
-
-:: Ask the user what they want to do
-echo [1] Start Server Only (Fast - uses cached models)
+echo [1] Start Server Only (fast - use cached models)
 echo [2] Quick Retrain (CI mode - skip intraday/Trends)
-echo [3] Full Retrain (All features incl. intraday volume)
-echo [4] Rebuild Docker + Start
+echo [3] Full Retrain (all features + volume profile)
+echo [4] Tune Models (Optuna hyperparameter tuning)
+echo [5] Rebuild Docker + Start (fresh install)
+echo [6] Predict a Ticker (quick prediction)
 echo.
-set /p user_choice="Enter 1-4: "
+set /p user_choice="Enter 1-6: "
 
 echo.
-echo =========================================
 echo [1/4] Cleaning up old containers...
-docker compose down
+docker compose down 2>nul
+docker compose down api 2>nul
 
-if "%user_choice%"=="4" (
+if "%user_choice%"=="5" (
     echo.
     echo [Rebuilding Docker image...]
     docker compose build --no-cache api
@@ -63,24 +63,48 @@ if "%user_choice%"=="2" (
     echo Step 1: Fetching stock data + IHSG...
     python src/ingest.py
 
-    echo Step 2: Engineering features (CI mode - fast)...
-    python src/features.py --mode ci --format csv
+    echo Step 2: Engineering features (CI mode)...
+    python -c "import sys; sys.path.insert(0,'src'); from features.pipeline import build_feature_set; from config import TICKERS, DATA_PROCESSED_CSV_PATH; build_feature_set('data/raw/stocks.csv', DATA_PROCESSED_CSV_PATH, TICKERS, mode='ci')"
 
     echo Step 3: Training models...
     python src/train.py
+
+    echo Step 4: Building model index...
+    python scripts/build_model_index.py
 )
 
 if "%user_choice%"=="3" (
     echo === FULL RETRAIN (All features) ===
-    echo This will fetch intraday data for 45 tickers (~15-20 min).
+    echo This fetches intraday data for 45 tickers (~15-20 min).
     echo Step 1: Fetching stock data + IHSG...
     python src/ingest.py
 
     echo Step 2: Engineering features (full mode)...
-    python src/features.py --mode full --format parquet
+    python -c "import sys; sys.path.insert(0,'src'); from features.pipeline import build_feature_set; from config import TICKERS, DATA_PROCESSED_PATH; build_feature_set('data/raw/stocks.csv', DATA_PROCESSED_PATH, TICKERS, mode='full')"
 
     echo Step 3: Training models...
     python src/train.py
+
+    echo Step 4: Building model index...
+    python scripts/build_model_index.py
+)
+
+if "%user_choice%"=="4" (
+    echo === OPTUNA HYPERPARAMETER TUNING ===
+    echo This will tune top-10 tickers (~30-60 min)...
+    python src/train.py --tune
+    echo Rebuilding model index...
+    python scripts/build_model_index.py
+)
+
+if "%user_choice%"=="6" (
+    echo === PREDICT A TICKER ===
+    set /p pred_ticker="Enter ticker (e.g. BBCA.JK): "
+    if exist "venv\Scripts\python.exe" (
+        venv\Scripts\python.exe cli.py predict !pred_ticker!
+    ) else (
+        python cli.py predict !pred_ticker!
+    )
 )
 
 if "%user_choice%"=="1" (
