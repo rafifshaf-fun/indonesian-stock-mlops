@@ -26,35 +26,54 @@ This project demonstrates production-grade MLOps practices including **Purged Ti
 
 ## 🏗️ Architecture
 
-```text
-┌─────────────────────────────────────────────────────────────┐
-│                        Data Sources                         │
-│  yfinance (OHLCV + Fundamentals) │ FRED API │ Bank Indonesia │ Google Trends │
-└─────────────────┬───────────────────────────────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Feature Engineering                      │
-│     Technical Indicators (200+) │ Macro │ Sentiment         │
-└─────────────────┬───────────────────────────────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────────────────────────────┐
-│              XGBoost Model Training                         │
-│         TimeSeriesSplit CV │ MLflow Experiment Tracking     │
-└─────────────────┬───────────────────────────────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────────────────────────────┐
-│                FastAPI Prediction API                       │
-│          /predict │ /metrics │ /health │ /docs              │
-└─────────────────┬───────────────────────────────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────────────────────────────┐
-│              Prometheus + Grafana Monitoring                │
-│    Confidence Scores │ Signal Counts │ API Latency          │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph Data["📡 Data Sources"]
+        YH[Yahoo Finance<br/>OHLCV + Fundamentals]
+        FR[FRED API<br/>Macro + Commodities]
+        BI[Bank Indonesia<br/>BI Rate]
+        NA[NewsAPI<br/>Headlines]
+        GT[Google Trends<br/>Search Interest]
+    end
+
+    subgraph Features["⚙️ Feature Engineering"]
+        TA[TA Indicators<br/>75+ technical]
+        ICT[ICT Concepts<br/>25 smart money]
+        EMA[Enhanced MAs<br/>15 moving avg]
+        VP[Volume Profile<br/>20 intraday]
+        MX[Macro Injection<br/>USD/IDR, FRED, BI]
+        ST[Sentiment<br/>VADER overlay]
+    end
+
+    subgraph Training["🧠 Model Training"]
+        XG[XGBoost<br/>45 per-ticker models]
+        CV[TimeSeriesSplit CV<br/>5 folds, 10d gap]
+        MLF[MLflow Tracking<br/>Experiments + Registry]
+        OT[Optuna Tuning<br/>Hyperparameter search]
+    end
+
+    subgraph API["⚡ FastAPI Server"]
+        PRED[/predict<br/>BUY/SELL signal]
+        BATCH[/predict/batch<br/>Batch predictions]
+        CACHE[SQLite Cache<br/>Sub-second repeats]
+        SENT[Sentiment Overlay<br/>±10% adjustment]
+    end
+
+    subgraph Monitor["📊 Monitoring"]
+        PROM[Prometheus<br/>Metrics scraper]
+        GRAF[Grafana<br/>Dashboard]
+    end
+
+    Data --> Features
+    Features --> Training
+    Training --> API
+    API --> Monitor
+
+    NA --> SENT
+    SENT --> PRED
+    CACHE --> PRED
+    PROM --> GRAF
+```
 
 ## ✨ Features
 
@@ -69,8 +88,6 @@ This project demonstrates production-grade MLOps practices including **Purged Ti
 - 🔧 **Unified CLI** — `python cli.py predict|backtest|sentiment|train|serve|status|list`
 
 ---
-
-## 🗂️ Project Structure
 
 ## 🗂️ Project Structure
 
