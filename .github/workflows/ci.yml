@@ -27,7 +27,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          pip install pyarrow  # Parquet support
+          pip install pyarrow vaderSentiment nltk
 
       - name: Fetch stock data
         run: python src/ingest.py
@@ -35,7 +35,19 @@ jobs:
       - name: Run feature engineering (CI mode)
         env:
           FRED_API_KEY: dd8911c26b5abd28eab62d670dd0371e
-        run: python src/features.py --mode ci --format csv
+        run: python -c "
+          import sys; sys.path.insert(0,'src');
+          from features.pipeline import build_feature_set;
+          from config import TICKERS, DATA_PROCESSED_CSV_PATH;
+          build_feature_set('data/raw/stocks.csv', DATA_PROCESSED_CSV_PATH, TICKERS, mode='ci')
+        "
+
+      - name: Build model index
+        run: python -c "
+          import sys; sys.path.insert(0,'scripts');
+          from build_model_index import build_index;
+          build_index()
+        "
 
       - name: Upgrade MLflow DB schema
         run: mlflow db upgrade sqlite:///mlflow.db
@@ -49,23 +61,19 @@ jobs:
         run: |
           git config --global user.email "actions@github.com"
           git config --global user.name "GitHub Actions"
-          
-          # Track the new SQLite database
+
           git add -f mlflow.db
-          
-          # Safely handle mlruns just in case
           mkdir -p mlruns
           git add -f mlruns/
           git reset HEAD mlruns/**/artifacts/ || true
-          
+
           git diff --staged --quiet || git commit -m "ci: update MLflow metrics [skip ci]"
           git push
-
 
       - name: Test API health
         run: |
           cd src && python serve.py &
-          sleep 5
+          sleep 30
           curl -f http://localhost:8000/health
 
   docker:

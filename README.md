@@ -28,40 +28,38 @@ This project demonstrates production-grade MLOps practices including **Purged Ti
 
 ```mermaid
 flowchart TB
-    subgraph Data["📡 Data Sources"]
-        YH[Yahoo Finance<br/>OHLCV + Fundamentals]
-        FR[FRED API<br/>Macro + Commodities]
-        BI[Bank Indonesia<br/>BI Rate]
-        NA[NewsAPI<br/>Headlines]
-        GT[Google Trends<br/>Search Interest]
+    subgraph Data["Data Sources"]
+        YH["Yahoo Finance (OHLCV + Fundamentals)"]
+        FR["FRED API (Macro + Commodities)"]
+        BI["Bank Indonesia (BI Rate)"]
+        NA["NewsAPI (Headlines + VADER)"]
     end
 
-    subgraph Features["⚙️ Feature Engineering"]
-        TA[TA Indicators<br/>75+ technical]
-        ICT[ICT Concepts<br/>25 smart money]
-        EMA[Enhanced MAs<br/>15 moving avg]
-        VP[Volume Profile<br/>20 intraday]
-        MX[Macro Injection<br/>USD/IDR, FRED, BI]
-        ST[Sentiment<br/>VADER overlay]
+    subgraph Features["Feature Engineering"]
+        TA["TA Indicators (75+)"]
+        ICT["ICT Concepts (25 Smart Money)"]
+        EMA["Enhanced MAs (15)"]
+        VP["Volume Profile (20)"]
+        MX["Macro + Sentiment Injection"]
     end
 
-    subgraph Training["🧠 Model Training"]
-        XG[XGBoost<br/>45 per-ticker models]
-        CV[TimeSeriesSplit CV<br/>5 folds, 10d gap]
-        MLF[MLflow Tracking<br/>Experiments + Registry]
-        OT[Optuna Tuning<br/>Hyperparameter search]
+    subgraph Training["Model Training"]
+        XG["XGBoost (45 per-ticker models)"]
+        CV["TimeSeriesSplit CV (5 folds)"]
+        MLF["MLflow Tracking + Registry"]
+        OT["Optuna Hyperparameter Tuning"]
     end
 
-    subgraph API["⚡ FastAPI Server"]
-        PRED[/predict<br/>BUY/SELL signal]
-        BATCH[/predict/batch<br/>Batch predictions]
-        CACHE[SQLite Cache<br/>Sub-second repeats]
-        SENT[Sentiment Overlay<br/>±10% adjustment]
+    subgraph API["FastAPI Server"]
+        PRED["/predict endpoint"]
+        BATCH["/predict/batch endpoint"]
+        CACHE["SQLite Prediction Cache"]
+        SENT["VADER Sentiment Overlay"]
     end
 
-    subgraph Monitor["📊 Monitoring"]
-        PROM[Prometheus<br/>Metrics scraper]
-        GRAF[Grafana<br/>Dashboard]
+    subgraph Monitor["Monitoring"]
+        PROM["Prometheus Metrics"]
+        GRAF["Grafana Dashboard"]
     end
 
     Data --> Features
