@@ -35,19 +35,10 @@ jobs:
       - name: Run feature engineering (CI mode)
         env:
           FRED_API_KEY: dd8911c26b5abd28eab62d670dd0371e
-        run: python -c "
-          import sys; sys.path.insert(0,'src');
-          from features.pipeline import build_feature_set;
-          from config import TICKERS, DATA_PROCESSED_CSV_PATH;
-          build_feature_set('data/raw/stocks.csv', DATA_PROCESSED_CSV_PATH, TICKERS, mode='ci')
-        "
+        run: python scripts/ci_features.py
 
       - name: Build model index
-        run: python -c "
-          import sys; sys.path.insert(0,'scripts');
-          from build_model_index import build_index;
-          build_index()
-        "
+        run: python scripts/build_model_index.py
 
       - name: Upgrade MLflow DB schema
         run: mlflow db upgrade sqlite:///mlflow.db
