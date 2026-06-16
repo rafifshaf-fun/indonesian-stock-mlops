@@ -112,8 +112,11 @@ if "%user_choice%"=="1" (
 )
 
 echo.
-echo Step 4: Seeding metrics to Prometheus/Grafana...
+echo Step 4: Seeding metrics to Prometheus/Grafana (parallel async)...
 python scripts/seed_metrics.py
+
+echo Step 5: Pre-warming prediction cache for instant first request...
+python -c "import asyncio, sys; sys.path.insert(0,'scripts'); from seed_metrics import seed_all; asyncio.run(seed_all(concurrency=4))"
 
 echo.
 echo =========================================

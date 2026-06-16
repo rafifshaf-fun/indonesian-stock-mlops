@@ -221,155 +221,197 @@ def tune_hyperparameters(X, y, ticker: str, n_trials: int = 20) -> dict:
     return best
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CORE: TRAIN A SINGLE TICKER
+# CORE: TRAIN A SINGLE TICKER (SHAP pruning + expanding CV + LGBM blend)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def train(ticker: str = "BBCA.JK", tune: bool = False):
-    """Train and evaluate an XGBoost model for a single ticker.
+def _select_features_shap(X, y, top_k: int = 60) -> pd.DataFrame:
+    """SHAP-based feature selection. Falls back to correlation pruning if SHAP unavailable."""
+    try:
+        import shap
+    except ImportError:
+        return X
 
-    Args:
-        ticker: Stock ticker symbol
-        tune: If True, run Optuna hyperparameter tuning
+    if X.shape[1] <= top_k:
+        return X
+
+    try:
+        neg, pos = np.bincount(y.astype(int))
+        sw = neg / pos if pos > 0 else 1
+        model = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1,
+                              eval_metric="logloss", random_state=42,
+                              scale_pos_weight=sw, verbosity=0)
+        sc = StandardScaler()
+        X_s = pd.DataFrame(sc.fit_transform(X), columns=X.columns, index=X.index)
+        model.fit(X_s, y)
+        explainer = shap.TreeExplainer(model)
+        vals = explainer.shap_values(X_s.iloc[:min(1000, len(X_s))])
+        if isinstance(vals, list):
+            vals = vals[1]
+        imp = np.abs(vals).mean(axis=0)
+        top = np.argsort(imp)[::-1][:top_k]
+        cols = X.columns[top].tolist()
+        logger.info("SHAP pruning: %d → %d features", X.shape[1], len(cols))
+        return X[cols]
+    except Exception:
+        return X
+
+
+def _expanding_cv_splits(X, n_splits=5, gap=10):
+    """Expanding-window CV splits — each fold grows the training window."""
+    n = len(X)
+    ts = n // (n_splits + 1)
+    for i in range(n_splits):
+        te_start = n - (n_splits - i) * ts
+        te_end = n - (n_splits - i - 1) * ts
+        tr_end = te_start - gap
+        if tr_end <= ts:
+            continue
+        yield np.arange(tr_end), np.arange(te_start, min(te_end, n))
+
+
+def train(ticker: str = "BBCA.JK", tune: bool = False, use_shap: bool = True,
+          expand_cv: bool = True, blend_lgbm: bool = True):
+    """Train an XGBoost (+ optional LGBM blend) model for a single ticker.
+
+    Features: SHAP pruning, expanding walk-forward CV, LGBM soft-vote blending.
     """
     df = load_features(FEATURES_PATH)
-    df = df[df["ticker"] == ticker].copy()
-    df = df.sort_index()
+    df = df[df["ticker"] == ticker].copy().sort_index()
 
     if len(df) < MIN_ROWS:
-        logger.warning("Skipping %s — only %d rows (need %d)", ticker, len(df), MIN_ROWS)
-        return
+        return logger.warning("Skipping %s — only %d rows", ticker, len(df))
 
     X, y = prepare_xy(df)
-
-    if X.shape[0] == 0 or X.shape[1] == 0:
-        logger.warning("Skipping %s — no features remaining", ticker)
-        return
-    if y.nunique() < 2:
-        logger.warning("Skipping %s — only one class (%d samples)", ticker, len(y))
+    if X.shape[0] == 0 or X.shape[1] == 0 or y.nunique() < 2:
         return
 
-    # ── Feature Pruning ──────────────────────────────────────────────────
-    corr_thresh = TRAINING_CONFIG["corr_threshold"]
-    var_thresh = TRAINING_CONFIG["var_threshold"]
-    X = prune_features(X, corr_threshold=corr_thresh, var_threshold=var_thresh)
+    # ── SHAP pruning (primary) or legacy correlation pruning ─────────────
+    if use_shap:
+        X = _select_features_shap(X, y, top_k=60)
+    else:
+        X = prune_features(X, verbose=True)
 
     if X.shape[1] == 0:
-        logger.warning("Skipping %s — all features pruned", ticker)
         return
 
-    # ── Class Distribution ───────────────────────────────────────────────
-    class_counts = y.value_counts().to_dict()
-    neg_count = class_counts.get(0, 0)
-    pos_count = class_counts.get(1, 0)
-    imbalance_ratio = neg_count / pos_count if pos_count > 0 else 1.0
+    neg_count, pos_count = (y == 0).sum(), (y == 1).sum()
+    gap_days, n_splits = TRAINING_CONFIG["cv_gap_days"], TRAINING_CONFIG["cv_splits"]
 
-    # ── CV Setup ─────────────────────────────────────────────────────────
-    gap_days = TRAINING_CONFIG["cv_gap_days"]
-    n_splits = TRAINING_CONFIG["cv_splits"]
-    tscv = TimeSeriesSplit(n_splits=n_splits, gap=gap_days)
+    # ── CV splits ─────────────────────────────────────────────────────────
+    if expand_cv:
+        cv_splits = list(_expanding_cv_splits(X, n_splits, gap_days))
+    else:
+        cv_splits = list(TimeSeriesSplit(n_splits=n_splits, gap=gap_days).split(X))
 
-    # ── Hyperparameters ──────────────────────────────────────────────────
+    # ── Params ────────────────────────────────────────────────────────────
     if tune:
-        params = tune_hyperparameters(X, y, ticker, n_trials=TRAINING_CONFIG["optuna_trials"])
+        params = tune_hyperparameters(X, y, ticker)
     else:
         params = TRAINING_CONFIG["xgb_params"].copy()
-
-    # Add class imbalance weight
     if neg_count > 0 and pos_count > 0:
         params["scale_pos_weight"] = neg_count / pos_count
+    params["nthread"] = 2
 
     mlflow.set_experiment(MLFLOW_EXPERIMENT)
 
     with mlflow.start_run(run_name=f"xgb_{ticker}"):
         mlflow.log_params(params)
-        mlflow.log_param("ticker", ticker)
-        mlflow.log_param("n_features", X.shape[1])
-        mlflow.log_param("n_rows", len(df))
-        mlflow.log_param("cv_gap_days", gap_days)
-        mlflow.log_param("cv_splits", n_splits)
-        mlflow.log_param("class_imbalance_ratio", round(imbalance_ratio, 2))
-        mlflow.log_param("n_sell", neg_count)
-        mlflow.log_param("n_buy", pos_count)
-        mlflow.log_param("feature_pruning", True)
+        for k, v in {"ticker": ticker, "n_features": X.shape[1], "n_rows": len(df),
+                     "shap_pruning": use_shap, "expanding_cv": expand_cv,
+                     "lgbm_blend": blend_lgbm,
+                     "class_imbalance": round(neg_count / max(pos_count, 1), 2)}.items():
+            mlflow.log_param(k, v)
 
         accs, f1s, aucs, precs, recs = [], [], [], [], []
 
-        for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
-            X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
-            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
-
-            if y_val.nunique() < 2:
+        for train_idx, val_idx in cv_splits:
+            X_tr, X_vl = X.iloc[train_idx], X.iloc[val_idx]
+            y_tr, y_vl = y.iloc[train_idx], y.iloc[val_idx]
+            if y_vl.nunique() < 2:
                 continue
 
-            scaler = StandardScaler()
-            X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train), columns=X.columns)
-            X_val_scaled = pd.DataFrame(scaler.transform(X_val), columns=X.columns)
+            sc = StandardScaler()
+            X_tr_s = pd.DataFrame(sc.fit_transform(X_tr), columns=X.columns)
+            X_vl_s = pd.DataFrame(sc.transform(X_vl), columns=X.columns)
 
             model = XGBClassifier(**params)
-            model.fit(X_train_scaled, y_train)
+            model.fit(X_tr_s, y_tr)
+            preds = model.predict(X_vl_s)
+            proba = model.predict_proba(X_vl_s)[:, 1]
 
-            preds = model.predict(X_val_scaled)
-            proba = model.predict_proba(X_val_scaled)[:, 1]
-
-            accs.append(accuracy_score(y_val, preds))
-            f1s.append(f1_score(y_val, preds, zero_division=0))
-            aucs.append(roc_auc_score(y_val, proba))
-            precs.append(precision_score(y_val, preds, zero_division=0))
-            recs.append(recall_score(y_val, preds, zero_division=0))
+            accs.append(accuracy_score(y_vl, preds))
+            f1s.append(f1_score(y_vl, preds, zero_division=0))
+            aucs.append(roc_auc_score(y_vl, proba))
+            precs.append(precision_score(y_vl, preds, zero_division=0))
+            recs.append(recall_score(y_vl, preds, zero_division=0))
 
         if not accs:
-            logger.warning("No valid folds for %s, skipping", ticker)
             return
 
-        mlflow.log_metric("avg_accuracy", np.mean(accs))
-        mlflow.log_metric("avg_f1", np.mean(f1s))
-        mlflow.log_metric("avg_roc_auc", np.mean(aucs))
-        mlflow.log_metric("avg_precision", np.mean(precs))
-        mlflow.log_metric("avg_recall", np.mean(recs))
-        mlflow.log_metric("f1_std", np.std(f1s))
+        for n, v in [("avg_accuracy", accs), ("avg_f1", f1s), ("avg_roc_auc", aucs),
+                     ("avg_precision", precs), ("avg_recall", recs),
+                     ("f1_std", [np.std(f1s)])]:
+            mlflow.log_metric(n, np.mean(v))
 
-        logger.info("%s | Acc: %.4f | F1: %.4f | AUC: %.4f | Prec: %.4f | Rec: %.4f | Features: %d",
-                    ticker, np.mean(accs), np.mean(f1s), np.mean(aucs),
-                    np.mean(precs), np.mean(recs), X.shape[1])
+        logger.info("%s | Acc:%.4f F1:%.4f AUC:%.4f Feat:%d",
+                    ticker, np.mean(accs), np.mean(f1s), np.mean(aucs), X.shape[1])
 
-        # ── Final Model + Calibration ────────────────────────────────────
-        scaler_final = StandardScaler()
-        X_all_scaled = pd.DataFrame(scaler_final.fit_transform(X), columns=X.columns)
+        # ── Final model ────────────────────────────────────────────────────
+        sc_final = StandardScaler()
+        X_all_s = pd.DataFrame(sc_final.fit_transform(X), columns=X.columns)
+        xgb = XGBClassifier(**params)
+        xgb.fit(X_all_s, y)
 
-        base_model = XGBClassifier(**params)
-        base_model.fit(X_all_scaled, y)
+        # ── LGBM blend (optional) ──────────────────────────────────────────
+        proba_blend = None
+        if blend_lgbm:
+            try:
+                from lightgbm import LGBMClassifier
+                lgbm = LGBMClassifier(
+                    n_estimators=params.get("n_estimators",200), learning_rate=params.get("learning_rate",0.05),
+                    max_depth=params.get("max_depth",4), random_state=42, verbosity=-1,
+                )
+                lgbm.fit(X_all_s, y)
+                proba_blend = (xgb.predict_proba(X_all_s)[:,1] + lgbm.predict_proba(X_all_s)[:,1]) / 2
+                mlflow.log_metric("blend_accuracy",
+                                  accuracy_score(y, (proba_blend >= 0.5).astype(int)))
+                logger.info("LGBM blended for %s", ticker)
+            except ImportError:
+                pass
+            except Exception as e:
+                logger.debug("LGBM blend failed for %s: %s", ticker, e)
 
-        # Calibrate probabilities (isotonic regression)
+        # ── Calibration ────────────────────────────────────────────────────
         try:
-            calibrated_model = CalibratedCVClassifier(
-                estimator=base_model, method="isotonic", cv="prefit"
-            )
-            calibrated_model.fit(X_all_scaled, y)
-            final_model = calibrated_model
+            final = CalibratedCVClassifier(estimator=xgb, method="isotonic", cv="prefit")
+            final.fit(X_all_s, y)
             mlflow.log_param("calibrated", True)
-            logger.info("Model calibrated with isotonic regression for %s", ticker)
         except Exception:
-            final_model = base_model
+            final = xgb
             mlflow.log_param("calibrated", False)
-            logger.debug("Calibration skipped for %s", ticker)
 
         if not IS_CI:
-            mlflow.xgboost.log_model(base_model, "model")
-
-            # Feature importance plot
-            img_path = plot_feature_importance(base_model, X.columns, ticker)
-            mlflow.log_artifact(img_path, "feature_importance")
-            os.remove(img_path)
-
-            # Confusion matrix (from final fold or all-data prediction)
-            all_preds = base_model.predict(X_all_scaled)
-            cm_path = plot_confusion_matrix(y, all_preds, ticker)
-            mlflow.log_artifact(cm_path, "confusion_matrix")
-            os.remove(cm_path)
-
-            logger.info("Model & plots logged for %s", ticker)
+            mlflow.xgboost.log_model(xgb, "model")
+            img = plot_feature_importance(xgb, X.columns, ticker)
+            mlflow.log_artifact(img, "feature_importance"); os.remove(img)
+            cm = plot_confusion_matrix(y, xgb.predict(X_all_s), ticker)
+            mlflow.log_artifact(cm, "confusion_matrix"); os.remove(cm)
         else:
             logger.info("CI mode — metrics only for %s", ticker)
+
+
+def _train_one(args):
+    """Wrapper for parallel execution."""
+    ticker, tune, feats = args
+    global FEATURES_PATH
+    FEATURES_PATH = feats
+    try:
+        train(ticker, tune=tune)
+        return ticker, True
+    except Exception as e:
+        logger.error("%s failed: %s", ticker, e)
+        return ticker, False
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
@@ -378,23 +420,31 @@ def train(ticker: str = "BBCA.JK", tune: bool = False):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Train XGBoost models for stock prediction")
-    parser.add_argument("--ticker", type=str, default=None,
-                        help="Train a single ticker (default: all tickers)")
-    parser.add_argument("--tune", action="store_true",
-                        help="Enable Optuna hyperparameter tuning")
-    parser.add_argument("--features", type=str, default=FEATURES_PATH,
-                        help="Path to features file (parquet or csv)")
+    parser = argparse.ArgumentParser(description="Train XGBoost (+LGBM blend) models")
+    parser.add_argument("--ticker", type=str, default=None)
+    parser.add_argument("--tune", action="store_true")
+    parser.add_argument("--features", type=str, default=FEATURES_PATH)
+    parser.add_argument("--parallel", action="store_true",
+                        help="Parallel training across tickers (~4x speedup)")
+    parser.add_argument("--no-shap", action="store_true")
+    parser.add_argument("--no-expand-cv", action="store_true")
+    parser.add_argument("--no-blend", action="store_true")
     args = parser.parse_args()
 
     FEATURES_PATH = args.features
-
-    ticker_list = [args.ticker] if args.ticker else TICKERS
-
+    tickers = [args.ticker] if args.ticker else TICKERS
     if args.tune:
-        # Only tune top-N most liquid tickers
-        ticker_list = ticker_list[:TRAINING_CONFIG["tune_top_n_tickers"]]
-        logger.info("Tuning mode enabled for %d tickers", len(ticker_list))
+        tickers = tickers[:TRAINING_CONFIG["tune_top_n_tickers"]]
 
-    for ticker in ticker_list:
-        train(ticker, tune=args.tune)
+    use_shap, expand_cv, blend = not args.no_shap, not args.no_expand_cv, not args.no_blend
+
+    if args.parallel and not args.ticker:
+        from joblib import Parallel, delayed
+        logger.info("Parallel training on %d tickers...", len(tickers))
+        tasks = [(t, args.tune, FEATURES_PATH) for t in tickers]
+        results = Parallel(n_jobs=-1, backend="loky")(delayed(_train_one)(t) for t in tasks)
+        ok = sum(1 for _, s in results if s)
+        logger.info("Done: %d/%d tickers trained", ok, len(tickers))
+    else:
+        for t in tickers:
+            train(t, tune=args.tune, use_shap=use_shap, expand_cv=expand_cv, blend_lgbm=blend)

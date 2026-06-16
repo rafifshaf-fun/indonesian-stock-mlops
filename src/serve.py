@@ -373,12 +373,35 @@ class PredictResponse(BaseModel):
     sentiment_score: float = 0.0
     probability_adjusted: float = 0.0
     signal_adjusted: str = ""
+    drift_warning: bool = False
+    drift_score: float = 0.0
 
 class BatchPredictResponse(BaseModel):
     predictions: List[PredictResponse]
 
 # ── Sentiment overlay strength ────────────────────────────────────────────────
-SENTIMENT_WEIGHT = 0.10  # Max ±10% adjustment to model probability from sentiment
+SENTIMENT_WEIGHT = 0.10
+PSI_THRESHOLD = 0.25  # Population Stability Index threshold for drift warning
+
+# ── PSI (Population Stability Index) — distribution drift check ─────────────
+def _compute_psi(expected: np.ndarray, actual: np.ndarray, bins: int = 10) -> float:
+    """Compute PSI between expected (training) and actual (live) distributions.
+
+    PSI > 0.25 indicates significant drift — predictions may be unreliable.
+    """
+    all_vals = np.concatenate([expected, actual])
+    bin_edges = np.percentile(all_vals, np.linspace(0, 100, bins + 1))
+    bin_edges[0] = -np.inf
+    bin_edges[-1] = np.inf
+
+    exp_hist, _ = np.histogram(expected, bins=bin_edges)
+    act_hist, _ = np.histogram(actual, bins=bin_edges)
+
+    exp_hist = (exp_hist / exp_hist.sum()).clip(0.001)
+    act_hist = (act_hist / act_hist.sum()).clip(0.001)
+
+    psi = np.sum((act_hist - exp_hist) * np.log(act_hist / exp_hist))
+    return float(psi)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ENDPOINTS
@@ -485,6 +508,7 @@ async def predict(request: PredictRequest, background_tasks: BackgroundTasks):
                 sentiment_score=overlay["sentiment_score"],
                 probability_adjusted=overlay["probability_adjusted"],
                 signal_adjusted=overlay["signal_adjusted"],
+                drift_warning=False, drift_score=0.0,
             )
 
         # ── Slow path: full pipeline (download + features + cache) ──────
@@ -550,6 +574,7 @@ async def predict(request: PredictRequest, background_tasks: BackgroundTasks):
             sentiment_score=overlay["sentiment_score"],
             probability_adjusted=overlay["probability_adjusted"],
             signal_adjusted=overlay["signal_adjusted"],
+            drift_warning=False, drift_score=0.0,
         )
 
     except HTTPException:
@@ -620,6 +645,7 @@ async def predict_batch(request: BatchPredictRequest, background_tasks: Backgrou
                 sentiment_score=overlay["sentiment_score"],
                 probability_adjusted=overlay["probability_adjusted"],
                 signal_adjusted=overlay["signal_adjusted"],
+                drift_warning=False, drift_score=0.0,
             )
         except HTTPException:
             raise

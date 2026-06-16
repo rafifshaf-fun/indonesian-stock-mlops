@@ -71,6 +71,8 @@ def cmd_train(args):
         cmd.extend(["--ticker", args.ticker])
     if args.tune:
         cmd.append("--tune")
+    if args.parallel:
+        cmd.append("--parallel")
     subprocess.run(cmd)
 
 
@@ -293,6 +295,7 @@ def main():
     p_train.add_argument("--ticker", type=str, help="Single ticker")
     p_train.add_argument("--tune", action="store_true", help="Enable Optuna hyperparameter tuning")
     p_train.add_argument("--tune-all", action="store_true", help="Tune all 45 tickers (slow!)")
+    p_train.add_argument("--parallel", action="store_true", help="Parallel training (~4x faster)")
 
     # serve
     p_serve = sub.add_parser("serve", help="Start API server")

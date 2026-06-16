@@ -17,3 +17,6 @@ matplotlib
 pyarrow
 optuna
 tenacity
+shap
+lightgbm
+aiohttp
