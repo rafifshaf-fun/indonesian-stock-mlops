@@ -3,6 +3,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import yfinance as yf
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
 import warnings
 from config import (
@@ -45,11 +46,13 @@ def validate_data(df: pd.DataFrame) -> pd.DataFrame:
         try:
             ticker_df = df[ticker].copy()
             
-            # Check 1: Zero Volume (Suspicious for liquid LQ45 stocks)
+            # Check 1: Zero Volume — fill from prior day (weekend/holiday/API gap)
             if 'Volume' in ticker_df.columns:
                 zero_vol = ticker_df[ticker_df['Volume'] == 0]
                 if not zero_vol.empty:
-                    print(f" ⚠️ Warning: {ticker} has {len(zero_vol)} recent days with 0 volume.")
+                    vol_fixed = ticker_df['Volume'].replace(0, np.nan).ffill().fillna(0)
+                    df.loc[:, (ticker, 'Volume')] = vol_fixed.values
+                    print(f" ⚠️  Warning: {ticker} had {len(zero_vol)} zero-volume days — filled from prior day.")
             
             # Check 2: Unrealistic Price Drops (Usually an unadjusted stock split)
             if 'Close' in ticker_df.columns:

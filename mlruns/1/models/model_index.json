@@ -1,0 +1,13 @@
+{
+  "total_models": 92,
+  "indexed_models": 91,
+  "mapped_tickers": 1,
+  "errors": 0,
+  "ticker_to_model": {
+    "AADI.JK": {
+      "model_folder": "m-c0f33b9ff52b468096ad249f087e38ba",
+      "match_score": 129,
+      "n_features": 129
+    }
+  }
+}
