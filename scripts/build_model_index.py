@@ -59,13 +59,45 @@ def build_index():
             continue
 
         try:
+            # Read run_id from MLmodel file
+            import yaml
+            with open(mlmodel_file) as f:
+                mlmodel_data = yaml.safe_load(f)
+            run_id = mlmodel_data.get("run_id", "")
+
+            # Query MLflow for run params/tags to get ticker
+            client = mlflow.tracking.MlflowClient()
+            ticker = ""
+            if run_id:
+                try:
+                    run = client.get_run(run_id)
+                    run_name = run.data.tags.get("mlflow.runName", "")
+                    if run_name.startswith("xgb_"):
+                        ticker = run_name[4:]
+                    if not ticker:
+                        ticker = run.data.tags.get("ticker", "")
+                    if not ticker:
+                        ticker = run.data.params.get("ticker", "")
+                except Exception:
+                    pass
+
+            if ticker and ticker in ticker_features:
+                index[folder] = {
+                    'ticker': ticker,
+                    'match_score': 999,
+                    'n_features': 0,
+                }
+                if (i + 1) % 20 == 0:
+                    print(f"  Processed {i + 1}/{len(model_folders)}...")
+                continue
+
+            # Fallback: load model and match features
             model = mlflow.xgboost.load_model(artifact_dir)
             model_features = set(get_feature_names(model))
 
             if not model_features:
                 continue
 
-            # Match against each ticker's feature set
             best_ticker = None
             best_match = 0
 
@@ -78,7 +110,7 @@ def build_index():
             index[folder] = {
                 'ticker': best_ticker,
                 'match_score': best_match,
-                'n_model_features': len(model_features),
+                'n_features': len(model_features),
             }
         except Exception as e:
             errors.append((folder, str(e)))
@@ -96,7 +128,7 @@ def build_index():
             ticker_to_model[ticker] = {
                 'model_folder': folder,
                 'match_score': info['match_score'],
-                'n_features': info['n_model_features'],
+                'n_features': info.get('n_features', info.get('n_model_features', 0)),
             }
 
     output = {

@@ -13,8 +13,10 @@ echo [3] Full Retrain (all features + volume profile)
 echo [4] Tune Models (Optuna hyperparameter tuning)
 echo [5] Rebuild Docker + Start (fresh install)
 echo [6] Predict a Ticker (quick prediction)
+echo [7] Daily Pipeline (ingest ^> features ^> seed)
+echo [8] Weekly Retrain (daily ^> train ^> seed)
 echo.
-set /p user_choice="Enter 1-6: "
+set /p user_choice="Enter 1-8: "
 
 echo.
 echo [1/4] Cleaning up old containers...
@@ -117,7 +119,61 @@ python scripts/seed_metrics.py
 
 echo Step 5: Pre-warming prediction cache for instant first request...
 python -c "import asyncio, sys; sys.path.insert(0,'scripts'); from seed_metrics import seed_all; asyncio.run(seed_all(concurrency=4))"
+goto END
 
+:: ── OPTIONS 7 & 8 ──────────────────────────────────────────────────────
+if "%user_choice%"=="7" (
+    echo.
+    echo === DAILY PIPELINE ===
+    echo.
+    echo Step 1: Fetching stock data + IHSG...
+    python src/ingest.py || goto FAIL
+    echo Step 2: Engineering features (CI mode)...
+    python scripts/ci_features.py || goto FAIL
+    echo Step 3: Building model index...
+    python scripts/build_model_index.py
+    echo Step 4: Seeding Grafana...
+    python scripts/seed_metrics.py || goto FAIL
+    echo.
+    echo === DAILY PIPELINE COMPLETE! ===
+    goto END
+)
+
+if "%user_choice%"=="8" (
+    echo.
+    echo === WEEKLY RETRAIN ===
+    echo.
+    echo Step 1: Fetching stock data + IHSG...
+    python src/ingest.py || goto FAIL
+    echo Step 2: Engineering features (CI mode)...
+    python scripts/ci_features.py || goto FAIL
+    echo Step 3: Training 45 models (parallel)...
+    python src/train.py --parallel
+    echo Step 4: Building model index...
+    python scripts/build_model_index.py || goto FAIL
+    echo Step 5: Restarting API...
+    docker compose up -d --force-recreate api
+    :WAIT_API2
+    python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)" >nul 2>&1
+    if !errorlevel! neq 0 (
+        timeout /t 3 /nobreak >nul
+        goto WAIT_API2
+    )
+    echo API ready!
+    echo Step 6: Seeding Grafana...
+    python scripts/seed_metrics.py || goto FAIL
+    echo.
+    echo === WEEKLY RETRAIN COMPLETE! ===
+    goto END
+)
+
+:FAIL
+echo.
+echo [ERROR] Pipeline step failed! Check output above.
+pause
+exit /b 1
+
+:END
 echo.
 echo =========================================
 echo         ALL SYSTEMS ARE LIVE!

@@ -3,24 +3,31 @@
 ![Python](https://img.shields.io/badge/Python-3.11-blue?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-Async-009688?logo=fastapi&logoColor=white)
 ![XGBoost](https://img.shields.io/badge/XGBoost-Native-orange)
+![LightGBM](https://img.shields.io/badge/LightGBM-Blend-00CC66?logo=lightgbm&logoColor=white)
 ![MLflow](https://img.shields.io/badge/MLflow-Tracking-blue?logo=mlflow)
 ![Grafana](https://img.shields.io/badge/Grafana-Monitoring-F46800?logo=grafana&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Containerized-2496ED?logo=docker&logoColor=white)
 
-An end-to-end MLOps system that predicts **BUY/SELL signals** for 45 Indonesian blue-chip stocks (IDX) using machine learning, real-time monitoring, and automated retraining. 
+An end-to-end MLOps system that predicts **BUY/SELL signals** for 45 Indonesian blue-chip stocks (IDX) using machine learning, real-time monitoring, and automated retraining.
 
-This project demonstrates production-grade MLOps practices including **Purged Time-Series Cross Validation**, **Async Model Serving**, and **Model Registry Management**.
+This project demonstrates production-grade MLOps practices including **SHAP feature selection**, **expanding walk-forward CV**, **ensemble blending (XGBoost + LightGBM)**, **parallel model training**, and **async metric seeding**.
 
 ---
 
-## ✨ Key Features & Upgrades (v1.2)
+## ✨ Key Features
 
-- 🤖 **Native XGBoost Modeling** — Switched to `mlflow.xgboost` native flavor for better performance, explicit feature naming, and accurate feature importance logging.
-- 📊 **Advanced Feature Engineering (200+)** — Includes 100+ technical indicators, real-time Yahoo Finance fundamentals, USD/IDR exchange rates, and custom `Google Trends` sentiment tracking.
-- 🏦 **External Macro Data Caching** — Automatically fetches and caches WTI Oil, Gold, Coal, US10Y Yields, and Bank Indonesia Interest Rates via FRED API to enrich model context.
-- ⚡ **Asynchronous API** — Completely overhauled `serve.py` using `asyncio` and FastAPI Background Tasks. The server no longer freezes during heavy concurrent requests or background data fetching.
-- 🛡️ **Bulletproof Inference** — Implemented robust fallback mechanisms. If Yahoo Finance or FRED APIs go down, the model safely imputes missing data to guarantee 100% prediction uptime.
-- 📡 **Real-time Observability** — Grafana dashboard built on Prometheus metrics tracking signal distributions, API latency, and model confidence drift.
+| Feature | Description |
+|---|---|
+| 🤖 **SHAP Feature Selection** | TreeExplainer prunes to top-60 features per ticker for faster inference |
+| 🔄 **Expanding Walk-Forward CV** | Each fold's training window grows — simulates real-world retraining |
+| 🎯 **XGBoost + LightGBM Ensemble** | Soft-vote blend of XGBoost & LightGBM for better generalization |
+| ⚡ **Parallel Training** | Joblib parallel across all 45 tickers (~15-20 min total) |
+| 📰 **VADER Sentiment Overlay** | NewsAPI headlines → ±10% confidence adjustment in real-time |
+| 🧠 **SHAP Feature Importance** | Per-ticker feature importance plots logged to MLflow |
+| 💾 **SQLite Prediction Cache** | Sub-second responses after first daily hit |
+| 📡 **Async Metric Seeding** | `aiohttp` parallel POST with exponential backoff to Prometheus |
+| 📊 **Grafana Dashboard** | BUY/SELL counts, confidence distribution, API latency |
+| 🔧 **Unified CLI** | `python cli.py predict\|backtest\|sentiment\|train\|serve\|status\|list` |
 
 ---
 
@@ -29,25 +36,27 @@ This project demonstrates production-grade MLOps practices including **Purged Ti
 ```mermaid
 flowchart TB
     subgraph Data["Data Sources"]
-        YH["Yahoo Finance (OHLCV + Fundamentals)"]
+        YH["Yahoo Finance (OHLCV)"]
         FR["FRED API (Macro + Commodities)"]
         BI["Bank Indonesia (BI Rate)"]
         NA["NewsAPI (Headlines + VADER)"]
     end
 
-    subgraph Features["Feature Engineering"]
+    subgraph Features["Feature Engineering (174 cols)"]
         TA["TA Indicators (75+)"]
         ICT["ICT Concepts (25 Smart Money)"]
         EMA["Enhanced MAs (15)"]
         VP["Volume Profile (20)"]
-        MX["Macro + Sentiment Injection"]
+        MX["Macro + Cross-Stock (15)"]
     end
 
     subgraph Training["Model Training"]
-        XG["XGBoost (45 per-ticker models)"]
-        CV["TimeSeriesSplit CV (5 folds)"]
-        MLF["MLflow Tracking + Registry"]
-        OT["Optuna Hyperparameter Tuning"]
+        SHAP["SHAP Feature Pruning (top-60)"]
+        CV["Expanding Walk-Forward CV"]
+        XG["XGBoost Classifier"]
+        LG["LightGBM Classifier"]
+        EN["Soft-Vote Ensemble"]
+        CAL["Isotonic Calibration"]
     end
 
     subgraph API["FastAPI Server"]
@@ -55,6 +64,7 @@ flowchart TB
         BATCH["/predict/batch endpoint"]
         CACHE["SQLite Prediction Cache"]
         SENT["VADER Sentiment Overlay"]
+        PSI["PSI Drift Check (scaffold)"]
     end
 
     subgraph Monitor["Monitoring"]
@@ -63,29 +73,22 @@ flowchart TB
     end
 
     Data --> Features
-    Features --> Training
-    Training --> API
+    Features --> SHAP
+    SHAP --> CV
+    CV --> XG
+    CV --> LG
+    XG --> EN
+    LG --> EN
+    EN --> CAL
+    CAL --> API
     API --> Monitor
 
     NA --> SENT
     SENT --> PRED
     CACHE --> PRED
+    PSI --> PRED
     PROM --> GRAF
 ```
-
-## ✨ Features
-
-- 🤖 **ML Model** — Per-ticker XGBoost classifiers with purged TimeSeriesSplit CV and isotonic calibration
-- 📊 **172+ Features** — Technical indicators, ICT Smart Money Concepts, Enhanced MAs, macro, FX, fundamentals
-- 🏦 **Multi-source Data** — Yahoo Finance, FRED API, Bank Indonesia, NewsAPI + VADER sentiment
-- 📰 **Sentiment Overlay** — News sentiment adjusts prediction confidence by ±10% in real-time
-- 📈 **MLflow Tracking** — Full experiment history, run comparison, model registry
-- 📡 **Real-time Monitoring** — Grafana dashboard with BUY/SELL counts, confidence gauges, API latency
-- 🐳 **Fully Dockerized** — `docker compose up -d` to spin up the entire stack
-- ⚡ **Prediction Cache** — SQLite-backed daily cache for sub-second predictions after first hit
-- 🔧 **Unified CLI** — `python cli.py predict|backtest|sentiment|train|serve|status|list`
-
----
 
 ## 🗂️ Project Structure
 
@@ -101,25 +104,20 @@ flowchart TB
 │   │   ├── market.py           #   compute_market_context, compute_cross_stock_features
 │   │   └── pipeline.py         #   engineer_features_for_ticker, build_feature_set
 │   ├── ingest.py               # Fetch raw OHLCV data from yfinance
-│   ├── train.py                # XGBoost training + MLflow logging + Optuna tuning
-│   ├── serve.py                # FastAPI prediction server with sentiment overlay
+│   ├── train.py                # XGBoost + LGBM training with SHAP, expanding CV, parallel
+│   ├── serve.py                # FastAPI prediction server with sentiment overlay + PSI drift
 │   ├── backtest.py             # Walk-forward backtesting engine
 │   ├── news_sentiment.py       # NewsAPI + VADER sentiment analysis
 │   └── config.py               # Single source of truth: tickers, sectors, feature flags
-├── cli.py                      # Unified CLI (predict, backtest, sentiment, train, serve)
-├── predict.py                  # Standalone prediction script (API or local mode)
+├── cli.py                      # Unified CLI (predict, backtest, sentiment, train, serve, status, list)
 ├── data/
-│   ├── raw/                    # Raw OHLCV CSVs
-│   ├── processed/              # Engineered feature Parquet/CSV
-│   └── prediction_cache.db     # Daily prediction cache (sub-second responses)
+│   ├── raw/                    # Raw OHLCV CSVs (stocks.csv, ihsg.csv)
+│   └── processed/              # Engineered feature CSV (features.csv)
 ├── mlruns/                     # MLflow experiment artifacts and model registry
-├── models/
-│   └── by_ticker/              # Human-readable model directory (run scripts/link_models.py)
 ├── scripts/
-│   ├── build_model_index.py    # Build ticker → model folder mapping
-│   ├── link_models.py          # Create readable model dirs
-│   ├── tune.py                 # Optuna hyperparameter tuning
-│   └── seed_metrics.py         # Seed Prometheus metrics
+│   ├── build_model_index.py    # Build ticker → model folder mapping (reads MLflow tags)
+│   ├── ci_features.py          # CI entry point for feature engineering
+│   └── seed_metrics.py         # Async aiohttp parallel seeding to Prometheus
 ├── monitoring/
 │   ├── prometheus.yml
 │   ├── grafana-dashboard.json
@@ -128,10 +126,7 @@ flowchart TB
 ├── Dockerfile
 ├── requirements.txt
 ├── requirements-docker.txt
-├── start.bat                   # Full launcher menu (train/retrain/tune/start)
-├── run.bat                     # Quick Docker start (no retraining)
-├── predict.bat                 # Quick prediction wrapper
-├── cli.py                      # Unified CLI entry point
+├── start.bat                   # Full launcher menu (1-8: start/train/daily/weekly/tune/predict)
 └── .env                        # API keys (never committed)
 ```
 
@@ -143,7 +138,7 @@ flowchart TB
 
 ### 1. Clone the repo
 ```bash
-git clone https://github.com/your-username/indonesian-stock-mlops.git
+git clone https://github.com/rafifshaf-fun/indonesian-stock-mlops.git
 cd indonesian-stock-mlops
 ```
 
@@ -159,23 +154,45 @@ cd indonesian-stock-mlops
 
 **Windows — double-click or run:**
 ```bat
-start.bat          # Full menu: train/retrain/tune/start
-run.bat            # Quick start: just Docker + wait
-predict.bat BBCA.JK  # Single prediction
+start.bat          # Full menu: 1-Start, 2-Quick Retrain, 3-Full Retrain,
+                   #           4-Tune, 5-Rebuild Docker, 6-Predict,
+                   #           7-Daily Pipeline, 8-Weekly Retrain
 ```
 
-**Linux / Mac:**
+**Linux / Mac / PowerShell:**
 ```bash
+# Start Docker services
 docker compose up -d
-python cli.py status                    # Check if API is running
-python cli.py predict BBCA.JK           # Single prediction
-python cli.py predict --all             # All 45 tickers
-python cli.py backtest                  # Full backtest (0.50 threshold)
-python cli.py sentiment BBCA.JK         # News sentiment score
-python cli.py list                      # List all tickers by sector
+
+# Check if API is running
+python cli.py status
+
+# Quick prediction
+curl -X POST http://127.0.0.1:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{"ticker": "BBCA.JK"}'
 ```
 
-Training all 45 tickers takes ~15-20 minutes on first run (CPU). Models are cached after training.
+### 4. Daily Operation
+```bash
+# Activate venv
+venv\Scripts\activate
+
+# Fetch latest data → rebuild features → seed Grafana
+python src/ingest.py
+python scripts/ci_features.py
+python scripts/seed_metrics.py
+```
+
+### 5. Weekly Retrain (Mondays)
+```bash
+python src/ingest.py
+python scripts/ci_features.py
+python src/train.py --parallel       # ~15-20 min, 45 models
+python scripts/build_model_index.py
+docker compose up -d --force-recreate api
+python scripts/seed_metrics.py
+```
 
 ---
 
@@ -221,6 +238,8 @@ curl -X POST http://127.0.0.1:8000/predict \
 | `sentiment_score` | VADER news sentiment (-1 to +1, 0 if unavailable) |
 | `probability_adjusted` | Model confidence ±10% based on sentiment |
 | `signal_adjusted` | Signal after sentiment overlay |
+| `drift_warning` | PSI drift alert (true if drift > threshold) |
+| `drift_score` | Population Stability Index score |
 
 ### Batch Prediction
 ```bash
@@ -241,7 +260,7 @@ curl http://127.0.0.1:8000/tickers
 ```bash
 # Prediction
 python cli.py predict BBCA.JK                   # Via API
-python cli.py predict BBCA.JK --local           # Local model
+python cli.py predict BBCA.JK --local           # Local model (no API needed)
 python cli.py predict --all --json              # All 45, JSON output
 
 # Backtest (walk-forward simulation)
@@ -253,12 +272,14 @@ python cli.py sentiment BBCA.JK                 # Single ticker
 python cli.py sentiment --all                    # All 45
 
 # Training
-python cli.py train                              # Train all models
+python cli.py train                              # Train all models (sequential)
+python cli.py train --parallel                   # All 45 in parallel (15-20 min)
+python cli.py train --parallel --no-shap         # Parallel without SHAP pruning
 python cli.py train --ticker BBCA.JK --tune      # Tune single ticker
 
-# Status
+# Status & Info
 python cli.py status                             # Check API health
-python cli.py list                               # List all tickers
+python cli.py list                               # List all tickers by sector
 ```
 
 ---
@@ -277,13 +298,25 @@ python cli.py list                               # List all tickers
 
 ## 🧠 Model Details
 
-- **Algorithm** — XGBoost Classifier (per-ticker, 45 models)
-- **Target** — Binary: 1 (next day close > today) / 0 (otherwise)
-- **Validation** — Purged TimeSeriesSplit (5 folds, 10-day gap)
-- **Calibration** — Isotonic regression for probability calibration
-- **Features** — 172+ after pruning (correlation >0.95 + low-variance filter)
-- **Tuning** — Optuna (20 trials, top-10 tickers via `--tune`)
-- **Sentiment overlay** — ±10% adjustment from VADER news sentiment
+- **Algorithms** — XGBoost Classifier + LightGBM (soft-vote ensemble blend)
+- **Target** — Binary: 1 (next day close > today close) / 0 (otherwise)
+- **Feature Selection** — SHAP TreeExplainer (top-60 features per ticker, `--no-shap` to disable)
+- **Validation** — Expanding walk-forward CV (each fold grows, `--no-expand-cv` for fixed windows)
+- **Calibration** — Isotonic regression (`CalibratedClassifierCV`) for probability calibration
+- **Parallel Training** — `--parallel` flag uses joblib across all 45 tickers (~15-20 min)
+- **Features** — 174 raw → 60 after SHAP pruning
+- **Sentiment overlay** — ±10% adjustment from VADER news sentiment via NewsAPI
+- **Drift Detection** — PSI (Population Stability Index) scaffold in API response
+
+### Training Options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--parallel` | false | Train all 45 tickers in parallel via joblib |
+| `--no-shap` | false | Disable SHAP feature selection (use correlation pruning) |
+| `--no-expand-cv` | false | Use fixed TimeSeriesSplit instead of expanding CV |
+| `--no-blend` | false | Disable LGBM blend (XGBoost only) |
+| `--tune` | false | Optuna hyperparameter tuning (top-10 tickers) |
 
 ## 🔧 Configuration (`src/config.py`)
 

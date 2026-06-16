@@ -28,8 +28,10 @@ warnings.filterwarnings("ignore")
 logger = get_logger(__name__)
 
 # ── MLflow setup ──────────────────────────────────────────────────────────────
+os.environ["MLFLOW_ALLOW_FILE_STORE"] = "true"  # required for MLflow 3.13+
 mlflow_db_path = os.path.join(os.getcwd(), MLFLOW_DB)
-mlflow.set_tracking_uri(f"sqlite:///{mlflow_db_path}")
+os.environ["MLFLOW_TRACKING_URI"] = f"sqlite:///{mlflow_db_path}"
+mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
 
 FEATURES_PATH = DATA_PROCESSED_PATH  # Default: Parquet
 MIN_ROWS = TRAINING_CONFIG["min_rows"]
@@ -390,6 +392,7 @@ def train(ticker: str = "BBCA.JK", tune: bool = False, use_shap: bool = True,
             final = xgb
             mlflow.log_param("calibrated", False)
 
+        mlflow.set_tag("ticker", ticker)
         if not IS_CI:
             mlflow.xgboost.log_model(xgb, "model")
             img = plot_feature_importance(xgb, X.columns, ticker)
