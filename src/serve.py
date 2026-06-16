@@ -330,31 +330,26 @@ def build_inference_features(df: pd.DataFrame, ticker: str,
     else:
         df["news_sentiment"] = 0.0
 
-    # IDX fundamentals placeholders
-    idx_fields = ["idn_der", "idn_roe", "idn_roa", "idn_current_ratio",
-                  "idn_gpm", "idn_npm", "idn_eps_growth", "idn_bvps",
-                  "idn_per", "idn_pbv"]
-    for f in idx_fields:
-        df[f] = np.nan
-
-    # Volume profile placeholders (skip at inference)
-    vp_fields = ["vp_poc", "vp_poc_distance", "vp_vah", "vp_val",
-                 "vp_value_area_width", "vp_close_in_value_area", "vp_volume_skew",
-                 "vp_vwap_deviation", "vp_volume_at_close", "vp_profile_shape",
-                 "vp_open_drive", "vp_close_drive", "vp_intraday_volatility",
-                 "vp_intraday_range", "vp_intraday_trend", "vp_relative_volume",
-                 "vp_volume_trend_5d", "vp_high_volume_nodes", "vp_vwap_deviation_std"]
-    for f in vp_fields:
-        df[f] = np.nan
-
-    # Market context placeholders
-    ctx_fields = ["ihsg_return_1d", "ihsg_return_5d", "relative_strength_1d",
-                  "relative_strength_5d", "beta_20d", "correlation_20d",
-                  "market_breadth", "market_advance_decline", "sector_return_1d",
-                  "sector_relative_strength", "sector_rank_5d", "sector_volume_ratio",
-                  "usdidr_stress"]
-    for f in ctx_fields:
-        df[f] = np.nan
+    # Placeholder columns — batch assign via dict to avoid fragmentation
+    placeholders = {}
+    for f in ["idn_der", "idn_roe", "idn_roa", "idn_current_ratio",
+              "idn_gpm", "idn_npm", "idn_eps_growth", "idn_bvps",
+              "idn_per", "idn_pbv"]:
+        placeholders[f] = np.nan
+    for f in ["vp_poc", "vp_poc_distance", "vp_vah", "vp_val",
+              "vp_value_area_width", "vp_close_in_value_area", "vp_volume_skew",
+              "vp_vwap_deviation", "vp_volume_at_close", "vp_profile_shape",
+              "vp_open_drive", "vp_close_drive", "vp_intraday_volatility",
+              "vp_intraday_range", "vp_intraday_trend", "vp_relative_volume",
+              "vp_volume_trend_5d", "vp_high_volume_nodes", "vp_vwap_deviation_std"]:
+        placeholders[f] = np.nan
+    for f in ["ihsg_return_1d", "ihsg_return_5d", "relative_strength_1d",
+              "relative_strength_5d", "beta_20d", "correlation_20d",
+              "market_breadth", "market_advance_decline", "sector_return_1d",
+              "sector_relative_strength", "sector_rank_5d", "sector_volume_ratio",
+              "usdidr_stress"]:
+        placeholders[f] = np.nan
+    df = pd.concat([df, pd.DataFrame(placeholders, index=df.index)], axis=1)
 
     # Return latest row
     numeric_df = df.select_dtypes(include=[np.number])
