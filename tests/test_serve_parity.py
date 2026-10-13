@@ -189,13 +189,18 @@ def test_no_placeholder_nan_columns(served_frame):
     too (see ``PRE_EXISTING_NAN_COLUMNS``), and ``out`` cannot be narrowed
     without making the served column set depend on the row date and on how warm
     the macro cache is, which Task 1.4's ``align_to_schema`` rejects outright.
-    The pre-existing set is pinned instead, so any *other* empty column still
-    fails here: the 42 placeholder columns this task deletes would.
+    The pre-existing set is pinned instead — as an *equality*, so that a column
+    in it silently vanishing (or being replaced by a fabricated one) fails just
+    as loudly as a new empty column appearing.  The 42 placeholder columns this
+    task deletes would fail either way.
     """
     out = served_frame
-    all_nan = [c for c in out.columns if out[c].isna().all()]
-    unexpected = sorted(set(all_nan) - PRE_EXISTING_NAN_COLUMNS)
-    assert unexpected == [], f"features still faked at inference: {unexpected}"
+    all_nan = sorted(c for c in out.columns if out[c].isna().all())
+    assert all_nan == sorted(PRE_EXISTING_NAN_COLUMNS), (
+        "all-NaN column set is not the pinned one — fabricated at inference: "
+        f"{sorted(set(all_nan) - PRE_EXISTING_NAN_COLUMNS)}; pinned columns no "
+        f"longer all-NaN or missing: {sorted(PRE_EXISTING_NAN_COLUMNS - set(all_nan))}"
+    )
 
 
 def test_audit_named_market_features_carry_real_values(served_frame):
@@ -213,6 +218,22 @@ def test_volume_profile_family_is_absent_not_faked(served_frame):
     out = served_frame
     faked = [c for c in out.columns if c.startswith("vp_")]
     assert faked == [], f"volume-profile placeholders still emitted: {faked}"
+
+
+def test_google_trend_is_absent_not_faked(served_frame):
+    """A constant ``google_trend`` would fabricate a model-consumed column.
+
+    ``google_trend`` is *live* in training, not an empty family:
+    ``build_feature_set`` fetches real Google Trends values on the default
+    parquet path (src/features/pipeline.py:337-343), and the committed
+    data/processed/features.parquet carries 98 distinct values spanning 0-100.
+    Serving cannot reproduce that fetch, so any value it passed — the deleted
+    ``0.0`` included — would be a fabricated constant of exactly the kind this
+    task removes.  ``None`` is passed instead: the builder materialises no
+    column, and Task 1.4 excludes the family from the feature contract.
+    """
+    out = served_frame
+    assert "google_trend" not in out.columns
 
 
 def test_inference_frame_has_no_target_and_no_ticker(served_frame):
@@ -243,6 +264,60 @@ def test_cross_stock_window_matches_full_history(injected, raw_ohlcv,
         single, "BBCA.JK", fundamentals_dict)
 
     pd.testing.assert_frame_equal(windowed, full_history)
+
+
+def test_load_universe_context_reads_two_level_universe_from_disk(
+        raw_ohlcv, ihsg_frame, tmp_path, monkeypatch):
+    """Drive the *real* universe loader, which every other test replaces whole.
+
+    ``injected`` monkeypatches ``serve.load_universe_context`` itself, so until
+    this test existed the body — ``pipeline.load_data``'s two-level-header
+    ``read_csv``, the ``TICKERS`` loop, its ``KeyError`` skip, and the snapshot
+    cache — never executed and could have been deleted without a single failure.
+    The "move the real data/raw/*.csv aside and the suite still passes" check in
+    the task report demonstrates that gap rather than closing it.
+
+    Fully offline: both inputs are written under ``tmp_path`` and the only paths
+    consulted are those, so nothing in the real ``data/`` tree is read.
+
+    The synthetic universe holds three configured tickers plus one that is not
+    in ``TICKERS``, so the expectation below is a real intersection: the loop
+    must skip every configured ticker the file does not carry (42 of the 45
+    today) and must not key a symbol outside the universe.
+    """
+    import serve
+
+    universe = raw_ohlcv.copy()
+    universe[("ZZZZ.JK", "Close")] = universe[("BBCA.JK", "Close")].to_numpy()
+
+    stocks_path = tmp_path / "stocks.csv"
+    universe.to_csv(stocks_path)
+    ihsg_path = tmp_path / "ihsg.csv"
+    ihsg_frame.to_csv(ihsg_path)
+
+    monkeypatch.setattr(serve, "UNIVERSE_RAW_PATH", str(stocks_path))
+    monkeypatch.setattr(serve, "IHSG_PATH", str(ihsg_path))
+    # Clear the process-wide snapshot: a warm cache would return before the body
+    # ran and this test would then prove nothing.
+    monkeypatch.setattr(serve, "_universe_context", None)
+
+    loaded = serve.load_universe_context()
+    assert isinstance(loaded, tuple) and len(loaded) == 3
+    raw, ihsg, all_ticker_data = loaded
+
+    assert raw.columns.nlevels == 2, "universe lost the yfinance two-level layout"
+    assert sorted(set(raw.columns.get_level_values(1))) == [
+        "Close", "High", "Low", "Open", "Volume"]
+    assert "Close" in ihsg.columns and not ihsg.empty
+
+    universe_tickers = set(raw.columns.get_level_values(0))
+    expected_keys = set(serve.TICKERS) & universe_tickers
+    assert expected_keys, "synthetic universe shares no ticker with config.TICKERS"
+    assert expected_keys < set(serve.TICKERS), (
+        "the fixture must leave TICKERS entries absent to exercise the KeyError skip"
+    )
+    assert set(all_ticker_data) == expected_keys
+    assert "ZZZZ.JK" not in all_ticker_data
 
 
 def test_universe_staleness_is_reported(tmp_path, monkeypatch):

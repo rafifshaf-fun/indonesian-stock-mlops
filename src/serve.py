@@ -362,6 +362,12 @@ def universe_age_days() -> int:
         Whole days since that file was last written, or ``-1`` when the file is
         absent.  ``-1`` means *unknown*, never *fresh*: an absent file has no
         age, and reporting 0 would claim it had just been ingested.
+
+    Note that this stats the file on disk, while the features actually served
+    come from the snapshot cached at load_universe_context().  After a
+    mid-process ingest the two disagree: this reports age 0 while serving still
+    uses the older cached frame, so the number is evidence about the file, not
+    about the features in the response.
     """
     try:
         mtime = os.path.getmtime(UNIVERSE_RAW_PATH)
@@ -391,14 +397,27 @@ def build_inference_features(df: pd.DataFrame, ticker: str,
         has fewer than the builder's 50 usable rows (the API layer rejects that
         case before calling).
     """
-    # Volume profile and IDX fundamentals are deliberately NOT passed: vp_*
-    # needs a 5-minute intraday download and idn_* needs a per-ticker network
-    # fetch, neither of which serving can do without adding per-request network
-    # I/O.  Both families are therefore absent from the inference frame by
-    # design — and because that is a standing decision rather than a runtime
-    # failure, it is not logged per request (Task 1.9 owns failure visibility).
-    # The model's feature contract (feature_schema.json, Task 1.4) is derived so
-    # that it never expects a column serving cannot supply.
+    # Three feature families are deliberately NOT supplied here, each for its own
+    # measured reason:
+    #
+    # * vp_* (19 columns) is LIVE in training — no vp_* column is all-NaN in the
+    #   committed data/processed/features.parquet — but it needs 5-minute
+    #   intraday downloads, which serving cannot reproduce.  Excluded from the
+    #   contract rather than faked.
+    # * google_trend (1 column) is LIVE in training as well (build_feature_set
+    #   fetches real values, and the committed parquet carries 98 distinct ones).
+    #   Serving cannot reproduce the fetch, so passing any constant would
+    #   fabricate a model-consumed column; None is passed, which makes the
+    #   builder materialise no column at all.  Excluded from the contract too.
+    # * idn_* (10 columns) is already DEAD in training: fetch_idx_fundamentals
+    #   (src/features/fetchers.py) is a no-network stub that returns NaN for
+    #   every field, and all ten columns are all-NaN in the committed parquet.
+    #   There is nothing to reproduce.
+    #
+    # Because absence is a standing decision rather than a runtime failure, it is
+    # not logged per request (Task 1.9 owns failure visibility).  The model's
+    # feature contract (feature_schema.json, Task 1.4) is derived so that it
+    # never expects a column serving cannot supply.
     raw_ohlcv, ihsg, all_ticker_data = load_universe_context()
 
     # build_features selects its ticker with df[ticker], i.e. it wants the
@@ -428,7 +447,10 @@ def build_inference_features(df: pd.DataFrame, ticker: str,
         ihsg=ihsg,
         all_ticker_data=all_ticker_data,
         news_sentiment=news_sentiment,
-        google_trend=0.0,
+        # None, not a constant: a value here would materialise a fabricated
+        # google_trend column at inference while training carries real fetched
+        # values (see the family rationale above).
+        google_trend=None,
         vp_features=None,
         idx_fundamentals=None,
         mode="full",
