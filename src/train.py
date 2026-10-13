@@ -23,6 +23,10 @@ from config import (
     TICKERS, DATA_PROCESSED_PATH, DATA_PROCESSED_CSV_PATH,
     MLFLOW_EXPERIMENT, MLFLOW_DB, TRAINING_CONFIG, get_logger,
 )
+from features.schema import (
+    FeatureSchemaError, align_to_schema, candidate_columns, is_unproducible,
+    log_feature_schema,
+)
 
 warnings.filterwarnings("ignore")
 logger = get_logger(__name__)
@@ -36,6 +40,11 @@ mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
 FEATURES_PATH = DATA_PROCESSED_PATH  # Default: Parquet
 MIN_ROWS = TRAINING_CONFIG["min_rows"]
 IS_CI = bool(os.environ.get("CI"))
+
+#: How many features SHAP keeps for a run.  Named rather than repeated because
+#: the value now belongs to one selection shared by every ticker (Task 1.4),
+#: not to a per-ticker call.
+SHAP_TOP_K = 60
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FEATURE PRUNING
@@ -226,7 +235,7 @@ def tune_hyperparameters(X, y, ticker: str, n_trials: int = 20) -> dict:
 # CORE: TRAIN A SINGLE TICKER (SHAP pruning + expanding CV + LGBM blend)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _select_features_shap(X, y, top_k: int = 60) -> pd.DataFrame:
+def _select_features_shap(X, y, top_k: int = SHAP_TOP_K) -> pd.DataFrame:
     """SHAP-based feature selection. Falls back to correlation pruning if SHAP unavailable."""
     try:
         import shap
@@ -258,6 +267,77 @@ def _select_features_shap(X, y, top_k: int = 60) -> pd.DataFrame:
         return X
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ONE FEATURE SCHEMA FOR EVERY TICKER (Task 1.4, F5)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# The pooled selection is deterministic but not free — one SHAP pass over every
+# ticker's rows — and `train()` is otherwise entered once per ticker, so the
+# result is memoised.  Keyed by (features path, selection mode, top_k): pointing
+# `--features` at another file inside one process must not reuse this file's
+# contract.  At most one entry is kept, because one run has one contract.
+_GLOBAL_SCHEMA_CACHE: dict[tuple[str, bool, int], list[str]] = {}
+
+
+def select_global_feature_schema(features_path: str | None = None, *,
+                                 use_shap: bool = True,
+                                 top_k: int = SHAP_TOP_K) -> list[str]:
+    """The one ordered feature list every ticker in this run is trained on.
+
+    The audit found the 45 logged models carrying 45 *different* 60-name lists
+    (union 132, intersection 1), because ``_select_features_shap`` ran once per
+    ticker inside ``train()``.  Nothing then checked the column set a model was
+    fed, so consumers padded the missing names with ``NaN``, and a change to any
+    feature module invalidated all 45 models with no failure signal.
+
+    This runs that same selection exactly **once**, over every ticker's rows at
+    once, on the candidate set serving can actually reproduce
+    (:func:`features.schema.candidate_columns`).  ``train()`` then fits, and
+    logs, every ticker on exactly these columns in exactly this order, and
+    ``feature_schema.json`` records the list beside each logged model.
+
+    Returns the ordered column names; the caller gets a copy, so a schema in the
+    cache cannot be mutated in place.
+    """
+    path = FEATURES_PATH if features_path is None else features_path
+    key = (os.path.abspath(path), bool(use_shap), int(top_k))
+    if key in _GLOBAL_SCHEMA_CACHE:
+        return list(_GLOBAL_SCHEMA_CACHE[key])
+
+    pooled = load_features(path)
+    X_pooled, y_pooled = prepare_xy(pooled)
+
+    # The exclusion is applied to the candidate set *before* the selection, and
+    # it is the only mechanism available here: this function reads the already
+    # engineered frame and has neither raw OHLCV nor IHSG data with which to
+    # recompute what serving could produce.  A schema that named a column
+    # serving cannot build would be exactly the silent-NaN defect F5 removes.
+    candidates = candidate_columns(X_pooled.columns)
+    X_candidates = X_pooled[candidates]
+
+    if use_shap:
+        selected = _select_features_shap(X_candidates, y_pooled, top_k=top_k)
+    else:
+        selected = prune_features(X_candidates, verbose=True)
+
+    columns = selected.columns.tolist()
+    if not columns:
+        raise RuntimeError(
+            f"global feature selection returned no columns for {path} "
+            f"({len(candidates)} candidates, pooled shape {X_pooled.shape})"
+        )
+
+    logger.info(
+        "Global feature schema: %d pooled numeric columns → %d candidates "
+        "(serving-unproducible families excluded) → %d selected — once, for "
+        "every ticker", X_pooled.shape[1], len(candidates), len(columns),
+    )
+
+    _GLOBAL_SCHEMA_CACHE.clear()  # one run, one contract
+    _GLOBAL_SCHEMA_CACHE[key] = columns
+    return list(columns)
+
+
 def _expanding_cv_splits(X, n_splits=5, gap=10):
     """Expanding-window CV splits — each fold grows the training window."""
     n = len(X)
@@ -272,10 +352,17 @@ def _expanding_cv_splits(X, n_splits=5, gap=10):
 
 
 def train(ticker: str = "BBCA.JK", tune: bool = False, use_shap: bool = True,
-          expand_cv: bool = True, blend_lgbm: bool = True):
+          expand_cv: bool = True, blend_lgbm: bool = True,
+          feature_columns: list[str] | None = None):
     """Train an XGBoost (+ optional LGBM blend) model for a single ticker.
 
     Features: SHAP pruning, expanding walk-forward CV, LGBM soft-vote blending.
+
+    ``feature_columns`` is the run's one shared schema (Task 1.4): every ticker
+    is trained — and logged — on the same ordered list, selected once over the
+    pooled frame rather than once per ticker.  When it is omitted the selection
+    is made here, pooled and memoised, so a direct call still produces exactly
+    the same contract as a full `--parallel` run.
     """
     df = load_features(FEATURES_PATH)
     df = df[df["ticker"] == ticker].copy().sort_index()
@@ -287,11 +374,27 @@ def train(ticker: str = "BBCA.JK", tune: bool = False, use_shap: bool = True,
     if X.shape[0] == 0 or X.shape[1] == 0 or y.nunique() < 2:
         return
 
-    # ── SHAP pruning (primary) or legacy correlation pruning ─────────────
-    if use_shap:
-        X = _select_features_shap(X, y, top_k=60)
+    # ── The run's one feature schema (Task 1.4) ───────────────────────────
+    # One global selection replaces the per-ticker SHAP call that gave the 45
+    # models 45 different feature lists and left nothing checking the column set
+    # a model was fed.
+    if feature_columns is None:
+        feature_columns = select_global_feature_schema(use_shap=use_shap)
     else:
-        X = prune_features(X, verbose=True)
+        # A caller-supplied schema is held to the same rule as a derived one: a
+        # contract naming a column serving cannot build is the defect this task
+        # removes, wherever the list came from.
+        unproducible = [c for c in feature_columns if is_unproducible(c)]
+        if unproducible:
+            raise FeatureSchemaError(
+                f"feature schema names serving-unproducible column(s): {unproducible}"
+            )
+
+    # Reorder by name and drop the intermediates the model never sees.  A column
+    # the schema names but this frame lacks raises instead of being padded with
+    # NaN, which is the silent failure the audit measured at ~0.10 of predicted
+    # probability against the 0.50 decision boundary.
+    X = align_to_schema(X, feature_columns)
 
     if X.shape[1] == 0:
         return
@@ -394,7 +497,14 @@ def train(ticker: str = "BBCA.JK", tune: bool = False, use_shap: bool = True,
 
         mlflow.set_tag("ticker", ticker)
         if not IS_CI:
-            mlflow.xgboost.log_model(xgb, "model")
+            model_info = mlflow.xgboost.log_model(xgb, "model")
+            # R4: `log_model` creates the logged-model directory itself, so the
+            # contract is attached *after* the fact, to the model id MLflow just
+            # returned.  It lands beside MLmodel in that model's artifact
+            # directory — mlruns/1/models/<model_id>/artifacts/feature_schema.json
+            # — which is the exact directory every consumer already hands to
+            # mlflow.xgboost.load_model (src/serve.py, scripts/build_model_index.py).
+            log_feature_schema(model_info.model_id, feature_columns)
             img = plot_feature_importance(xgb, X.columns, ticker)
             mlflow.log_artifact(img, "feature_importance"); os.remove(img)
             cm = plot_confusion_matrix(y, xgb.predict(X_all_s), ticker)
@@ -405,11 +515,11 @@ def train(ticker: str = "BBCA.JK", tune: bool = False, use_shap: bool = True,
 
 def _train_one(args):
     """Wrapper for parallel execution."""
-    ticker, tune, feats = args
+    ticker, tune, feats, feature_columns = args
     global FEATURES_PATH
     FEATURES_PATH = feats
     try:
-        train(ticker, tune=tune)
+        train(ticker, tune=tune, feature_columns=feature_columns)
         return ticker, True
     except Exception as e:
         logger.error("%s failed: %s", ticker, e)
@@ -441,13 +551,22 @@ if __name__ == "__main__":
 
     use_shap, expand_cv, blend = not args.no_shap, not args.no_expand_cv, not args.no_blend
 
+    # One selection for the whole run, over the pooled frame, before any model is
+    # trained (Task 1.4).  Computed in this process and handed to every worker so
+    # the parallel branch shares one ordered list instead of letting each worker
+    # process make its own selection.
+    feature_columns = select_global_feature_schema(FEATURES_PATH, use_shap=use_shap)
+    logger.info("Training %d tickers on one shared %d-column schema",
+                len(tickers), len(feature_columns))
+
     if args.parallel and not args.ticker:
         from joblib import Parallel, delayed
         logger.info("Parallel training on %d tickers...", len(tickers))
-        tasks = [(t, args.tune, FEATURES_PATH) for t in tickers]
+        tasks = [(t, args.tune, FEATURES_PATH, feature_columns) for t in tickers]
         results = Parallel(n_jobs=-1, backend="loky")(delayed(_train_one)(t) for t in tasks)
         ok = sum(1 for _, s in results if s)
         logger.info("Done: %d/%d tickers trained", ok, len(tickers))
     else:
         for t in tickers:
-            train(t, tune=args.tune, use_shap=use_shap, expand_cv=expand_cv, blend_lgbm=blend)
+            train(t, tune=args.tune, feature_columns=feature_columns,
+                  use_shap=use_shap, expand_cv=expand_cv, blend_lgbm=blend)
