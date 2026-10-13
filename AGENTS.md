@@ -6,11 +6,14 @@ Python 3.11, local venv at `venv/`.
 
 ## Commands
 
-- Test: none — there is no test suite and no runner. `pytest` is listed in
-  `requirements-dev.txt` but is not installed and no `test_*.py` exists.
-- Lint / Types / Build: none configured — no `pyproject.toml`, ruff, black, or
-  pre-commit config, although ruff/black/pre-commit are listed in
-  `requirements-dev.txt` and are not installed.
+- Test: `.\venv\Scripts\python.exe -m pytest` — the suite under `tests/`, configured in
+  `pyproject.toml` (`testpaths = ["tests"]`, `pythonpath = ["src"]`, and
+  `filterwarnings = ["error"]`, which is deliberate: a stray warning is a failure, so keep the
+  output pristine). Six modules still call `warnings.filterwarnings("ignore")` at import time
+  (`cli.py`, `predict.py`, `src/train.py`, `src/backtest.py`, `src/ingest.py`,
+  `src/news_sentiment.py`); those suppress warnings raised during import/collection, not in tests.
+- Lint / Types / Build: none configured. `ruff`, `black` and `pre-commit` are installed and pinned
+  in `requirements-dev.txt` but have no configuration, and there is no type checker or build step.
 - Full stack: `docker compose up -d`, then `python cli.py status`.
 - API only, no Docker (faster dev loop): `python src/serve.py`.
 - CLI entry point: `python cli.py {predict,backtest,sentiment,train,serve,status,list}`.
@@ -67,12 +70,24 @@ Python 3.11, local venv at `venv/`.
   `start.bat` calls `python src/train.py` with no `--features`, so it retrains on
   the older parquet. Pass `--features data/processed/features.csv`, which is what
   CI does.
-- **The committed model index is empty.** `mlruns/1/models/model_index.json` in
-  git has `mapped_tickers: 0` while 45 model folders exist locally. Run
-  `python scripts/build_model_index.py` before serving or predicting. Until then
-  `cli.py`/`predict.py --local` report "No model found", and the API does not
-  error at all: `load_best_model` falls back to "first valid model folder" and
-  silently serves another ticker's model.
+- **The model index maps no tickers.** `mlruns/1/models/model_index.json` in git has
+  `mapped_tickers: 0` while 45 model folders exist locally. Selection is now single-path
+  (`src/model_store.py`): an unmapped ticker raises `ModelNotFound`, which the API surfaces as a
+  404 and a startup `warning` names the remedy. The "first valid model folder" substitute — which
+  silently served another ticker's model — is deleted, along with the backtester's reverse-sorted
+  scan that made the API and the backtest disagree. Rebuild with
+  `python scripts/build_model_index.py`, or let training write it (training is now its single
+  writer). Until the index is populated, every prediction fails loudly by design.
+- Each model carries a `feature_schema.json` beside its `MLmodel`
+  (`mlruns/1/models/<model_id>/artifacts/`), written by training and enforced at load through
+  `features.schema.align_to_schema`. A model whose schema names a column the serving builder
+  cannot produce fails with `FeatureSchemaError` rather than padding it with `NaN`. Models
+  trained before this contract existed are loaded by falling back to the model's own
+  `feature_names_in_`, with a `warning` naming the ticker.
+- Serving builds features by calling the same I/O-free `features.pipeline.build_features` that
+  training uses, so the two paths cannot drift. The `vp_*`, `idn_*` and `google_trend` families
+  are deliberately absent at inference — serving cannot produce them without per-request network
+  I/O — and are excluded from the feature contract.
 - Rebuilding the index is mandatory after every retrain, and the API loads it
   once at startup — restart the container (`--force-recreate api`) to pick it up.
 - Training all 45 tickers takes ~15-20 min with `--parallel`. `--tune` covers only
@@ -81,10 +96,9 @@ Python 3.11, local venv at `venv/`.
   `--parallel` is used: the parallel branch forwards only ticker, `--tune` and
   `--features`, so `train()` falls back to its all-on defaults. Combine those
   flags only on the sequential path.
-- CI (`.github/workflows/ci.yml`) trains models and then commits `mlflow.db` and
-  `mlruns/` back to `main` as `ci: update MLflow metrics [skip ci]`. A push to
-  `main` therefore mutates tracked metrics; expect to pull before working. The
-  same workflow has `contents: write`.
+- CI (`.github/workflows/ci.yml`) is read-only: it declares `permissions: contents: read`, has no
+  `git push`, and no longer commits `mlflow.db` or `mlruns/` back to `main`. Actions are pinned by
+  commit SHA. `mlflow.db` is untracked, so experiment history is local or Docker-only.
 - The `api` container bind-mounts the repo root to `/app`, so it executes host
   code and reads host `data/` and `mlruns/`. Code changes need no image rebuild;
   model-index changes need a container restart.
@@ -96,9 +110,10 @@ Python 3.11, local venv at `venv/`.
   documents both keys with empty values. CI reads `FRED_API_KEY` from the
   Actions secret of the same name. A missing key degrades features to NaN/0
   instead of failing.
-- `start.bat` options 7 (Daily) and 8 (Weekly) are unreachable — an unconditional
-  `goto END` at line 122 runs before their blocks, so those choices only seed
-  metrics. Use the explicit command lists in `README.md` instead.
+- `start.bat`'s menu works: the jump that skipped options 7 (Daily) and 8 (Weekly) is now
+  conditional, and the unescaped parentheses that corrupted the `if (...)` blocks are escaped.
+  In batch, an unescaped `(` or `)` inside a parenthesised block terminates that block early —
+  worth remembering before editing this file.
 - DVC tracks `data/raw/stocks.csv` and `data/processed/features.csv`, but the
   configured remote (`../UsersLAdmininstratordvc-storage`) is a mangled local
   path, so `dvc pull` will not resolve until the remote is re-added.
