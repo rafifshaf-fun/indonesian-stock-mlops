@@ -1,7 +1,10 @@
-pytest>=7.0
-pytest-asyncio>=0.21
-httpx>=0.24
-black>=23.0
-ruff>=0.3.0
-pre-commit>=3.0
-ipykernel>=6.0
+# Development-only tooling. Not needed to run the pipeline or the API.
+# Pinned to the exact installed versions, matching the treatment of
+# requirements.txt; refresh deliberately, never by a floating floor.
+pytest==9.1.1
+pytest-asyncio==1.4.0
+httpx==0.28.1
+black==26.10.1
+ruff==0.17.0
+pre-commit==4.7.0
+ipykernel==7.4.0

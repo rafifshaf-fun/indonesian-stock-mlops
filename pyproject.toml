@@ -1,0 +1,14 @@
+# Test-runner configuration only.
+#
+# Deliberately no [project] and no [build-system] table: either would make pip
+# treat this repository as an installable distribution rather than merely
+# configuring pytest. Linter configuration lives nowhere yet by design.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The application is a script tree rooted at src/, not an installed package, so
+# tests import `config` and `features` from src/ directly.
+pythonpath = ["src"]
+# Every warning is an error: an unpersisted scaler, blanked features or dead
+# calibration code must announce itself in the suite rather than be silenced.
+filterwarnings = ["error"]
