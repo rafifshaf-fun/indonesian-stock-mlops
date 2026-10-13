@@ -91,8 +91,11 @@ Python 3.11, local venv at `venv/`.
 - `pip install -r requirements.txt` does **not** install `vaderSentiment` or
   `nltk`; the image uses `requirements-docker.txt`, which does, and CI installs
   both ad hoc. Sentiment silently degrades to a 0.0 score in a plain venv.
-- `.env` (`FRED_API_KEY`, `NEWSAPI_KEY`) is gitignored and no `.env.example` is
-  committed; a missing key degrades features to NaN/0 instead of failing.
+- `.env` (`FRED_API_KEY`, `NEWSAPI_KEY`) is gitignored; `.env.example` is
+  committed (force-added, because gitignore line 4 `.env.*` also matches it) and
+  documents both keys with empty values. CI reads `FRED_API_KEY` from the
+  Actions secret of the same name. A missing key degrades features to NaN/0
+  instead of failing.
 - `start.bat` options 7 (Daily) and 8 (Weekly) are unreachable — an unconditional
   `goto END` at line 122 runs before their blocks, so those choices only seed
   metrics. Use the explicit command lists in `README.md` instead.

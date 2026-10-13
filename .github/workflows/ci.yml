@@ -34,7 +34,7 @@ jobs:
 
       - name: Run feature engineering (CI mode)
         env:
-          FRED_API_KEY: dd8911c26b5abd28eab62d670dd0371e
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
         run: python scripts/ci_features.py
 
       - name: Build model index
