@@ -3,6 +3,8 @@ Data fetchers: fundamentals, USD/IDR, FRED macro, BI Rate, Google Trends.
 """
 import os
 import time
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -148,6 +150,12 @@ def fetch_news_sentiment(ticker: str) -> float:
     Uses NewsAPI (if NEWSAPI_KEY is set) + VADER sentiment analysis.
     Falls back to 0.0 if unavailable or on error.
 
+    A float cannot say *why* it is 0.0, so this function cannot report a
+    failure: the module behind it returns ``0.0`` for a dead endpoint, a 429, a
+    missing key and an absent VADER, exactly as it does for genuinely neutral
+    news.  Callers that must tell those apart want
+    :func:`fetch_news_sentiment_status`.
+
     Returns:
         Float between -1 (very negative) and +1 (very positive).
     """
@@ -157,6 +165,32 @@ def fetch_news_sentiment(ticker: str) -> float:
     except Exception as e:
         logger.debug("News sentiment unavailable for %s: %s", ticker, e)
         return 0.0
+
+
+def fetch_news_sentiment_status(ticker: str) -> tuple[float, bool, Optional[str]]:
+    """Get the sentiment score *and* whether it is a measurement.
+
+    ``fetch_news_sentiment`` returns a bare float, and every production failure
+    mode of the news path — no ``NEWSAPI_KEY``, a dead or 401 endpoint, a 429, no
+    ``vaderSentiment`` — returns the same ``0.0`` as a quiet news day.  That is
+    how a dead news API came to be presented as neutral news (F8).  This
+    companion is the seam the serving overlay reads instead: it reports the
+    failure as data rather than expecting an exception that the real code never
+    raises.
+
+    Returns:
+        ``(score, available, reason)``.  ``score`` is a float in [-1, 1];
+        ``available`` is ``False`` when it is the fallback rather than a
+        measurement, and ``reason`` then names the failure.  A plain 3-tuple
+        rather than a class, so the module-import failure below can report the
+        same shape without importing the class it could not import.
+    """
+    try:
+        from news_sentiment import get_sentiment_with_status
+    except Exception as e:
+        reason = f"news_sentiment module is not importable ({type(e).__name__}: {e})"
+        return 0.0, False, reason
+    return get_sentiment_with_status(ticker)
 
 
 def fetch_idx_fundamentals(ticker: str) -> dict:

@@ -60,9 +60,17 @@ Python 3.11, local venv at `venv/`.
 - Every external API call is wrapped in try/except with a safe default; a
   sentiment failure must never block a prediction (`serve.py` sentiment overlay)
   — but the fallback must be visible. `PredictResponse.degraded` names every
-  component that failed (`["sentiment"]`), the overlay logs at `warning`, and
-  `compute_volume_profile_features`/`build_features` warn when a family is
-  omitted. A safe default indistinguishable from a real value is the defect.
+  component that failed (`["sentiment"]`), the overlay logs at `warning` with the
+  reason, and `compute_volume_profile_features`/`build_features` warn when a
+  family is omitted. A safe default indistinguishable from a real value is the
+  defect.
+  A sentiment failure is detected by **reading a status, never by catching an
+  exception**: `features.fetchers.fetch_news_sentiment_status(ticker)` returns
+  `(score, available, reason)`, because the value-only `fetch_news_sentiment`
+  returns the same `0.0` for a missing `NEWSAPI_KEY`, a dead or rejected
+  endpoint, a 429 and an absent `vaderSentiment` as it does for neutral news, and
+  raises for none of them. An `except` around it is dead code — that was F8. The
+  reason is one distinct string per mode, so a 429 is not reported as a dead key.
   "Omitted" means the argument was *not passed*: `build_features`'s
   `google_trend`, `vp_features` and `idx_fundamentals` default to the sentinel
   `features.pipeline._NOT_SUPPLIED`, so an explicit `None` — a deliberate
@@ -124,7 +132,11 @@ Python 3.11, local venv at `venv/`.
 - `pip install -r requirements.txt` does **not** install `vaderSentiment` or
   `nltk`; the image uses `requirements-docker.txt`, which does, and CI installs
   both ad hoc. Sentiment degrades to a 0.0 score in a plain venv — visible now
-  as `degraded: ["sentiment"]` and a `warning`, not only in the score.
+  as `degraded: ["sentiment"]` and a `warning`, not only in the score. The
+  reason that warning names depends on what is missing: with no `NEWSAPI_KEY`
+  either (the default plain venv) it names the key, because the key is checked
+  before the analyser — a request that never leaves the machine cannot be blamed
+  on VADER. Set a key and the absent `vaderSentiment` is named instead.
 - `.env` (`FRED_API_KEY`, `NEWSAPI_KEY`) is gitignored; `.env.example` is
   committed, exempted from the `.env.*` rule by the `!.env.example` negation, and
   documents both keys with empty values. CI reads `FRED_API_KEY` from the

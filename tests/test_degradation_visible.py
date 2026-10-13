@@ -11,17 +11,27 @@ run succeeded.**
   rather than by scanning the source text, so a comment may name the symbol it
   explains — a raw text scan is the landmine Task 1.5 left in place.
 * **A dead news API was indistinguishable from neutral news.**  The sentiment
-  overlay's ``except Exception: pass`` left ``sentiment_score == 0.0``, which is
-  also the honest reading of "the news was neutral".  ``PredictResponse`` now
-  carries ``degraded``, and a failed fetch appends ``"sentiment"`` *and* logs at
-  ``warning``.
+  overlay caught an exception out of the fetcher, but the fetcher catches every
+  exception itself and returns ``0.0``, so ``predict`` presented a dead NewsAPI
+  endpoint, a missing key, a 429 and an absent ``vaderSentiment`` as a clean
+  neutral reading.  ``PredictResponse`` now carries ``degraded``, and the overlay
+  reads ``features.fetchers.fetch_news_sentiment_status`` — the seam that says
+  whether the score is a *measurement* — so an unavailable source appends
+  ``"sentiment"`` *and* logs at ``warning`` with the reason.  The tests below
+  drive that fetcher for real (see ``news_sentiment_state``); none of them
+  substitutes a fetcher that *raises*, because that is a shape the production
+  path never produces.
 * **A batch failure was a signal.**  ``/predict/batch`` answered a failed ticker
   with ``prediction: 0`` (SELL), ``probability_up: 0.0`` and the error text in
   the ``signal`` field, under HTTP 200 — a caller reading ``prediction`` traded
   on it.  It now raises ``HTTPException(502)``.
 
-Every test here is offline: ``serve`` never downloads, no fetcher is reached
-unpatched, and the prediction cache is redirected to ``tmp_path``.
+Every test here is offline: ``serve`` never downloads, the prediction cache is
+redirected to ``tmp_path``, and the only collaborators reached are the ones the
+tests stand in for deliberately — the model, the price download, and the two
+third-party halves of the news path (``requests`` and the VADER analyser).  The
+news *seam* itself is never stubbed: ``news_sentiment`` runs for real, because a
+stub is what hid this defect in the first place.
 
 ``serve`` imports mlflow → opentelemetry, whose runtime-context loader still
 calls the removed ``importlib.metadata`` dict interface on Python 3.11, and
@@ -32,6 +42,8 @@ text and to this module only, exactly as ``tests/test_prediction_cache.py`` does
 import ast
 import logging
 import pathlib
+import sys
+import types
 import warnings
 
 import numpy as np
@@ -52,6 +64,24 @@ with warnings.catch_warnings(record=True) as _import_warnings:
     from fastapi.testclient import TestClient
 
 _IMPORT_WARNINGS = [str(w.message) for w in _import_warnings]
+
+#: The exact message the wrapped import is allowed to capture.  Pinned in full
+#: rather than by substring: a second, different starlette deprecation must fail
+#: the pin below instead of being silently swallowed along with this one.
+EXPECTED_IMPORT_WARNING = (
+    "Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` "
+    "instead."
+)
+
+# ``src/news_sentiment.py`` calls ``warnings.filterwarnings("ignore")`` at import
+# time, which would otherwise disable the suite's ``filterwarnings = ["error"]``
+# for every test collected after it.  ``catch_warnings`` saves and restores the
+# filter list, so the module's global ignore is discarded when this block exits.
+# The import is at module scope on purpose: it emits one ``warning`` naming the
+# absent ``vaderSentiment``, and that record belongs to collection rather than to
+# whichever test happens to be running when the seam is first touched.
+with warnings.catch_warnings():
+    import news_sentiment
 
 pytestmark = [
     pytest.mark.filterwarnings(
@@ -126,13 +156,40 @@ def _ast_symbols(path: pathlib.Path) -> set[str]:
     return _symbols_in_source(path.read_text(encoding="utf-8"))
 
 
-def _offenders(source: str) -> list[str]:
+def _offenders(source: str, symbol: str = NEVER_EXISTED) -> list[str]:
     """The assertion the whole of R1 rests on, as a function of source text.
 
     Kept in one place so the both-directions test below exercises *this* check
-    and not a paraphrase of it.
+    and not a paraphrase of it.  ``symbol`` is a parameter because the same
+    structural check covers R2's dead imports (``StandardScaler``,
+    ``sklearn.calibration``).
     """
-    return sorted(s for s in _symbols_in_source(source) if NEVER_EXISTED in s)
+    return sorted(s for s in _symbols_in_source(source) if symbol in s)
+
+
+#: The module the deleted calibration block imported.  Its absence is a separate
+#: check from the symbol's: ``from sklearn.calibration import X`` puts the module
+#: in an ``ImportFrom.module``, which is a plain ``str`` the symbol walk cannot
+#: see, while ``import sklearn.calibration`` and ``sklearn.calibration.X`` are
+#: aliases and attribute chains that it can.
+CALIBRATION_MODULE = "sklearn.calibration"
+
+
+def _calibration_module_offenders(source: str) -> list[str]:
+    """Names in ``source`` that reach for the ``sklearn.calibration`` module.
+
+    Deliberately structural: a tombstone comment that names the module while
+    explaining what was deleted contributes nothing here, which is the whole
+    reason this check replaced a raw ``not in source`` scan.
+    """
+    found = [
+        node.module
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.ImportFrom)
+        and (node.module or "").startswith(CALIBRATION_MODULE)
+    ]
+    found += [s for s in _symbols_in_source(source) if s.startswith(CALIBRATION_MODULE)]
+    return sorted(set(found))
 
 
 def test_the_dead_calibration_symbol_is_not_code():
@@ -188,7 +245,14 @@ def test_the_prose_naming_the_symbol_is_present_and_the_scan_ignores_it():
 
 
 def test_the_real_calibration_import_is_gone():
-    """R2: ``CalibratedClassifierCV`` had no use once the block was removed."""
+    """R2: ``CalibratedClassifierCV`` had no use once the block was removed.
+
+    Asserted structurally, both ways the module can be reached.  This test used
+    to end in ``assert "sklearn.calibration" not in source`` — a raw text scan,
+    which is the landmine the AST check exists to remove: the tombstone comment
+    recording *why* the block was deleted names the module, and a text scan fails
+    on that prose.
+    """
     tree = ast.parse(TRAIN_SOURCE.read_text(encoding="utf-8"))
     imported = {
         alias.name
@@ -197,24 +261,58 @@ def test_the_real_calibration_import_is_gone():
         for alias in node.names
     }
     assert "CalibratedClassifierCV" not in imported, imported
-    assert "sklearn.calibration" not in TRAIN_SOURCE.read_text(encoding="utf-8")
+    assert _calibration_module_offenders(TRAIN_SOURCE.read_text(encoding="utf-8")) == []
 
 
 def test_the_dead_scaler_import_is_gone_from_the_backtester():
-    """R2's second import: ``StandardScaler`` was never referenced in backtest."""
-    source = BACKTEST_SOURCE.read_text(encoding="utf-8")
-    assert "StandardScaler" not in source, (
-        "the unused StandardScaler import is still in src/backtest.py"
+    """R2's second import: ``StandardScaler`` was never referenced in backtest.
+
+    A structural check for the same reason as the calibration one above: a
+    comment recording that the import was removed must not fail its own test.
+    """
+    offenders = _offenders(BACKTEST_SOURCE.read_text(encoding="utf-8"), "StandardScaler")
+    assert not offenders, (
+        f"the unused StandardScaler import is still in src/backtest.py: {offenders}"
     )
+
+
+def test_the_ast_absence_checks_still_catch_a_real_reintroduction():
+    """Both replaced checks, shown to fail if the symbol genuinely comes back.
+
+    Replacing a text scan with a structural check is only an improvement if the
+    structural check still catches *code*.  Each case below is a shape a
+    maintainer or a merge would plausibly restore, followed by the prose shapes
+    that must stay free.
+    """
+    # ``StandardScaler`` — every way a name can be bound or referenced.
+    assert _offenders("import StandardScaler\n", "StandardScaler") != []
+    assert _offenders("from sklearn.preprocessing import StandardScaler\n",
+                      "StandardScaler") != []
+    assert _offenders("scaler = StandardScaler()\n", "StandardScaler") != []
+    assert _offenders("def StandardScaler():\n    pass\n", "StandardScaler") != []
+    assert _offenders("# StandardScaler was removed as unused\n",
+                      "StandardScaler") == []
+    assert _offenders('DOC = "StandardScaler"\n', "StandardScaler") == []
+
+    # ``sklearn.calibration`` — as an import, as a dotted module, as an attribute.
+    assert _calibration_module_offenders(
+        "from sklearn.calibration import CalibratedClassifierCV\n") != []
+    assert _calibration_module_offenders("import sklearn.calibration\n") != []
+    assert _calibration_module_offenders("sklearn.calibration.CalibratedClassifierCV()\n") != []
+    assert _calibration_module_offenders("# nothing from sklearn.calibration here\n") == []
+    assert _calibration_module_offenders('DOC = "sklearn.calibration"\n') == []
 
 
 def test_the_testclient_import_wrapper_hides_nothing_else():
     """The one wrapped import captured the one known message and nothing more.
 
-    Pinned so that growing the wrapper into a general-purpose silencer would
-    fail here rather than quietly reduce the suite's warning coverage.
+    Pinned to the *exact* message, not a substring: a second, unrelated starlette
+    deprecation would otherwise satisfy a substring check and be swallowed
+    silently.  Absence is tolerated — if a future starlette stops emitting this
+    deprecation the wrapper simply has nothing to catch — but any other message,
+    or more than one of them, fails here.
     """
-    assert all("starlette.testclient" in m for m in _IMPORT_WARNINGS), _IMPORT_WARNINGS
+    assert set(_IMPORT_WARNINGS) <= {EXPECTED_IMPORT_WARNING}, _IMPORT_WARNINGS
     assert len(_IMPORT_WARNINGS) <= 1, _IMPORT_WARNINGS
 
 
@@ -243,13 +341,185 @@ def _stub_download(monkeypatch):
     monkeypatch.setattr(serve.yf, "download", lambda *a, **k: frame.copy())
 
 
+# ── Driving the real news seam ────────────────────────────────────────────────
+# The point of this task is that a *production* sentiment failure must be
+# visible.  ``features.fetchers.fetch_news_sentiment`` returns the same ``0.0``
+# for every one of them and never raises, so a test that stubs it with something
+# that raises proves nothing about the seam production actually uses — that was
+# the flaw in the first version of these tests.  Everything below therefore runs
+# the real ``news_sentiment`` module.  Only the two third-party collaborators it
+# talks to are stood in for, and each stand-in carries exactly the surface the
+# module uses.
+
+class _FakeAnalyzer:
+    """``vaderSentiment``'s analyzer, as ``analyze_sentiment`` uses it.
+
+    One method, ``polarity_scores(text) -> {"compound": float}``, and a fixed
+    compound so the expected overlay arithmetic is exact.  ``VADER_AVAILABLE`` is
+    forced true alongside it — the state a genuine install produces — so the
+    module's real lazy-load path in ``get_sentiment_analyzer`` runs.
+    """
+
+    COMPOUND = 0.4
+
+    def polarity_scores(self, text):
+        return {"compound": self.COMPOUND}
+
+
+class _NeutralAnalyzer(_FakeAnalyzer):
+    """The same analyzer, reading every headline as genuinely neutral."""
+
+    COMPOUND = 0.0
+
+
+class _FakeResponse:
+    """``requests.Response``, as ``fetch_news`` uses it: status and ``json()``."""
+
+    def __init__(self, status_code, payload=None):
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {}
+
+    def json(self):
+        return self._payload
+
+
+def _articles(*titles):
+    """A NewsAPI success body carrying one article per title."""
+    return {"articles": [{"title": title} for title in titles]}
+
+
+def _fake_newsapi(monkeypatch, *responses):
+    """Point ``news_sentiment``'s HTTP client at canned responses.
+
+    ``fetch_news`` uses exactly one attribute of ``requests`` — ``get`` — so the
+    stand-in is that attribute and nothing else.  Responses are consumed in call
+    order and the last repeats, because the function tries up to three search
+    strategies; one response therefore covers every strategy, which is what the
+    "endpoint answered with no articles" case needs.
+    """
+    queue = list(responses)
+    calls = []
+
+    def get(url, params=None, timeout=None):
+        calls.append(params)
+        return queue.pop(0) if len(queue) > 1 else queue[0]
+
+    monkeypatch.setattr(news_sentiment, "requests", types.SimpleNamespace(get=get))
+    return calls
+
+
+def _vader_present(monkeypatch, analyzer=_FakeAnalyzer):
+    """Put the module in the state a real ``vaderSentiment`` install produces."""
+    monkeypatch.setattr(news_sentiment, "VADER_AVAILABLE", True)
+    monkeypatch.setattr(
+        news_sentiment, "SentimentIntensityAnalyzer", analyzer, raising=False
+    )
+    monkeypatch.setattr(news_sentiment, "_sentiment_analyzer", None)
+
+
+@pytest.fixture
+def news_sentiment_state(tmp_path, monkeypatch):
+    """The real module, with its on-disk cache and its optional dependency isolated.
+
+    ``CACHE_DIR`` is redirected because the real path is a repository cache the
+    module writes on every call (``data/sentiment/<ticker>.json``), and because an
+    entry already sitting there would answer before the seam under test was
+    reached — the repo's own cache is full of ``n_articles: 0`` entries that a
+    pre-fix run persisted as neutral scores.
+    """
+    monkeypatch.setattr(news_sentiment, "CACHE_DIR", str(tmp_path / "sentiment"))
+    monkeypatch.setattr(news_sentiment, "_sentiment_analyzer", None)
+    return news_sentiment
+
+
+# The production failure modes, each as "the state the module is left in".  None
+# of them raises anywhere: that is exactly why the overlay's ``except`` was dead
+# code, and why the reason has to travel as data.
+def _mode_no_key(monkeypatch):
+    monkeypatch.setattr(news_sentiment, "NEWSAPI_KEY", "")
+    _vader_present(monkeypatch)
+
+
+def _mode_dead_endpoint(monkeypatch):
+    monkeypatch.setattr(news_sentiment, "NEWSAPI_KEY", "test-key")
+    _vader_present(monkeypatch)
+
+    def refuse(url, params=None, timeout=None):
+        raise ConnectionError("connection refused")
+
+    monkeypatch.setattr(news_sentiment, "requests", types.SimpleNamespace(get=refuse))
+
+
+def _mode_rejected_key(monkeypatch):
+    monkeypatch.setattr(news_sentiment, "NEWSAPI_KEY", "test-key")
+    _vader_present(monkeypatch)
+    _fake_newsapi(monkeypatch, _FakeResponse(401, {"status": "error"}))
+
+
+def _mode_rate_limited(monkeypatch):
+    monkeypatch.setattr(news_sentiment, "NEWSAPI_KEY", "test-key")
+    _vader_present(monkeypatch)
+    _fake_newsapi(monkeypatch, _FakeResponse(429))
+
+
+def _mode_no_vader(monkeypatch):
+    """The plain-venv case: the key and the endpoint are fine, VADER is absent."""
+    monkeypatch.setattr(news_sentiment, "NEWSAPI_KEY", "test-key")
+    monkeypatch.setattr(news_sentiment, "VADER_AVAILABLE", False)
+    monkeypatch.setattr(news_sentiment, "_sentiment_analyzer", None)
+    _fake_newsapi(monkeypatch, _FakeResponse(200, _articles("Bank BCA profit rises")))
+
+
+def _mode_no_articles(monkeypatch):
+    monkeypatch.setattr(news_sentiment, "NEWSAPI_KEY", "test-key")
+    _vader_present(monkeypatch)
+    _fake_newsapi(monkeypatch, _FakeResponse(200, {"articles": []}))
+
+
+#: The reason each failure mode must be named with.  Written as literals rather
+#: than read from the module so that this table is a *behavioural* pin: if a
+#: reason string is renamed, the overlay's log line stops matching these and the
+#: mode test fails.  ``test_the_reason_constants_are_what_the_tests_expect`` ties
+#: the literals back to the module's own constants.
+NO_NEWSAPI_KEY_REASON = "NEWSAPI_KEY is not set"
+NO_VADER_REASON = "vaderSentiment is not installed"
+RATE_LIMITED_REASON = "NewsAPI rate limit reached (HTTP 429)"
+
+FAILURE_MODES = [
+    pytest.param(_mode_no_key, NO_NEWSAPI_KEY_REASON, id="no-newsapi-key"),
+    pytest.param(_mode_dead_endpoint, "ConnectionError", id="dead-endpoint"),
+    pytest.param(_mode_rejected_key, "NewsAPI returned HTTP 401", id="rejected-key"),
+    pytest.param(_mode_rate_limited, RATE_LIMITED_REASON, id="rate-limited"),
+    pytest.param(_mode_no_vader, NO_VADER_REASON, id="no-vader"),
+    pytest.param(_mode_no_articles, "returned no articles", id="no-articles"),
+]
+
+
+def test_the_reason_constants_are_what_the_tests_expect():
+    """The mode table above is tied to the module's own reason strings."""
+    assert news_sentiment.NO_NEWSAPI_KEY == NO_NEWSAPI_KEY_REASON
+    assert news_sentiment.NO_VADER == NO_VADER_REASON
+    assert news_sentiment.NEWSAPI_RATE_LIMITED == RATE_LIMITED_REASON
+
+
+@pytest.fixture
+def healthy_news(news_sentiment_state, monkeypatch):
+    """The real seam in the state a healthy production fetch produces."""
+    monkeypatch.setattr(news_sentiment, "NEWSAPI_KEY", "test-key")
+    _vader_present(monkeypatch)
+    _fake_newsapi(monkeypatch, _FakeResponse(200, _articles("Bank BCA profit rises")))
+    return news_sentiment
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     """A ``TestClient`` over ``serve.app`` with the cache and model stubbed.
 
-    ``_apply_sentiment_overlay`` is *not* stubbed here: the tests below patch
-    ``features.fetchers.fetch_news_sentiment`` instead, so they drive the real
-    overlay, the real ``degraded`` bookkeeping and the real ``warning``.
+    ``_apply_sentiment_overlay`` is *not* stubbed here, and neither is the
+    fetcher it reads: the tests below drive the real
+    ``features.fetchers.fetch_news_sentiment_status`` against the real
+    ``news_sentiment`` module, so they exercise the seam production uses — not a
+    stub whose shape production never produces.
 
     The prediction cache is pre-populated for ``BBCA.JK``, so ``/predict`` takes
     its fast path.  That is deliberate: these tests are about what the response
@@ -269,69 +539,144 @@ def client(tmp_path, monkeypatch):
 # `degraded` is real — both directions
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def test_a_sentiment_failure_is_a_200_naming_the_failed_component(
-        client, monkeypatch, caplog):
-    """A dead news API is a 200 with ``degraded == ["sentiment"]``, plus a warning.
+@pytest.mark.parametrize("prepare, expected_reason", FAILURE_MODES)
+def test_every_real_sentiment_failure_mode_is_degraded_and_named(
+        client, news_sentiment_state, monkeypatch, caplog, prepare, expected_reason):
+    """Each production failure mode is ``degraded == ["sentiment"]`` plus a warning.
 
-    The prediction itself is intact — sentiment is an overlay, never a blocker —
-    so the honest answer is "here is the signal, computed without sentiment".  A
-    bare ``0.0`` said "the news was neutral", which is not what happened.
+    The prediction itself stays intact — sentiment is an overlay, never a blocker
+    — so the honest answer is "here is the signal, computed without sentiment".
+    What must never happen is the old one: a bare ``0.0`` saying "the news was
+    neutral", which is not what happened.
 
-    The fetcher is replaced with one that *raises*, because that is the shape of
-    the failure: ``features.fetchers.fetch_news_sentiment`` already swallows its
-    own errors and returns ``0.0``, which is exactly why a dead NewsAPI key and
-    a quiet news day were the same value in the response.
+    The four modes differ only in the state they leave the *real* module in (no
+    key, an unreachable or rejected endpoint, a 429, no VADER).  Nothing here
+    replaces the seam with something that raises, because the seam does not
+    raise: all of these used to return ``0.0`` from it, which is how the
+    overlay's ``except`` came to be dead code.
     """
-    import features.fetchers as fetchers
-
-    def no_news(ticker):
-        raise RuntimeError("news api down")
-
-    monkeypatch.setattr(fetchers, "fetch_news_sentiment", no_news)
+    prepare(monkeypatch)
 
     with caplog.at_level(logging.WARNING):
+        # Cleared after the level is raised but before the request: the module's
+        # own import-time "vaderSentiment not installed" notice is emitted at
+        # collection, and this assertion is about what the request logged.
+        caplog.clear()
         response = client.post("/predict", json={"ticker": "BBCA.JK"})
 
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["degraded"] == ["sentiment"], body
-    assert body["sentiment_score"] == 0.0
     assert body["prediction"] in (0, 1)
-    # Matched on the ASCII prefix only: this message contains a non-ASCII dash,
-    # and ``caplog`` re-reads the module's source to render the record on a
-    # cp1252 console, which mangles anything after that byte.  The prefix is
-    # unambiguous and is the part an operator greps for.
+    assert body["sentiment_score"] == 0.0, body
+
+    lines = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert any(
-        record.getMessage().startswith("Sentiment unavailable")
-        and record.levelno >= logging.WARNING
-        for record in caplog.records
-    ), [record.getMessage() for record in caplog.records]
+        "Sentiment unavailable" in line and expected_reason in line for line in lines
+    ), lines
 
 
-def test_a_healthy_sentiment_fetch_leaves_degraded_empty(client, monkeypatch):
-    """The negative direction: no failure, no flag, no invented degradation."""
+@pytest.mark.parametrize("prepare, expected_reason", FAILURE_MODES)
+def test_the_value_only_fetcher_still_returns_a_float(
+        news_sentiment_state, monkeypatch, prepare, expected_reason):
+    """Existing callers keep working: the failure is still a float, not an exception.
+
+    ``build_features``'s ``news_sentiment`` model input needs a float (a neutral
+    ``0.0`` for "unavailable" is acceptable and consistent with training), and
+    ``cli.py sentiment`` must not crash — so the value-only fetcher keeps
+    returning ``0.0`` for every failure mode.  The status companion is what makes
+    that ``0.0`` visible, and the second half of this test pins that the
+    unavailability survives the module's cache: the reason read back is the
+    reason that was written, not a fresh guess.
+    """
     import features.fetchers as fetchers
 
-    monkeypatch.setattr(fetchers, "fetch_news_sentiment", lambda ticker: 0.25)
+    prepare(monkeypatch)
 
+    score = fetchers.fetch_news_sentiment("BBCA.JK")
+    assert isinstance(score, float) and score == 0.0
+
+    _, available, reason = fetchers.fetch_news_sentiment_status("BBCA.JK")
+    assert available is False
+    assert expected_reason in reason, reason
+
+
+def test_a_plain_venv_degradation_is_visible(
+        client, news_sentiment_state, monkeypatch, caplog):
+    """The state ``AGENTS.md`` documents: no ``NEWSAPI_KEY`` and no ``vaderSentiment``.
+
+    ``pip install -r requirements.txt`` installs neither, so this is the default
+    developer environment, and the documented guarantee is that the degradation
+    there is visible as ``degraded: ["sentiment"]`` *and* a ``warning`` — not only
+    in the score.  That sentence was false while the failure was silent; it is
+    asserted here so it cannot quietly become false again.
+
+    The reason named is the missing key rather than the missing analyser: the key
+    is checked first, because a request that never leaves the machine cannot be
+    blamed on VADER.  With a key set and no VADER, the ``no-vader`` mode above
+    names VADER instead — the two are separable, which is the point.
+    """
+    monkeypatch.setattr(news_sentiment, "NEWSAPI_KEY", "")
+    monkeypatch.setattr(news_sentiment, "VADER_AVAILABLE", False)
+    monkeypatch.setattr(news_sentiment, "_sentiment_analyzer", None)
+
+    with caplog.at_level(logging.WARNING):
+        caplog.clear()
+        response = client.post("/predict", json={"ticker": "BBCA.JK"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["degraded"] == ["sentiment"], body
+    lines = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        "Sentiment unavailable" in line and NO_NEWSAPI_KEY_REASON in line
+        for line in lines
+    ), lines
+
+
+def test_a_real_sentiment_score_still_flows_through_unchanged(client, healthy_news):
+    """The success path is untouched: the score reaches the response, and the
+    overlay arithmetic is exactly what it was.
+
+    ``fetch_news_sentiment_status`` returns ``available=True`` here, so the score
+    is used as a score — the change is additive on the failure path only.
+    """
     response = client.post("/predict", json={"ticker": "BBCA.JK"})
 
     assert response.status_code == 200, response.text
-    assert response.json()["degraded"] == [], response.json()
+    body = response.json()
+    assert body["degraded"] == [], body
+    assert body["sentiment_score"] == _FakeAnalyzer.COMPOUND
+    assert body["probability_adjusted"] == pytest.approx(
+        round(0.6 + _FakeAnalyzer.COMPOUND * 0.10, 4)
+    )
+    assert body["signal_adjusted"] == "BUY"
 
 
-def test_a_healthy_sentiment_fetch_is_silent(client, monkeypatch, caplog):
-    """A successful overlay logs no warning — ``degraded`` must stay meaningful."""
-    import features.fetchers as fetchers
+def test_a_genuine_neutral_reading_is_not_degraded(
+        client, news_sentiment_state, monkeypatch, caplog):
+    """A successful analysis that happens to score 0.0 is not a degradation.
 
-    monkeypatch.setattr(fetchers, "fetch_news_sentiment", lambda ticker: 0.0)
+    This is the other half of the fix, and the reason the mechanism is a status
+    rather than "treat 0.0 as failure": a quiet news day and a dead news API both
+    produce ``sentiment_score == 0.0``, and now they are distinguishable — one
+    carries ``degraded == []`` and logs nothing, the other carries
+    ``degraded == ["sentiment"]`` and logs the reason.
+    """
+    monkeypatch.setattr(news_sentiment, "NEWSAPI_KEY", "test-key")
+    _vader_present(monkeypatch, _NeutralAnalyzer)
+    _fake_newsapi(monkeypatch, _FakeResponse(200, _articles("Bank BCA holds steady")))
 
     with caplog.at_level(logging.WARNING):
+        caplog.clear()
         response = client.post("/predict", json={"ticker": "BBCA.JK"})
 
-    assert response.status_code == 200
-    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], \
-        [r.getMessage() for r in caplog.records]
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["degraded"] == [], body
+    assert body["sentiment_score"] == 0.0, body
+    noisy = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert noisy == [], noisy
 
 
 def test_a_downstream_feature_failure_is_never_a_signal(client, monkeypatch):
@@ -407,8 +752,14 @@ def test_a_failing_batch_ticker_is_502_not_a_sell(monkeypatch):
     assert "signals" not in response.text
 
 
-def test_a_healthy_batch_ticker_still_returns_a_signal(tmp_path, monkeypatch):
-    """The counterpart: the 502 is the failure path and nothing else changed."""
+def test_a_healthy_batch_ticker_still_returns_a_signal(
+        tmp_path, monkeypatch, healthy_news):
+    """The counterpart: the 502 is the failure path and nothing else changed.
+
+    ``healthy_news`` drives the real fetcher to a success, so the ``degraded``
+    assertion below is about the batch path staying clean rather than about a
+    stub that was told to look clean.
+    """
     import serve
 
     client = TestClient(serve.app)
@@ -416,7 +767,6 @@ def test_a_healthy_batch_ticker_still_returns_a_signal(tmp_path, monkeypatch):
     monkeypatch.setattr(serve, "load_best_model", lambda ticker: (_StubModel(), list(SCHEMA)))
     monkeypatch.setattr(serve, "build_inference_features",
                         lambda df, ticker, fundamentals: pd.DataFrame([{"rsi": 0.5}]))
-    monkeypatch.setattr("features.fetchers.fetch_news_sentiment", lambda ticker: 0.25)
     _stub_batch_io(monkeypatch)
 
     response = client.post("/predict/batch", json={"tickers": ["BBCA.JK"]})
@@ -561,18 +911,52 @@ def test_a_supplied_family_is_not_reported_as_omitted(
     assert not [m for m in families if "google_trend" in m], families
 
 
+def test_a_supplied_but_empty_family_is_silent(
+        raw_ohlcv, ihsg_frame, fundamentals_dict, caplog):
+    """A supplied-but-*empty* dict is supplied: it is not an omission.
+
+    ``vp_features={}`` and ``idx_fundamentals={}`` are exactly what the training
+    wrapper passes when its fetch failed — ``compute_volume_profile_features``
+    returns ``{}`` on every failure path — so this is a real production shape, and
+    it was the unpinned one.  The columns stay absent, as they must (never
+    fabricated), and nothing is reported as *omitted*: the omission warning names a
+    caller who forgot a family, and this caller did not.  The failure that produced
+    the empty dict is named where it happened, by
+    ``test_a_volume_profile_download_failure_logs_at_warning``.
+    """
+    import features.pipeline as p
+
+    with caplog.at_level(logging.WARNING):
+        out = p.build_features(
+            raw_ohlcv, "BBCA.JK",
+            fundamentals=fundamentals_dict, usdidr=None, fred_macro=None,
+            bi_rate=None, ihsg=ihsg_frame, news_sentiment=0.0,
+            google_trend=-0.5, vp_features={}, idx_fundamentals={},
+            mode="full", with_target=True,
+        )
+
+    assert out is not None
+    assert not [c for c in out.columns if c.startswith("vp_")]
+    assert _omission_warnings(caplog, "volume_profile") == [], caplog.records
+    assert _omission_warnings(caplog, "idx_fundamentals") == [], caplog.records
+
+
 def test_a_healthy_serving_request_logs_no_omission_warning(
-        raw_ohlcv, ihsg_frame, fundamentals_dict, tmp_path, monkeypatch, caplog):
+        raw_ohlcv, ihsg_frame, fundamentals_dict, tmp_path, monkeypatch, caplog,
+        healthy_news):
     """The whole point: the serving path is silent about its standing omissions.
 
     This drives the *real* ``serve.build_inference_features`` — the only serving
-    caller of ``build_features`` — through ``POST /predict``, with the universe,
-    macro caches and sentiment stubbed offline.  It is the request shape an
-    operator sees on a healthy day, and it must produce neither an omission
-    warning nor a ``degraded`` entry.
+    caller of ``build_features`` — through ``POST /predict``, with the universe
+    and the macro caches stubbed offline.  It is the request shape an operator
+    sees on a healthy day, and it must produce neither an omission warning nor a
+    ``degraded`` entry.
+
+    Sentiment is a *real* fetch here too (``healthy_news``), not a stub: a
+    request only counts as healthy if the component the previous round of this
+    task was about is genuinely reporting itself healthy.
     """
     import serve
-    import features.fetchers as fetchers
     from datetime import date as _date
 
     monkeypatch.setattr(serve, "PRED_CACHE_DB", str(tmp_path / "cache.db"))
@@ -592,7 +976,6 @@ def test_a_healthy_serving_request_logs_no_omission_warning(
     monkeypatch.setattr(serve, "fetch_fundamentals", lambda ticker: {})
     monkeypatch.setattr(serve.yf, "download",
                         lambda *a, **k: raw_ohlcv["BBCA.JK"].dropna().copy())
-    monkeypatch.setattr(fetchers, "fetch_news_sentiment", lambda ticker: 0.25)
 
     all_ticker_data = {t: raw_ohlcv[t].dropna() for t in ("BBCA.JK", "BBRI.JK", "BMRI.JK")}
     monkeypatch.setattr(serve, "load_universe_context",
@@ -608,6 +991,7 @@ def test_a_healthy_serving_request_logs_no_omission_warning(
 
     client = TestClient(serve.app)
     with caplog.at_level(logging.WARNING):
+        caplog.clear()
         response = client.post("/predict", json={"ticker": "BBCA.JK"})
 
     assert response.status_code == 200, response.text
@@ -623,6 +1007,40 @@ def test_a_healthy_serving_request_logs_no_omission_warning(
 # ═══════════════════════════════════════════════════════════════════════════════
 # R4 — a volume-profile download failure is visible, and still returns {}
 # ═══════════════════════════════════════════════════════════════════════════════
+# ``compute_volume_profile_features`` gained four ``warning`` lines in this task
+# and only the first of them was covered.  A visibility constraint whose warnings
+# are untested is a constraint that can be deleted without anyone noticing, so
+# each branch gets a driver here — and the success path gets a negative control,
+# which is what keeps the other four meaningful.
+
+def _vp_warnings(caplog, cause: str) -> list[str]:
+    """Records at WARNING or above that mention ``cause``."""
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno >= logging.WARNING and cause in r.getMessage()
+    ]
+
+
+def _stub_intraday(monkeypatch, frame):
+    """Make ``volume_profile``'s download return ``frame`` (or raise, if given)."""
+    monkeypatch.setattr("ingest.download_intraday_data", frame, raising=False)
+
+
+def _intraday_frame(rows: int, start: str = "2024-01-02 09:00") -> pd.DataFrame:
+    """A plausible 5-minute intraday frame with unique minute-resolution rows."""
+    index = pd.date_range(start, periods=rows, freq="5min", name="Datetime")
+    price = np.linspace(100.0, 101.0, rows)
+    return pd.DataFrame(
+        {
+            "Open": price,
+            "High": price + 0.2,
+            "Low": price - 0.2,
+            "Close": price,
+            "Volume": np.linspace(1_000.0, 2_000.0, rows),
+        },
+        index=index,
+    )
+
 
 def test_a_volume_profile_download_failure_logs_at_warning(monkeypatch, caplog):
     """R4: the failure was ``logger.debug``, so 19 features vanished silently."""
@@ -631,7 +1049,7 @@ def test_a_volume_profile_download_failure_logs_at_warning(monkeypatch, caplog):
     def explode(*args, **kwargs):
         raise RuntimeError("intraday download refused")
 
-    monkeypatch.setattr("ingest.download_intraday_data", explode, raising=False)
+    _stub_intraday(monkeypatch, explode)
 
     with caplog.at_level(logging.WARNING):
         result = vp.compute_volume_profile_features("BBCA.JK")
@@ -641,6 +1059,86 @@ def test_a_volume_profile_download_failure_logs_at_warning(monkeypatch, caplog):
         "BBCA.JK" in record.getMessage() and record.levelno >= logging.WARNING
         for record in caplog.records
     ), [r.getMessage() for r in caplog.records]
+
+
+def test_a_volume_profile_import_failure_logs_at_warning(monkeypatch, caplog):
+    """R4's first branch: ``ingest`` is not importable, so 19 columns go missing.
+
+    ``sys.modules[...] = None`` is how CPython is told an import is refused: the
+    ``from ingest import download_intraday_data`` inside the function then raises
+    a real ``ImportError``, which is the shape the handler exists for.
+    """
+    import features.volume_profile as vp
+
+    monkeypatch.setitem(sys.modules, "ingest", None)
+
+    with caplog.at_level(logging.WARNING):
+        result = vp.compute_volume_profile_features("BBCA.JK")
+
+    assert result == {}, result
+    named = _vp_warnings(caplog, "not importable")
+    assert named, [r.getMessage() for r in caplog.records]
+
+
+def test_a_volume_profile_empty_download_logs_at_warning(monkeypatch, caplog):
+    """R4's second branch: the download succeeded and returned nothing usable.
+
+    Both halves are driven — an empty frame and a frame below the ten-row floor —
+    because they take the same branch for the same reason and a regression in
+    either direction should be visible.
+    """
+    import features.volume_profile as vp
+
+    for label, frame in (("empty", pd.DataFrame()),
+                         ("too short", _intraday_frame(4))):
+        caplog.clear()
+        _stub_intraday(monkeypatch, lambda *a, **k: frame)
+        with caplog.at_level(logging.WARNING):
+            result = vp.compute_volume_profile_features("BBCA.JK")
+        assert result == {}, (label, result)
+        named = _vp_warnings(caplog, "empty or too short")
+        assert named, (label, [r.getMessage() for r in caplog.records])
+
+
+def test_a_volume_profile_short_latest_session_logs_at_warning(monkeypatch, caplog):
+    """R4's third branch: enough rows overall, too few in the latest session.
+
+    One session carries 12 rows and the next only 3, which is what a partial
+    trading day looks like — the frame passes the earlier length gate and the
+    features would otherwise be computed from three points.
+    """
+    import features.volume_profile as vp
+
+    frame = pd.concat([
+        _intraday_frame(12, "2024-01-02 09:00"),
+        _intraday_frame(3, "2024-01-03 09:00"),
+    ])
+    _stub_intraday(monkeypatch, lambda *a, **k: frame)
+
+    with caplog.at_level(logging.WARNING):
+        result = vp.compute_volume_profile_features("BBCA.JK")
+
+    assert result == {}, result
+    named = _vp_warnings(caplog, "latest session")
+    assert named, [r.getMessage() for r in caplog.records]
+
+
+def test_a_successful_volume_profile_download_warns_about_nothing(monkeypatch, caplog):
+    """The negative control: the four warnings above are failure-specific.
+
+    Without this, "the failure is visible" would be satisfied by a function that
+    warns unconditionally — which is the noise that teaches operators to ignore
+    the channel.
+    """
+    import features.volume_profile as vp
+
+    _stub_intraday(monkeypatch, lambda *a, **k: _intraday_frame(60))
+
+    with caplog.at_level(logging.WARNING):
+        result = vp.compute_volume_profile_features("BBCA.JK")
+
+    assert result, result
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
 def test_the_volume_profile_omission_is_named_by_the_training_wrapper(

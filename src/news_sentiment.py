@@ -27,17 +27,59 @@ import requests
 import time
 from datetime import datetime, timedelta
 import json
+from typing import NamedTuple, Optional
+
+from config import TICKERS, CACHE_CONFIG, get_logger
+
+logger = get_logger(__name__)
 
 try:
     from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
     VADER_AVAILABLE = True
 except ImportError:
     VADER_AVAILABLE = False
-    print("⚠️ vaderSentiment not installed — run: pip install vaderSentiment")
+    # ``logger.warning``, not ``print``: a bare print of this message writes a
+    # non-ASCII character to stdout, and on a stream whose encoding cannot carry
+    # it (a pipe or a redirect on a cp1252 host) it raises ``UnicodeEncodeError``
+    # *during this module's import*.  ``fetch_news_sentiment`` catches every
+    # exception, so the whole news path then failed as a silent 0.0 — a
+    # dependency notice turning into the very defect this task removes.  Logging
+    # is also what the sibling fetcher does for its missing optional dependency
+    # (``features/fetchers.py``: fredapi, pytrends), and it is visible to
+    # operators instead of only to whatever stdout happens to be attached.
+    logger.warning("vaderSentiment not installed — run: pip install vaderSentiment")
 
-from config import TICKERS, CACHE_CONFIG, get_logger
 
-logger = get_logger(__name__)
+class SentimentResult(NamedTuple):
+    """A sentiment score together with whether it is a *measurement*.
+
+    ``0.0`` has two entirely different meanings — "the headlines VADER read were
+    neutral" and "there was no news product at all" — and this module reported
+    both as the same float.  The serving overlay built its ``degraded`` list on
+    that ambiguity, so a missing ``NEWSAPI_KEY``, a dead NewsAPI endpoint, a 429
+    and an absent ``vaderSentiment`` all arrived as a clean neutral reading, with
+    no warning (F8).
+
+    ``score`` is always a float, so a caller that only wants the feature value is
+    unaffected.  ``available`` is ``False`` exactly when ``score`` is the
+    fallback rather than a computed value, and ``reason`` then names the failure
+    in operator-readable terms.
+
+    Ordered ``(score, available, reason)`` so it can be unpacked positionally by
+    a caller that does not want to import this class.
+    """
+
+    score: float
+    available: bool
+    reason: Optional[str] = None
+
+
+#: Reason strings for the failure modes that make a score unavailable.  Each is
+#: the reason an operator reads on the overlay's ``warning`` line, so they are
+#: distinct and specific rather than one shared "sentiment failed".
+NO_NEWSAPI_KEY = "NEWSAPI_KEY is not set"
+NO_VADER = "vaderSentiment is not installed"
+NEWSAPI_RATE_LIMITED = "NewsAPI rate limit reached (HTTP 429)"
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY", "")
@@ -128,22 +170,27 @@ def analyze_sentiment(texts: list) -> float:
 
 # ── News Fetching ─────────────────────────────────────────────────────────────
 
-def fetch_news(ticker: str, days_back: int = 3) -> list:
-    """Fetch recent news headlines for a ticker via NewsAPI.
+def _fetch_news_with_reason(ticker: str, days_back: int = 3) -> "tuple[list, Optional[str]]":
+    """Fetch recent news headlines, and say why there are none when there are none.
 
-    Tries English keywords first, then falls back to ticker name search,
-    then tries without language filter for Indonesian-language coverage.
+    ``fetch_news`` is the headline-only view of this function.  The reason it
+    returns is what lets a caller tell "NewsAPI answered and had nothing" from
+    "NewsAPI never answered" — the distinction every failure mode used to be
+    collapsed into, because all of them ended as an empty list and therefore as
+    a ``0.0`` score.
 
     Args:
         ticker: Stock ticker (e.g. 'BBCA.JK')
         days_back: How many days of news to fetch
 
     Returns:
-        List of headline text strings, or empty list on failure.
+        ``(headlines, reason)``.  ``reason`` is ``None`` only when the endpoint
+        answered and produced at least one headline; otherwise it names the
+        failure (no key, rate limit, endpoint error, or no articles).
     """
     if not NEWSAPI_KEY:
         logger.debug("No NEWSAPI_KEY set — skipping news fetch for %s", ticker)
-        return []
+        return [], NO_NEWSAPI_KEY
 
     search_term = TICKER_KEYWORDS.get(ticker, ticker.replace(".JK", ""))
     from_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
@@ -158,6 +205,8 @@ def fetch_news(ticker: str, days_back: int = 3) -> list:
         {"q": search_term.split()[0] if " " in search_term else search_term, "language": "en"},
     ]
 
+    endpoint_error: Optional[str] = None
+    answered_without_articles = False
     for strategy in strategies:
         try:
             r = requests.get(NEWSAPI_URL, params={
@@ -168,24 +217,65 @@ def fetch_news(ticker: str, days_back: int = 3) -> list:
                 "pageSize": 10,
                 **{k: v for k, v in strategy.items() if k != "q"},
             }, timeout=10)
-
-            if r.status_code == 200:
-                data = r.json()
-                articles = data.get("articles", [])
-                headlines = [a.get("title", "") for a in articles if a.get("title")]
-                if headlines:
-                    logger.debug("Found %d articles for %s (strategy: %s)",
-                                len(headlines), ticker, strategy)
-                    return headlines
-            elif r.status_code == 429:
-                logger.warning("NewsAPI rate limited for %s", ticker)
-                return []
-            # Other errors: try next strategy
-        except Exception:
+        except Exception as e:
+            endpoint_error = f"NewsAPI request failed ({type(e).__name__}: {e})"
             continue
 
+        if r.status_code == 429:
+            logger.warning("NewsAPI rate limited for %s", ticker)
+            return [], NEWSAPI_RATE_LIMITED
+        if r.status_code != 200:
+            # 401/403 (bad or revoked key) and 5xx land here, and every one of
+            # them used to be indistinguishable from a quiet news day.
+            endpoint_error = f"NewsAPI returned HTTP {r.status_code}"
+            continue
+
+        try:
+            data = r.json()
+        except Exception as e:
+            endpoint_error = f"NewsAPI returned unparseable JSON ({type(e).__name__}: {e})"
+            continue
+
+        articles = data.get("articles", [])
+        headlines = [a.get("title", "") for a in articles if a.get("title")]
+        if headlines:
+            logger.debug("Found %d articles for %s (strategy: %s)",
+                        len(headlines), ticker, strategy)
+            return headlines, None
+        answered_without_articles = True
+
     logger.debug("No articles found for %s with any strategy", ticker)
-    return []
+
+    if endpoint_error is not None:
+        return [], f"{endpoint_error} for {ticker} (every search strategy failed)"
+    if answered_without_articles:
+        # A 200 with no usable titles is not a neutral reading: VADER was never
+        # given a headline to score, so the 0.0 that follows is an absent
+        # measurement.  Naming it is what keeps the fallback from passing as one.
+        return [], (f"NewsAPI returned no articles for {ticker} "
+                    f"(all {len(strategies)} search strategies, HTTP 200)")
+    return [], f"no search strategy produced a result for {ticker}"
+
+
+def fetch_news(ticker: str, days_back: int = 3) -> list:
+    """Fetch recent news headlines for a ticker via NewsAPI.
+
+    Tries English keywords first, then falls back to ticker name search,
+    then tries without language filter for Indonesian-language coverage.
+
+    The headline-only view of :func:`_fetch_news_with_reason`: an empty list
+    here carries no explanation, so a caller that must tell an unavailable
+    source from a quiet one wants that function instead.
+
+    Args:
+        ticker: Stock ticker (e.g. 'BBCA.JK')
+        days_back: How many days of news to fetch
+
+    Returns:
+        List of headline text strings, or empty list on failure.
+    """
+    headlines, _reason = _fetch_news_with_reason(ticker, days_back)
+    return headlines
 
 
 # ── Caching ───────────────────────────────────────────────────────────────────
@@ -226,15 +316,34 @@ def get_ticker_sentiment(ticker: str, force_refresh: bool = False) -> dict:
     Checks cache first, then fetches fresh news and computes sentiment.
 
     Returns:
-        dict with keys: ticker, sentiment_score, n_articles, n_headlines
+        dict with keys: ticker, sentiment_score, n_articles, n_headlines,
+        available, reason.  ``available`` is ``False`` when ``sentiment_score``
+        is the fallback ``0.0`` rather than a measurement, and ``reason`` then
+        names why.  Both are written to the cache alongside the score, so an
+        unavailable reading cannot come back out of the cache looking like a
+        neutral one.
     """
     if not force_refresh:
         cached = load_cache(ticker)
-        if cached and "sentiment_score" in cached:
+        # An entry written before this module recorded ``available`` has unknown
+        # provenance: it may be a *failed* fetch cached as a neutral score, which
+        # is how a dead key used to be persisted (``data/sentiment/`` is full of
+        # ``{"sentiment_score": 0.0, "n_articles": 0}`` from exactly that).  Such
+        # an entry is refetched rather than believed — the refetch overwrites it
+        # with a marked one, so this costs one call per ticker after an upgrade.
+        if cached and "sentiment_score" in cached and "available" in cached:
             return cached
 
-    headlines = fetch_news(ticker)
-    score = analyze_sentiment(headlines)
+    headlines, reason = _fetch_news_with_reason(ticker)
+
+    if reason is None and get_sentiment_analyzer() is None:
+        # The endpoint answered, so the blocker is local: VADER is absent.
+        # Deliberately checked *after* the fetch — checking it first would report
+        # a missing dependency for a request that never got that far, and a 429
+        # has to stay distinguishable from an absent analyser.
+        reason = NO_VADER
+
+    score = 0.0 if reason is not None else analyze_sentiment(headlines)
     n_headlines = len(headlines)
 
     result = {
@@ -242,6 +351,8 @@ def get_ticker_sentiment(ticker: str, force_refresh: bool = False) -> dict:
         "sentiment_score": score,
         "n_articles": n_headlines,
         "n_headlines": n_headlines,
+        "available": reason is None,
+        "reason": reason,
         "fetched_at": datetime.now().isoformat(),
     }
 
@@ -282,16 +393,41 @@ def get_all_sentiments(tickers: list = None, force_refresh: bool = False,
 # FEATURE INTEGRATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def get_sentiment_with_status(ticker: str) -> SentimentResult:
+    """Get the sentiment score *and* whether it is a measurement.
+
+    This is the seam the serving overlay reads.  A caller that takes the ``0.0``
+    without consulting ``available`` is reporting a failure as a successful
+    neutral reading, which is F8.
+
+    Never raises — an unavailable source is reported through
+    ``available``/``reason`` rather than through an exception, because none of
+    the four production failure modes (no ``NEWSAPI_KEY``, a dead endpoint, a
+    429, no ``vaderSentiment``) can be detected from the returned value alone,
+    and an exception is a shape the real code produces only when something
+    outside these four breaks.
+    """
+    try:
+        data = get_ticker_sentiment(ticker)
+    except Exception as e:
+        return SentimentResult(
+            0.0, False, f"sentiment lookup failed ({type(e).__name__}: {e})"
+        )
+
+    score = float(data.get("sentiment_score", 0.0))
+    if data.get("available", True):
+        return SentimentResult(score, True, None)
+    return SentimentResult(score, False, data.get("reason") or "sentiment unavailable")
+
+
 def get_sentiment_feature(ticker: str) -> float:
     """Get sentiment score for use as a feature.
 
     Returns a float between -1 and 1. Never raises — defaults to 0 on failure.
+    The value-only view of :func:`get_sentiment_with_status`, which is what a
+    caller needs when "unavailable" must not be presented as "neutral".
     """
-    try:
-        data = get_ticker_sentiment(ticker)
-        return data.get("sentiment_score", 0.0)
-    except Exception:
-        return 0.0
+    return get_sentiment_with_status(ticker).score
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

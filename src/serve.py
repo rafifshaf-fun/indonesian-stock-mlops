@@ -9,7 +9,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, BackgroundTasks
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Any, List
 import uvicorn
 from prometheus_fastapi_instrumentator import Instrumentator
@@ -670,6 +670,12 @@ def build_inference_features(df: pd.DataFrame, ticker: str,
     # Sentiment is fetched the way serving has always fetched it: flag-gated,
     # and 0.0 on any failure.  It is handed to the builder as a value rather
     # than written into the frame so the builder keeps ownership of the column.
+    # This call site is deliberately the *value-only* view
+    # (``fetch_news_sentiment``): the builder needs a float, and a neutral 0.0
+    # for "unavailable" is consistent with training.  Visibility belongs to the
+    # overlay below, which reads ``fetch_news_sentiment_status`` and reports the
+    # failure in ``degraded``; a silent fallback here is not a hidden one,
+    # because the overlay covers the same failure for the same request.
     news_sentiment = 0.0
     if FEATURE_FLAGS.get("news_sentiment", True):
         try:
@@ -758,8 +764,10 @@ class PredictResponse(BaseModel):
     # above are a *safe default*, which the project's convention requires, but a
     # safe default that is indistinguishable from a real value is how a dead
     # news API came to look like genuinely neutral news (F8).  Defaults to empty
-    # so a healthy response says so explicitly.
-    degraded: list[str] = []
+    # so a healthy response says so explicitly.  ``default_factory`` rather than
+    # a bare ``[]``: this must not depend on Pydantic deep-copying a mutable
+    # default.
+    degraded: list[str] = Field(default_factory=list)
 
 class BatchPredictResponse(BaseModel):
     predictions: List[PredictResponse]
@@ -813,29 +821,49 @@ def _apply_sentiment_overlay(ticker: str, prob: float, background_tasks=None) ->
     """Adjust model probability with news sentiment overlay.
 
     Fetches latest sentiment and tweaks probability by up to SENTIMENT_WEIGHT.
-    Falls back to 0.0 sentiment immediately on any error (no blocking) — but
-    reports that fallback, because ``sentiment_score == 0.0`` is also the honest
-    reading of "the headlines were neutral".  A failed fetch is therefore named
-    in ``degraded`` *and* logged at ``warning``, so an operator can tell a dead
-    news API from a quiet news day (F8).
+    Falls back to 0.0 sentiment when the news source is unavailable (no
+    blocking) — but reports that fallback, because ``sentiment_score == 0.0`` is
+    also the honest reading of "the headlines were neutral".  An unavailable
+    source is therefore named in ``degraded`` *and* logged at ``warning`` with
+    the reason, so an operator can tell a dead news API from a quiet news day
+    (F8).
+
+    The overlay reads ``fetch_news_sentiment_status``, not
+    ``fetch_news_sentiment``: the latter returns a bare float, and every real
+    failure mode of the news path — no ``NEWSAPI_KEY``, a dead/401 endpoint, a
+    429, no ``vaderSentiment`` — returns 0.0 from it without raising, so an
+    ``except`` around it could never fire.  Detecting a failure by catching an
+    exception was the defect this function exists to remove.
 
     Returns dict with sentiment_score, probability_adjusted, signal_adjusted,
     degraded.
     """
     sentiment = 0.0
     degraded: list[str] = []
+
     try:
-        from features.fetchers import fetch_news_sentiment
-        sentiment = fetch_news_sentiment(ticker)
-        sentiment = max(-1.0, min(1.0, sentiment))
+        from features.fetchers import fetch_news_sentiment_status
+        score, available, reason = fetch_news_sentiment_status(ticker)
     except Exception as e:
+        # Belt and braces.  The status companion swallows its own failures, so
+        # this fires only if the import or the seam itself breaks — and even
+        # then it is visible, never a bare ``pass`` (F8).
+        score, available, reason = 0.0, False, f"{type(e).__name__}: {e}"
+
+    if available:
+        sentiment = max(-1.0, min(1.0, float(score)))
+    else:
         # Never block a prediction on sentiment — but never hide the failure
-        # either.  This was a bare ``pass``, which is F8: the response carried a
-        # 0.0 that no caller could distinguish from a successful neutral fetch.
+        # either.  ``sentiment`` stays at the 0.0 initialised above, which is a
+        # safe default, and the response now says that it is one.
         degraded.append("sentiment")
+        # The reason comes *before* the non-ASCII dash on purpose: on a console
+        # whose encoding cannot represent that character the tail of the line can
+        # render as replacement characters, and the reason is the part an
+        # operator has to be able to read.
         logger.warning(
-            "Sentiment unavailable for %s — overlay skipped, response marked "
-            "degraded: %s", ticker, e,
+            "Sentiment unavailable (%s) for %s — overlay skipped, response "
+            "marked degraded", reason, ticker,
         )
 
     adjustment = sentiment * SENTIMENT_WEIGHT
