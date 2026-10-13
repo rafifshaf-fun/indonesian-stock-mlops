@@ -350,3 +350,72 @@ def test_model_without_any_feature_names_cannot_be_enforced(monkeypatch, tmp_pat
 
     with pytest.raises(FeatureSchemaError, match="BBCA.JK"):
         model_store.load_model_for("BBCA.JK")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# The diagnostic is once per process; the read is not
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_index_diagnostic_is_emitted_once_per_process(monkeypatch, tmp_path, caplog):
+    """Two requests against an empty index, exactly one index warning.
+
+    ``resolve_model_folder`` reads the index on every uncached request, and with
+    the committed empty index every ``/predict`` did exactly that — so the
+    identical WARNING was re-emitted on every request, on the endpoint that was
+    already failing.  The *read* stays per request (a rebuilt index must be
+    picked up by a running process, so it is asserted in the companion test
+    below); only the diagnostic is deduplicated.  The message itself is not
+    silenced: it stays at ``warning`` and keeps naming the index path and the
+    remedy.
+    """
+    import model_store
+
+    _write_index(tmp_path, {"ticker_to_model": {}})
+    monkeypatch.setattr(model_store, "model_dir", lambda: tmp_path)
+    # The once-flag is process-wide state, so this test observes it from a clean
+    # start rather than depending on what ran before it.
+    monkeypatch.setattr(model_store, "_reported_index_diagnostics", set())
+
+    with caplog.at_level("WARNING"):
+        for _ in range(2):
+            with pytest.raises(ModelNotFound):
+                model_store.resolve_model_folder("BBCA.JK")
+
+    warnings = [r for r in caplog.records if "maps no tickers" in r.getMessage()]
+    assert len(warnings) == 1, [r.getMessage() for r in caplog.records]
+    assert warnings[0].levelname == "WARNING"
+    assert str(tmp_path / "model_index.json") in warnings[0].getMessage()
+    assert "build_model_index.py" in warnings[0].getMessage()
+
+
+def test_a_different_index_diagnostic_is_still_reported_and_the_file_is_re_read(
+    monkeypatch, tmp_path, caplog
+):
+    """Deduplication is per diagnostic, and never caches the index *contents*.
+
+    A second, different failure in the same process must still be reported, and
+    an index rewritten under the process must still be observed — otherwise the
+    fix for the log flood would have hidden a rebuild from a running server,
+    which is the one thing the read on the request path is there to prevent.
+    """
+    import model_store
+
+    _write_index(tmp_path, {"ticker_to_model": {}})
+    monkeypatch.setattr(model_store, "model_dir", lambda: tmp_path)
+    monkeypatch.setattr(model_store, "_reported_index_diagnostics", set())
+
+    with caplog.at_level("WARNING"):
+        assert model_store.load_model_index() == {}
+
+        # A *different* degradation, same path, later in the same process.
+        _write_index(tmp_path, "{not json")
+        assert model_store.load_model_index() == {}
+
+        # A rebuilt index is seen without a restart: the contents are not cached.
+        _write_index(tmp_path, {"ticker_to_model": {"BBCA.JK": {"model_folder": "m-1"}}})
+        assert model_store.load_model_index() == {"BBCA.JK": "m-1"}
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert len(messages) == 2, messages
+    assert any("maps no tickers" in m for m in messages)
+    assert any("not valid JSON" in m for m in messages)

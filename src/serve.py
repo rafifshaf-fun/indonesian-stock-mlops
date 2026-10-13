@@ -239,6 +239,13 @@ def load_best_model(ticker: str) -> tuple[Any, list[str]]:
     try:
         entry = load_model_for(ticker)
     except ModelNotFound as e:
+        # A client asking for a ticker the index does not map is a client error,
+        # so the client gets a bare 404 — but the server keeps a trace naming the
+        # ticker.  On a populated index that is the *only* server-side record of
+        # the request: startup warns about a wholly-empty index and about nothing
+        # else, so an unmapped ticker used to vanish without a line anywhere.
+        # Deliberately not ``error``: no server fault occurred.
+        logger.warning("No model mapped to %s: %s", ticker, e)
         raise HTTPException(status_code=404, detail=f"No model found for {ticker}") from e
     except FeatureSchemaError as e:
         raise HTTPException(status_code=500, detail=str(e)) from e

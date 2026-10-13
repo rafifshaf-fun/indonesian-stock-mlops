@@ -83,6 +83,32 @@ MLMODEL_FILENAME = "MLmodel"
 #: Repository root, derived from this module rather than from the caller's cwd.
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
+#: Index diagnostics already emitted, so a degradation that recurs on *every*
+#: request is reported once rather than once per request.  ``resolve_model_folder``
+#: reads the index on each uncached request — deliberately, so a rebuilt index
+#: reaches a running process without a restart — which meant a broken index
+#: re-logged the identical line on every ``/predict``: a per-request, unbounded
+#: flood on the very endpoint that was failing.
+#:
+#: Keyed by the diagnostic's identity (kind, path, and any detail that makes the
+#: message text different), so a *different* degradation — another failure mode,
+#: a changed failure, or the same one for another index — is still reported.
+#: Only the message is deduplicated; the read is untouched.
+_reported_index_diagnostics: set[tuple[Any, ...]] = set()
+
+
+def _warn_once(key: tuple[Any, ...], message: str, *args: Any) -> None:
+    """Emit ``message`` at ``warning`` the first time ``key`` is diagnosed.
+
+    The first occurrence is kept verbatim — same level, same text, still naming
+    the path and the remedy.  Later occurrences of the *same* diagnostic are
+    dropped; a different one passes straight through.
+    """
+    if key in _reported_index_diagnostics:
+        return
+    _reported_index_diagnostics.add(key)
+    logger.warning(message, *args)
+
 
 class ModelNotFound(LookupError):
     """No model is mapped to the requested ticker, or its artifacts are gone.
@@ -115,30 +141,36 @@ def load_model_index() -> dict[str, str]:
         shape (``{"model_folder": ..., "match_score": ..., "n_features": ...}``)
         is normalised to the folder name; an entry without one is dropped.
 
-    Every degradation logs at ``warning``: an empty mapping means every lookup
-    raises :class:`ModelNotFound`, and that must be visible rather than read as
-    "no models exist".
+    Every degradation logs at ``warning`` — once per process per *distinct*
+    diagnostic (see :func:`_warn_once`), because this function runs on the
+    request path and an index that stays broken would otherwise re-log the same
+    line on every request.  An empty mapping means every lookup raises
+    :class:`ModelNotFound`, and that must be visible rather than read as "no
+    models exist".
     """
     path = index_path()
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError as exc:
-        logger.warning(
-            "Model index %s is unreadable (%s) — no ticker can be resolved", path, exc
+        _warn_once(
+            ("unreadable", str(path), type(exc).__name__),
+            "Model index %s is unreadable (%s) — no ticker can be resolved", path, exc,
         )
         return {}
 
     try:
         parsed = json.loads(raw)
     except ValueError as exc:
-        logger.warning(
+        _warn_once(
+            ("not-json", str(path), str(exc)),
             "Model index %s is not valid JSON (%s) — no ticker can be resolved",
             path, exc,
         )
         return {}
 
     if not isinstance(parsed, dict):
-        logger.warning(
+        _warn_once(
+            ("not-an-object", str(path), type(parsed).__name__),
             "Model index %s must hold a JSON object, found %s — no ticker can be resolved",
             path, type(parsed).__name__,
         )
@@ -146,7 +178,8 @@ def load_model_index() -> dict[str, str]:
 
     entries = parsed.get("ticker_to_model")
     if not isinstance(entries, dict):
-        logger.warning(
+        _warn_once(
+            ("no-ticker-mapping", str(path), type(entries).__name__),
             "Model index %s carries no ticker_to_model mapping — no ticker can be resolved",
             path,
         )
@@ -158,12 +191,14 @@ def load_model_index() -> dict[str, str]:
         if isinstance(folder, str) and folder:
             index[str(ticker)] = folder
         else:
-            logger.warning(
+            _warn_once(
+                ("entry-without-folder", str(path), str(ticker)),
                 "Model index entry for %s names no model folder (%r) — ignored", ticker, entry
             )
 
     if not index:
-        logger.warning(
+        _warn_once(
+            ("empty-index", str(path)),
             "Model index %s maps no tickers — every prediction will fail until "
             "scripts/build_model_index.py is run", path,
         )
