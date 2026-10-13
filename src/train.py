@@ -462,10 +462,16 @@ def train(ticker: str = "BBCA.JK", tune: bool = False, use_shap: bool = True,
                     ticker, np.mean(accs), np.mean(f1s), np.mean(aucs), X.shape[1])
 
         # ── Final model ────────────────────────────────────────────────────
-        sc_final = StandardScaler()
-        X_all_s = pd.DataFrame(sc_final.fit_transform(X), columns=X.columns)
+        # Fitted on the raw frame.  A tree is invariant to per-feature monotone
+        # rescaling, so standardising here bought the model nothing and only
+        # moved its split thresholds into z-score units — units no consumer
+        # reconstructs, because no scaler was ever persisted and serve.py,
+        # cli.py, predict.py and backtest.py all feed raw values.  That
+        # train/serve mismatch is the audit's F1 finding (0 BUY across 1,500
+        # historical rows).  Without a scaler there is also nothing to persist
+        # and keep in sync.
         xgb = XGBClassifier(**params)
-        xgb.fit(X_all_s, y)
+        xgb.fit(X, y)
 
         # ── LGBM blend (optional) ──────────────────────────────────────────
         proba_blend = None
@@ -476,8 +482,10 @@ def train(ticker: str = "BBCA.JK", tune: bool = False, use_shap: bool = True,
                     n_estimators=params.get("n_estimators",200), learning_rate=params.get("learning_rate",0.05),
                     max_depth=params.get("max_depth",4), random_state=42, verbosity=-1,
                 )
-                lgbm.fit(X_all_s, y)
-                proba_blend = (xgb.predict_proba(X_all_s)[:,1] + lgbm.predict_proba(X_all_s)[:,1]) / 2
+                # Same raw frame as the final fit: blending a scaler-fitted
+                # learner with raw predictions is the same mismatch one step on.
+                lgbm.fit(X, y)
+                proba_blend = (xgb.predict_proba(X)[:,1] + lgbm.predict_proba(X)[:,1]) / 2
                 mlflow.log_metric("blend_accuracy",
                                   accuracy_score(y, (proba_blend >= 0.5).astype(int)))
                 logger.info("LGBM blended for %s", ticker)
@@ -487,9 +495,14 @@ def train(ticker: str = "BBCA.JK", tune: bool = False, use_shap: bool = True,
                 logger.debug("LGBM blend failed for %s: %s", ticker, e)
 
         # ── Calibration ────────────────────────────────────────────────────
+        # Unreachable as written — CalibratedCVClassifier is not a name that
+        # exists, so this always raises and always logs calibrated=False.  It is
+        # left alone deliberately (its removal is Task 1.9's), but it is on raw X
+        # like every other call site: a dangling reference to a deleted frame
+        # would be a defect here too, even on a line that never runs.
         try:
             final = CalibratedCVClassifier(estimator=xgb, method="isotonic", cv="prefit")
-            final.fit(X_all_s, y)
+            final.fit(X, y)
             mlflow.log_param("calibrated", True)
         except Exception:
             final = xgb
@@ -507,7 +520,7 @@ def train(ticker: str = "BBCA.JK", tune: bool = False, use_shap: bool = True,
             log_feature_schema(model_info.model_id, feature_columns)
             img = plot_feature_importance(xgb, X.columns, ticker)
             mlflow.log_artifact(img, "feature_importance"); os.remove(img)
-            cm = plot_confusion_matrix(y, xgb.predict(X_all_s), ticker)
+            cm = plot_confusion_matrix(y, xgb.predict(X), ticker)
             mlflow.log_artifact(cm, "confusion_matrix"); os.remove(cm)
         else:
             logger.info("CI mode — metrics only for %s", ticker)
