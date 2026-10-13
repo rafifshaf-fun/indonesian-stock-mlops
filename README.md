@@ -56,7 +56,6 @@ flowchart TB
         XG["XGBoost Classifier"]
         LG["LightGBM Classifier"]
         EN["Soft-Vote Ensemble"]
-        CAL["Isotonic Calibration"]
     end
 
     subgraph API["FastAPI Server"]
@@ -64,7 +63,7 @@ flowchart TB
         BATCH["/predict/batch endpoint"]
         CACHE["SQLite Prediction Cache"]
         SENT["VADER Sentiment Overlay"]
-        PSI["PSI Drift Check (scaffold)"]
+        DRIFT["drift_warning / drift_score (not computed)"]
     end
 
     subgraph Monitor["Monitoring"]
@@ -79,14 +78,13 @@ flowchart TB
     CV --> LG
     XG --> EN
     LG --> EN
-    EN --> CAL
-    CAL --> API
+    EN --> API
     API --> Monitor
 
     NA --> SENT
     SENT --> PRED
     CACHE --> PRED
-    PSI --> PRED
+    PRED --> DRIFT
     PROM --> GRAF
 ```
 
@@ -105,7 +103,7 @@ flowchart TB
 │   │   └── pipeline.py         #   engineer_features_for_ticker, build_feature_set
 │   ├── ingest.py               # Fetch raw OHLCV data from yfinance
 │   ├── train.py                # XGBoost + LGBM training with SHAP, expanding CV, parallel
-│   ├── serve.py                # FastAPI prediction server with sentiment overlay + PSI drift
+│   ├── serve.py                # FastAPI prediction server with sentiment overlay
 │   ├── backtest.py             # Walk-forward backtesting engine
 │   ├── news_sentiment.py       # NewsAPI + VADER sentiment analysis
 │   └── config.py               # Single source of truth: tickers, sectors, feature flags
@@ -227,9 +225,14 @@ curl -X POST http://127.0.0.1:8000/predict \
   "signal": "SELL",
   "sentiment_score": 0.1523,
   "probability_adjusted": 0.4941,
-  "signal_adjusted": "SELL"
+  "signal_adjusted": "SELL",
+  "degraded": [],
+  "drift_warning": false,
+  "drift_score": 0.0
 }
 ```
+
+When the news fetch fails the prediction is still returned, `sentiment_score` is `0.0`, and `degraded` says `["sentiment"]` — the failure is never presented as neutral news.
 
 | Field | Description |
 |---|---|
@@ -238,8 +241,9 @@ curl -X POST http://127.0.0.1:8000/predict \
 | `sentiment_score` | VADER news sentiment (-1 to +1, 0 if unavailable) |
 | `probability_adjusted` | Model confidence ±10% based on sentiment |
 | `signal_adjusted` | Signal after sentiment overlay |
-| `drift_warning` | PSI drift alert (true if drift > threshold) |
-| `drift_score` | Population Stability Index score |
+| `degraded` | Components that failed while computing this response, e.g. `["sentiment"]`; empty when nothing failed |
+| `drift_warning` | Retained for compatibility. **Not computed** — always `false`. |
+| `drift_score` | Retained for compatibility. **Not computed** — always `0.0`. |
 
 ### Batch Prediction
 ```bash
@@ -247,6 +251,8 @@ curl -X POST http://127.0.0.1:8000/predict/batch \
   -H "Content-Type: application/json" \
   -d '{"tickers": ["BBCA.JK", "BBRI.JK", "TLKM.JK"]}'
 ```
+
+A ticker that cannot be predicted fails the request with **HTTP 502** and a `detail` naming it. A failed ticker is never returned as a signal: an earlier version answered `prediction: 0` (SELL) with `probability_up: 0.0` under HTTP 200, which a caller could trade on.
 
 ### List tickers
 ```bash
@@ -302,11 +308,11 @@ python cli.py list                               # List all tickers by sector
 - **Target** — Binary: 1 (next day close > today close) / 0 (otherwise)
 - **Feature Selection** — SHAP TreeExplainer (top-60 features per ticker, `--no-shap` to disable)
 - **Validation** — Expanding walk-forward CV (each fold grows, `--no-expand-cv` for fixed windows)
-- **Calibration** — Isotonic regression (`CalibratedClassifierCV`) for probability calibration
+- **Calibration** — none. A calibration step was present but never ran (it called a name that does not exist, and its `except Exception` hid the `NameError`), so it has been removed. Probabilities are the model's raw `predict_proba` output; re-adding calibration is a separate, tested change.
 - **Parallel Training** — `--parallel` flag uses joblib across all 45 tickers (~15-20 min)
 - **Features** — 174 raw → 60 after SHAP pruning
-- **Sentiment overlay** — ±10% adjustment from VADER news sentiment via NewsAPI
-- **Drift Detection** — PSI (Population Stability Index) scaffold in API response
+- **Sentiment overlay** — ±10% adjustment from VADER news sentiment via NewsAPI; a failed fetch is reported in the response's `degraded` list rather than being read as neutral sentiment
+- **Drift Detection** — not computed. `drift_warning` and `drift_score` are retained on the response for compatibility and are currently always `false` and `0.0`; wiring PSI needs a reference distribution and has not been done.
 
 ### Training Options
 

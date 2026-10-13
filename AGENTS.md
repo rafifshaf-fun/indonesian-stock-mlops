@@ -58,7 +58,17 @@ Python 3.11, local venv at `venv/`.
   and `google_trends` and writes the CSV; `full` writes the parquet.
   `scripts/ci_features.py` always uses `mode='ci'`.
 - Every external API call is wrapped in try/except with a safe default; a
-  sentiment failure must never block a prediction (`serve.py` sentiment overlay).
+  sentiment failure must never block a prediction (`serve.py` sentiment overlay)
+  — but the fallback must be visible. `PredictResponse.degraded` names every
+  component that failed (`["sentiment"]`), the overlay logs at `warning`, and
+  `compute_volume_profile_features`/`build_features` warn when a family is
+  omitted. A safe default indistinguishable from a real value is the defect.
+- `/predict/batch` raises `HTTPException(502, detail=...)` for a ticker that
+  cannot be predicted. It used to answer `prediction: 0` (SELL) with
+  `probability_up: 0.0` under HTTP 200, which a caller could trade on.
+- `drift_warning` and `drift_score` are on every response and are **not
+  computed** — hardcoded `false`/`0.0`, with `_compute_psi` never called. They
+  are kept for compatibility only; wiring PSI needs a reference distribution.
 - `TICKERS` and `SECTORS` must stay in sync — the universe is LQ45 and changes.
 - Commit style is prefixed: `feat:`, `fix:`, `refactor:`, `docs:`, `perf:`.
 
@@ -87,7 +97,9 @@ Python 3.11, local venv at `venv/`.
 - Serving builds features by calling the same I/O-free `features.pipeline.build_features` that
   training uses, so the two paths cannot drift. The `vp_*`, `idn_*` and `google_trend` families
   are deliberately absent at inference — serving cannot produce them without per-request network
-  I/O — and are excluded from the feature contract.
+  I/O — and are excluded from the feature contract. Because `build_features` now warns whenever a
+  family's flag is on and its argument is `None`, serving logs those deliberate omissions at
+  `warning` once per request; that is expected, not a fault.
 - Rebuilding the index is mandatory after every retrain, and the API loads it
   once at startup — restart the container (`--force-recreate api`) to pick it up.
 - Training all 45 tickers takes ~15-20 min with `--parallel`. `--tune` covers only
@@ -104,7 +116,8 @@ Python 3.11, local venv at `venv/`.
   model-index changes need a container restart.
 - `pip install -r requirements.txt` does **not** install `vaderSentiment` or
   `nltk`; the image uses `requirements-docker.txt`, which does, and CI installs
-  both ad hoc. Sentiment silently degrades to a 0.0 score in a plain venv.
+  both ad hoc. Sentiment degrades to a 0.0 score in a plain venv — visible now
+  as `degraded: ["sentiment"]` and a `warning`, not only in the score.
 - `.env` (`FRED_API_KEY`, `NEWSAPI_KEY`) is gitignored; `.env.example` is
   committed, exempted from the `.env.*` rule by the `!.env.example` negation, and
   documents both keys with empty values. CI reads `FRED_API_KEY` from the

@@ -23,12 +23,23 @@ def compute_volume_profile_features(ticker: str) -> dict:
 
     Downloads 5m data with caching. Falls back gracefully if download fails.
 
+    The fallback is ``{}`` and stays ``{}`` (R4): what changed is that it is no
+    longer *silent*.  It was ``logger.debug``, so a refused or rate-limited
+    intraday download dropped 19 columns — including ``vp_poc`` and
+    ``vp_relative_volume``, which the committed parquet shows as live training
+    signal — while the run reported success.
+
     Returns:
         dict of volume profile features for the most recent trading day.
     """
     try:
         from ingest import download_intraday_data
-    except ImportError:
+    except ImportError as e:
+        logger.warning(
+            "Volume profile features unavailable for %s — ingest."
+            "download_intraday_data is not importable, so 19 vp_* features are "
+            "omitted from this row: %s", ticker, e,
+        )
         return {}
 
     try:
@@ -36,11 +47,18 @@ def compute_volume_profile_features(ticker: str) -> dict:
             ticker, interval="5m", period="5d",
             cache_dir=INTRADAY_CACHE_DIR
         )
-    except Exception:
-        logger.debug("Volume profile download failed for %s", ticker)
+    except Exception as e:
+        logger.warning(
+            "Volume profile download failed for %s — 19 vp_* features omitted "
+            "from this row: %s", ticker, e,
+        )
         return {}
 
     if df.empty or len(df) < 10:
+        logger.warning(
+            "Intraday data for %s is empty or too short (%d rows) — 19 vp_* "
+            "features omitted from this row", ticker, len(df),
+        )
         return {}
 
     df = df.sort_index()
@@ -48,6 +66,11 @@ def compute_volume_profile_features(ticker: str) -> dict:
     day_data = df[df.index.date == latest_date]
 
     if len(day_data) < 10:
+        logger.warning(
+            "Intraday data for %s carries only %d rows for its latest session "
+            "(%s) — 19 vp_* features omitted from this row",
+            ticker, len(day_data), latest_date,
+        )
         return {}
 
     close = day_data["Close"].values

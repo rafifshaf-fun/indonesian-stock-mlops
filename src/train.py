@@ -15,7 +15,6 @@ from sklearn.metrics import (
     accuracy_score, f1_score, roc_auc_score,
     precision_score, recall_score, confusion_matrix,
 )
-from sklearn.calibration import CalibratedClassifierCV
 from xgboost import XGBClassifier
 import warnings
 
@@ -508,19 +507,20 @@ def train(ticker: str = "BBCA.JK", tune: bool = False, use_shap: bool = True,
             except Exception as e:
                 logger.debug("LGBM blend failed for %s: %s", ticker, e)
 
-        # ── Calibration ────────────────────────────────────────────────────
-        # Unreachable as written — CalibratedCVClassifier is not a name that
-        # exists, so this always raises and always logs calibrated=False.  It is
-        # left alone deliberately (its removal is Task 1.9's), but it is on raw X
-        # like every other call site: a dangling reference to a deleted frame
-        # would be a defect here too, even on a line that never runs.
-        try:
-            final = CalibratedCVClassifier(estimator=xgb, method="isotonic", cv="prefit")
-            final.fit(X, y)
-            mlflow.log_param("calibrated", True)
-        except Exception:
-            final = xgb
-            mlflow.log_param("calibrated", False)
+        # ── Calibration: removed, and it never ran ─────────────────────────
+        # The block that stood here called ``CalibratedCVClassifier`` — a name
+        # that exists in no module — so it raised ``NameError`` on its first
+        # statement, its own bare ``except Exception`` swallowed that, and every
+        # training run then logged ``calibrated=False`` and reported success.
+        # That parameter was the only trace of the step, and it said "not
+        # calibrated" while the README advertised isotonic calibration as a
+        # feature (F8).
+        #
+        # It is deleted rather than repaired: repairing it means choosing a
+        # reference distribution, a method and a CV split, each of which changes
+        # the probabilities a model serves.  That is a separate, tested change.
+        # The import of ``CalibratedClassifierCV`` went with it — nothing else
+        # used it.
 
         mlflow.set_tag("ticker", ticker)
         if not IS_CI:

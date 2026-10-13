@@ -648,9 +648,11 @@ def build_inference_features(df: pd.DataFrame, ticker: str,
     #   There is nothing to reproduce.
     #
     # Because absence is a standing decision rather than a runtime failure, it is
-    # not logged per request (Task 1.9 owns failure visibility).  The model's
-    # feature contract (feature_schema.json, Task 1.4) is derived so that it
-    # never expects a column serving cannot supply.
+    # not logged per request here (Task 1.9 owns failure visibility, and the
+    # builder now names every omitted family at ``warning`` — see
+    # ``features.pipeline.build_features``).  The model's feature contract
+    # (feature_schema.json, Task 1.4) is derived so that it never expects a
+    # column serving cannot supply.
     raw_ohlcv, ihsg, all_ticker_data = load_universe_context()
 
     # build_features selects its ticker with df[ticker], i.e. it wants the
@@ -742,6 +744,13 @@ class PredictResponse(BaseModel):
     signal_adjusted: str = ""
     drift_warning: bool = False
     drift_score: float = 0.0
+    # Every component that failed while this response was being computed, by
+    # name — ``["sentiment"]`` when the news fetch was unavailable.  The fields
+    # above are a *safe default*, which the project's convention requires, but a
+    # safe default that is indistinguishable from a real value is how a dead
+    # news API came to look like genuinely neutral news (F8).  Defaults to empty
+    # so a healthy response says so explicitly.
+    degraded: list[str] = []
 
 class BatchPredictResponse(BaseModel):
     predictions: List[PredictResponse]
@@ -795,17 +804,30 @@ def _apply_sentiment_overlay(ticker: str, prob: float, background_tasks=None) ->
     """Adjust model probability with news sentiment overlay.
 
     Fetches latest sentiment and tweaks probability by up to SENTIMENT_WEIGHT.
-    Falls back to 0.0 sentiment immediately on any error (no blocking).
+    Falls back to 0.0 sentiment immediately on any error (no blocking) — but
+    reports that fallback, because ``sentiment_score == 0.0`` is also the honest
+    reading of "the headlines were neutral".  A failed fetch is therefore named
+    in ``degraded`` *and* logged at ``warning``, so an operator can tell a dead
+    news API from a quiet news day (F8).
 
-    Returns dict with sentiment_score, probability_adjusted, signal_adjusted.
+    Returns dict with sentiment_score, probability_adjusted, signal_adjusted,
+    degraded.
     """
     sentiment = 0.0
+    degraded: list[str] = []
     try:
         from features.fetchers import fetch_news_sentiment
         sentiment = fetch_news_sentiment(ticker)
         sentiment = max(-1.0, min(1.0, sentiment))
-    except Exception:
-        pass  # sentiment stays 0.0 — never block prediction on sentiment failure
+    except Exception as e:
+        # Never block a prediction on sentiment — but never hide the failure
+        # either.  This was a bare ``pass``, which is F8: the response carried a
+        # 0.0 that no caller could distinguish from a successful neutral fetch.
+        degraded.append("sentiment")
+        logger.warning(
+            "Sentiment unavailable for %s — overlay skipped, response marked "
+            "degraded: %s", ticker, e,
+        )
 
     adjustment = sentiment * SENTIMENT_WEIGHT
     prob_adj = prob + adjustment
@@ -816,6 +838,7 @@ def _apply_sentiment_overlay(ticker: str, prob: float, background_tasks=None) ->
         "sentiment_score": round(sentiment, 4),
         "probability_adjusted": round(prob_adj, 4),
         "signal_adjusted": signal_adj,
+        "degraded": degraded,
     }
 
 @app.get("/cache")
@@ -881,6 +904,11 @@ async def predict(request: PredictRequest, background_tasks: BackgroundTasks):
             overlay = _apply_sentiment_overlay(request.ticker, probability)
             PREDICTION_COUNTER.labels(ticker=request.ticker, signal=signal).inc()
             CONFIDENCE_HISTOGRAM.labels(ticker=request.ticker).observe(probability)
+            # ``drift_warning``/``drift_score`` are hardcoded on every response
+            # path and ``_compute_psi`` is never called: PSI needs a reference
+            # distribution, which nothing here stores (R5).  The fields are kept
+            # for compatibility and the README now says plainly that they are not
+            # computed; wiring them is a separate, tested change.
             return PredictResponse(
                 ticker=request.ticker, prediction=prediction,
                 probability_up=round(probability, 4), signal=signal,
@@ -888,6 +916,7 @@ async def predict(request: PredictRequest, background_tasks: BackgroundTasks):
                 probability_adjusted=overlay["probability_adjusted"],
                 signal_adjusted=overlay["signal_adjusted"],
                 drift_warning=False, drift_score=0.0,
+                degraded=list(overlay["degraded"]),
             )
 
         # ── Slow path: full pipeline (download + features + cache) ──────
@@ -962,6 +991,7 @@ async def predict(request: PredictRequest, background_tasks: BackgroundTasks):
             probability_adjusted=overlay["probability_adjusted"],
             signal_adjusted=overlay["signal_adjusted"],
             drift_warning=False, drift_score=0.0,
+            degraded=list(overlay["degraded"]),
         )
 
     except HTTPException:
@@ -1031,17 +1061,22 @@ async def predict_batch(request: BatchPredictRequest, background_tasks: Backgrou
                 probability_adjusted=overlay["probability_adjusted"],
                 signal_adjusted=overlay["signal_adjusted"],
                 drift_warning=False, drift_score=0.0,
+                degraded=list(overlay["degraded"]),
             )
         except HTTPException:
             raise
         except Exception as e:
+            # F8: this used to return a *signal-shaped* object — prediction 0
+            # (= SELL), confidence 0.0, and the error text stuffed into the
+            # ``signal`` field — under HTTP 200, so a caller reading
+            # ``prediction`` traded on a failure.  A failure is now an error the
+            # caller cannot mistake for a prediction, and the ticker is in the
+            # body so one bad symbol in a batch is identifiable without logs.
             logger.warning("Batch predict failed for %s: %s", ticker, e)
-            return PredictResponse(
-                ticker=ticker,
-                prediction=0,
-                probability_up=0.0,
-                signal=f"ERROR: {str(e)[:50]}",
-            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Prediction failed for {ticker}: {e}",
+            ) from e
 
     tasks = [predict_single(t) for t in request.tickers]
     results = await asyncio.gather(*tasks, return_exceptions=False)

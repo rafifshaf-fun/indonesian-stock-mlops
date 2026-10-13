@@ -129,8 +129,13 @@ def build_features(df, ticker, *, fundamentals, usdidr, fred_macro, bi_rate,
             default is 0.0 per this function's published interface.
         vp_features: Dict of volume profile features from
             compute_volume_profile_features() (optional; applied only when the
-            flag is on and mode is not 'ci')
-        idx_fundamentals: Dict of IDX fundamental fields (optional)
+            flag is on and mode is not 'ci').  ``None`` means "no values
+            supplied": the columns are omitted, and the omission is logged at
+            ``warning`` because it is a degradation, not a decision this
+            function can make silently (R3).
+        idx_fundamentals: Dict of IDX fundamental fields (optional).  ``None``
+            means "no values supplied": the columns are omitted and the
+            omission is logged at ``warning``, exactly as for ``vp_features``.
         mode: 'full', 'incremental', or 'ci' (CI mode skips intraday)
         with_target: When True, compute the binary target and set the ``ticker``
             column.  Off by default because compute_target() drops the final row
@@ -185,8 +190,21 @@ def build_features(df, ticker, *, fundamentals, usdidr, fred_macro, bi_rate,
 
     # ── Volume Profile (skip in CI mode) ─────────────────────────────────
     if FEATURE_FLAGS.get("volume_profile", True) and mode != "ci":
-        for col, val in (vp_features or {}).items():
-            ticker_df[col] = val
+        if vp_features is None:
+            # R3: the family is on and this is not CI mode, so the caller was
+            # *supposed* to supply these 19 columns and did not.  They stay
+            # omitted — fabricating them is the defect this task exists to
+            # remove — but the omission is no longer invisible: serving calls
+            # this function directly, and a forgetful caller would otherwise
+            # reproduce the original placeholder defect with no log line.
+            logger.warning(
+                "volume_profile family omitted for %s: vp_features is None while "
+                "FEATURE_FLAGS['volume_profile'] is on and mode=%r",
+                ticker, mode,
+            )
+        else:
+            for col, val in vp_features.items():
+                ticker_df[col] = val
 
     # ── Market Context ──────────────────────────────────────────────────
     if FEATURE_FLAGS.get("market_context", True) and ihsg is not None:
@@ -194,8 +212,17 @@ def build_features(df, ticker, *, fundamentals, usdidr, fred_macro, bi_rate,
 
     # ── IDX Fundamentals ────────────────────────────────────────────────
     if FEATURE_FLAGS.get("idx_fundamentals", True):
-        for col, val in (idx_fundamentals or {}).items():
-            ticker_df[col] = val
+        if idx_fundamentals is None:
+            # R3, same shape as volume_profile above: the flag is on and the
+            # argument was left at its ``None`` default, so the ten idn_* columns
+            # are omitted.  Named at warning, omitted as before.
+            logger.warning(
+                "idx_fundamentals family omitted for %s: idx_fundamentals is None "
+                "while FEATURE_FLAGS['idx_fundamentals'] is on", ticker,
+            )
+        else:
+            for col, val in idx_fundamentals.items():
+                ticker_df[col] = val
 
     # ── Google Trends ───────────────────────────────────────────────────
     # Materialised only when the caller supplies a value (None == absent), so
