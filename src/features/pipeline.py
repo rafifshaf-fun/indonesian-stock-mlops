@@ -1,10 +1,16 @@
 """
 Feature engineering pipeline: load_data, inject_macro_features, compute_target,
-engineer_features_for_ticker, build_feature_set.
+build_features, engineer_features_for_ticker, build_feature_set.
 
 Orchestrates all feature modules to build the complete feature set.
+
+``build_features`` is the single, I/O-free feature builder: every external value
+(fundamentals, macro frames, sentiment, volume profile, IDX fundamentals) is
+passed in as an argument.  ``engineer_features_for_ticker`` is the training
+entry point and is now a thin wrapper that fetches those values and delegates.
 """
 import os
+import warnings
 import pandas as pd
 import numpy as np
 from ta.utils import dropna
@@ -91,10 +97,15 @@ def compute_target(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def engineer_features_for_ticker(df, ticker, fundamentals, usdidr, fred_macro,
-                                 bi_rate, ihsg=None, all_ticker_data=None,
-                                 mode="full") -> pd.DataFrame:
-    """Engineer features for a single ticker.
+def build_features(df, ticker, *, fundamentals, usdidr, fred_macro, bi_rate,
+                   ihsg=None, all_ticker_data=None, news_sentiment=0.0,
+                   google_trend=0.0, vp_features=None, idx_fundamentals=None,
+                   mode="full", with_target=False) -> pd.DataFrame:
+    """Build the feature frame for one ticker from already-fetched inputs.
+
+    Pure: this function performs no I/O.  It never fetches, reads or writes
+    anything — every value it needs arrives as an argument, which is what lets
+    the training path and the serving path share one implementation.
 
     Args:
         df: Raw multi-ticker OHLCV DataFrame (yfinance MultiIndex format)
@@ -104,8 +115,26 @@ def engineer_features_for_ticker(df, ticker, fundamentals, usdidr, fred_macro,
         fred_macro: FRED macro DataFrame
         bi_rate: BI rate Series
         ihsg: IHSG index DataFrame (optional, for market context)
-        all_ticker_data: Dict of {ticker: DataFrame} for cross-stock features (optional)
+        all_ticker_data: Dict of {ticker: DataFrame} for cross-stock features
+            (optional) — accepted for call-site compatibility only.  Cross-stock
+            features are applied by build_feature_set once every ticker has been
+            engineered, because the sector/breadth columns need the full frame.
+        news_sentiment: Sentiment score to store (used when the flag is on and
+            mode is not 'ci'; otherwise the column is 0.0)
+        google_trend: Trend value to materialise as a ``google_trend`` column.
+            ``None`` means "no value available" and leaves the column absent —
+            the training wrapper passes ``None`` because build_feature_set
+            fetches and joins its own ``google_trend`` column, and two frames
+            both carrying that column make ``DataFrame.join`` raise.  The
+            default is 0.0 per this function's published interface.
+        vp_features: Dict of volume profile features from
+            compute_volume_profile_features() (optional; applied only when the
+            flag is on and mode is not 'ci')
+        idx_fundamentals: Dict of IDX fundamental fields (optional)
         mode: 'full', 'incremental', or 'ci' (CI mode skips intraday)
+        with_target: When True, compute the binary target and set the ``ticker``
+            column.  Off by default because compute_target() drops the final row
+            (it needs a next-day price), so the inference path must not call it.
 
     Returns:
         Feature-rich DataFrame or None if insufficient data.
@@ -118,7 +147,21 @@ def engineer_features_for_ticker(df, ticker, fundamentals, usdidr, fred_macro,
 
     # ── Shared: TA indicators ────────────────────────────────────────────
     if FEATURE_FLAGS.get("ta_indicators", True):
-        ticker_df = compute_ta_features(ticker_df)
+        with warnings.catch_warnings():
+            # ta 0.11.0's PSARIndicator assigns by integer position instead of
+            # .iloc (ta/trend.py:1030, every neighbouring line uses .iloc), and
+            # pandas >= 2.2 deprecates positional __setitem__ on a label index.
+            # The value still lands in the right place, so this is upstream
+            # deprecation noise and not a feature defect — but the suite runs
+            # with filterwarnings=["error"], which would otherwise abort every
+            # test that walks the TA path.  Scoped to this one message and this
+            # one call: every other warning still raises.
+            warnings.filterwarnings(
+                "ignore",
+                message="Series.__setitem__ treating keys as positions is deprecated",
+                category=FutureWarning,
+            )
+            ticker_df = compute_ta_features(ticker_df)
 
     # ── Shared: Custom features ──────────────────────────────────────────
     ticker_df = compute_custom_features(ticker_df)
@@ -136,18 +179,14 @@ def engineer_features_for_ticker(df, ticker, fundamentals, usdidr, fred_macro,
 
     # ── News Sentiment ───────────────────────────────────────────────────
     if FEATURE_FLAGS.get("news_sentiment", True) and mode != "ci":
-        ticker_df["news_sentiment"] = fetch_news_sentiment(ticker)
+        ticker_df["news_sentiment"] = news_sentiment
     else:
         ticker_df["news_sentiment"] = 0.0
 
     # ── Volume Profile (skip in CI mode) ─────────────────────────────────
     if FEATURE_FLAGS.get("volume_profile", True) and mode != "ci":
-        try:
-            vp_features = compute_volume_profile_features(ticker)
-            for col, val in vp_features.items():
-                ticker_df[col] = val
-        except Exception:
-            pass  # Volume profile is optional
+        for col, val in (vp_features or {}).items():
+            ticker_df[col] = val
 
     # ── Market Context ──────────────────────────────────────────────────
     if FEATURE_FLAGS.get("market_context", True) and ihsg is not None:
@@ -155,15 +194,77 @@ def engineer_features_for_ticker(df, ticker, fundamentals, usdidr, fred_macro,
 
     # ── IDX Fundamentals ────────────────────────────────────────────────
     if FEATURE_FLAGS.get("idx_fundamentals", True):
-        idx_fund = fetch_idx_fundamentals(ticker)
-        for col, val in idx_fund.items():
+        for col, val in (idx_fundamentals or {}).items():
             ticker_df[col] = val
 
+    # ── Google Trends ───────────────────────────────────────────────────
+    # Materialised only when the caller supplies a value (None == absent), so
+    # that build_feature_set can still join its own `google_trend` column.
+    if (
+        FEATURE_FLAGS.get("google_trends", True)
+        and mode != "ci"
+        and google_trend is not None
+    ):
+        ticker_df["google_trend"] = google_trend
+
     # ── Shared: Target ─────────────────────────────────────────────────
-    ticker_df = compute_target(ticker_df)
-    ticker_df["ticker"] = ticker
+    if with_target:
+        ticker_df = compute_target(ticker_df)
+        ticker_df["ticker"] = ticker
 
     return ticker_df
+
+
+def engineer_features_for_ticker(df, ticker, fundamentals, usdidr, fred_macro,
+                                 bi_rate, ihsg=None, all_ticker_data=None,
+                                 mode="full") -> pd.DataFrame:
+    """Engineer features for a single ticker (training entry point).
+
+    Fetches the per-ticker external inputs and delegates to build_features(),
+    which owns all the feature logic.  Output is unchanged: the same columns,
+    values and row count as before the extraction.
+
+    Args:
+        df: Raw multi-ticker OHLCV DataFrame (yfinance MultiIndex format)
+        ticker: Ticker symbol
+        fundamentals: Dict from fetch_fundamentals()
+        usdidr: USD/IDR DataFrame
+        fred_macro: FRED macro DataFrame
+        bi_rate: BI rate Series
+        ihsg: IHSG index DataFrame (optional, for market context)
+        all_ticker_data: Dict of {ticker: DataFrame} for cross-stock features (optional)
+        mode: 'full', 'incremental', or 'ci' (CI mode skips intraday)
+
+    Returns:
+        Feature-rich DataFrame or None if insufficient data.
+    """
+    # ── News Sentiment ───────────────────────────────────────────────────
+    news_sentiment = 0.0
+    if FEATURE_FLAGS.get("news_sentiment", True) and mode != "ci":
+        news_sentiment = fetch_news_sentiment(ticker)
+
+    # ── Volume Profile (skip in CI mode) ─────────────────────────────────
+    vp_features = {}
+    if FEATURE_FLAGS.get("volume_profile", True) and mode != "ci":
+        try:
+            vp_features = compute_volume_profile_features(ticker)
+        except Exception as e:
+            logger.warning("Volume profile features unavailable for %s: %s", ticker, e)
+            vp_features = {}
+
+    # ── IDX Fundamentals ────────────────────────────────────────────────
+    idx_fundamentals = {}
+    if FEATURE_FLAGS.get("idx_fundamentals", True):
+        idx_fundamentals = fetch_idx_fundamentals(ticker)
+
+    return build_features(
+        df, ticker,
+        fundamentals=fundamentals, usdidr=usdidr, fred_macro=fred_macro,
+        bi_rate=bi_rate, ihsg=ihsg, all_ticker_data=all_ticker_data,
+        news_sentiment=news_sentiment, google_trend=None,
+        vp_features=vp_features, idx_fundamentals=idx_fundamentals,
+        mode=mode, with_target=True,
+    )
 
 
 def build_feature_set(raw_path: str, output_path: str, tickers: list,
