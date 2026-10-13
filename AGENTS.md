@@ -92,7 +92,7 @@ Python 3.11, local venv at `venv/`.
   `nltk`; the image uses `requirements-docker.txt`, which does, and CI installs
   both ad hoc. Sentiment silently degrades to a 0.0 score in a plain venv.
 - `.env` (`FRED_API_KEY`, `NEWSAPI_KEY`) is gitignored; `.env.example` is
-  committed (force-added, because gitignore line 4 `.env.*` also matches it) and
+  committed, exempted from the `.env.*` rule by the `!.env.example` negation, and
   documents both keys with empty values. CI reads `FRED_API_KEY` from the
   Actions secret of the same name. A missing key degrades features to NaN/0
   instead of failing.
