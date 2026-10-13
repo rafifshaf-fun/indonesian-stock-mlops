@@ -27,3 +27,10 @@ requests==2.34.2
 # its release notes name the years it added, which is what the calendar's
 # annual refresh checks first
 holidays==0.106
+# The IANA timezone database behind market_calendar's ZoneInfo("Asia/Jakarta").
+# A hard requirement, not a transitive one: Windows ships no system tz database,
+# so without this package that import raises ZoneInfoNotFoundError. Until now it
+# reached the venv only via kombu/pandas/tzlocal. requirements-docker.txt is an
+# independent list and carries neither this nor holidays; putting market_calendar
+# on the serving path means adding both there (see the module's Manifests note).
+tzdata==2026.2

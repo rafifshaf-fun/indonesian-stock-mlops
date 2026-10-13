@@ -32,21 +32,28 @@ rather than a false negative that stops all signalling.
 """
 from __future__ import annotations
 
+import dataclasses
+import importlib.metadata
 import logging
 from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import holidays
 import pytest
 
 import market_calendar
 from market_calendar import (
     FRIDAY_SESSIONS,
+    HOLIDAY_DATA_LAST_YEAR,
     IDX_EXCHANGE_HOLIDAYS,
     MON_THU_SESSIONS,
     WIB,
     SessionWindow,
     is_trading_day,
     signal_windows,
+    trading_day_signal_windows,
+    wib_today,
 )
 
 # Pinned dates.  ``2026-10-13`` is a Tuesday, ``2026-10-16`` the Friday of the
@@ -77,6 +84,32 @@ NORMAL_WEEKDAYS_2026 = (
     date(2026, 4, 1),
     date(2026, 7, 15),
     date(2026, 11, 30),
+)
+
+#: The nine *weekday* closures ``holidays`` 0.106 reports for 2030, pinned as
+#: literals on purpose.  The property test below asserts set equality against
+#: this tuple rather than against ``indonesia_holidays``/``IDX_EXCHANGE_HOLIDAYS``,
+#: so it is not merely reading the module's own sources back at it: a library
+#: bump that moves a projected date fails here, loudly, and an inverted predicate
+#: fails the equality on the other side.
+PROJECTED_CLOSURES_2030 = (
+    date(2030, 1, 1),    # Tahun Baru Masehi
+    date(2030, 2, 4),    # Hari Raya Idul Fitri (perkiraan)
+    date(2030, 2, 5),    # Hari kedua dari Hari Raya Idul Fitri (perkiraan)
+    date(2030, 3, 5),    # Hari Suci Nyepi
+    date(2030, 4, 19),   # Wafat Yesus Kristus
+    date(2030, 5, 1),    # Hari Buruh Internasional
+    date(2030, 5, 16),   # Hari Raya Waisak (perkiraan)
+    date(2030, 5, 30),   # Kenaikan Yesus Kristus
+    date(2030, 12, 25),  # Hari Raya Natal
+)
+
+#: IDX's published trading-day counts for three months outside 2026, so the
+#: cross-check is not a single-year coincidence.  See the report for the sources.
+PUBLISHED_NEIGHBOURING_MONTHS = (
+    (2024, 12, 19),   # three December closures: 25, 26 and the 31st exchange closure
+    (2025, 1, 19),    # the four weekday closures 1, 27, 28 and 29 January
+    (2025, 12, 20),   # 25 December plus the 31 December exchange closure
 )
 
 
@@ -172,6 +205,33 @@ def test_both_shapes_open_at_0900_and_close_session_two_at_154959():
 def test_sessions_are_session_window_instances():
     assert all(isinstance(s, SessionWindow) for s in MON_THU_SESSIONS)
     assert all(isinstance(s, SessionWindow) for s in FRIDAY_SESSIONS)
+
+
+def test_the_session_bounds_name_their_governing_instrument():
+    """The session table is held to the same named-source standard as the holidays.
+
+    These four bounds are the exchange's, not a summary of them: they come from
+    IDX Rule II-A as implemented by Decree Kep-00196/BEI/12-2024.  Naming the
+    instrument is what makes them reviewable when the exchange changes them.
+    """
+    authority = market_calendar.SESSION_HOURS_SOURCE
+    assert "II-A" in authority, authority
+    assert "Kep-00196/BEI/12-2024" in authority, authority
+
+
+def test_only_two_session_shapes_exist_so_a_shortened_session_is_not_representable():
+    """The documented gap, pinned rather than argued.
+
+    IDX runs early closes on a few days a year.  ``SessionWindow`` carries one
+    ``start``/``end`` pair per session and ``sessions_for`` knows two shapes, so a
+    half-day cannot be expressed: every weekday resolves to the Monday–Thursday
+    or the Friday pair, and nothing will tell a half-day apart from a full one.
+    Adding half-days is therefore a deliberate type change, not a data entry.
+    """
+    assert [f.name for f in dataclasses.fields(SessionWindow)] == ["start", "end"]
+    for offset in range(7):
+        day = MONDAY + timedelta(days=offset)
+        assert market_calendar.sessions_for(day) in (MON_THU_SESSIONS, FRIDAY_SESSIONS), day
 
 
 def test_signal_windows_returns_exactly_the_three_named_keys_in_order():
@@ -326,7 +386,13 @@ def test_every_weekday_of_a_future_year_is_trading_unless_it_is_a_known_closure(
     Set equality, both directions: no weekday is dropped merely for being in the
     future, and every listed closure is dropped.  2030 is past every table this
     module ships, so the closures in it come from the ``holidays`` projection
-    alone — and there are only nine of them, all of which are dropped.
+    alone.
+
+    The closures are compared against :data:`PROJECTED_CLOSURES_2030` — literals,
+    not a set built from the same two sources ``is_trading_day`` reads.  Without
+    that, the assertion would be close to tautological: it would restate the
+    implementation rather than check it.  With it, moving the predicate's
+    coverage in either direction fails here.
     """
     year = 2030
     weekdays = set(_weekdays(year))
@@ -334,13 +400,37 @@ def test_every_weekday_of_a_future_year_is_trading_unless_it_is_a_known_closure(
               if d in market_calendar.indonesia_holidays(year)
               or d in IDX_EXCHANGE_HOLIDAYS}
 
-    assert 0 < len(listed) <= 12, sorted(listed)   # a plausible year, not an empty one
-    assert len(weekdays - listed) > 250, "the fixture year is mostly closures"
+    assert listed == set(PROJECTED_CLOSURES_2030), sorted(
+        listed ^ set(PROJECTED_CLOSURES_2030)
+    )
+    assert all(d.weekday() < 5 for d in listed), sorted(listed)
 
     got = {d for d in weekdays if is_trading_day(d)}
 
-    assert got == weekdays - listed, sorted(weekdays - listed - got)[:5]
+    assert got == weekdays - set(PROJECTED_CLOSURES_2030), sorted(
+        (weekdays - set(PROJECTED_CLOSURES_2030)) - got
+    )[:5]
+    assert len(got) == len(weekdays) - len(PROJECTED_CLOSURES_2030)
     assert len(got) > 250, f"only {len(got)} trading days in {year} — the predicate is inverted"
+
+    # An ordinary Wednesday in that year, named so the failure message is concrete.
+    assert is_trading_day(date(2030, 6, 12)) is True
+
+
+def test_neighbouring_months_match_idx_published_trading_day_counts():
+    """Three published months outside 2026, so the cross-check is not one year.
+
+    December 2024, January 2025 and December 2025 were reproduced independently
+    when this task's data was verified; pinning them here means a ``holidays``
+    bump that changes a non-2026 year fails the suite instead of moving the
+    calendar silently.
+    """
+    for year, month, published in PUBLISHED_NEIGHBOURING_MONTHS:
+        counted = sum(
+            1 for day in _weekdays(year)
+            if day.month == month and is_trading_day(day)
+        )
+        assert counted == published, f"{year}-{month:02d}: {counted} != {published}"
 
 
 def test_the_number_of_2026_trading_days_matches_idx_published_counts():
@@ -398,6 +488,41 @@ def test_the_idx_override_list_is_sourced_data_not_a_bare_set():
         assert isinstance(source, str) and len(source) > 10, (day, source)
 
 
+def test_each_exchange_closure_names_its_own_year_in_its_source():
+    """Provenance that is year-less is provenance a maintainer cannot follow.
+
+    One shared category label was enough for ``isinstance(str) and len > 10`` and
+    lost the per-year citation — which year's *Kalender Libur Bursa* says so —
+    the moment a second year was added.  Each value now carries its own year, and
+    this asserts it rather than trusting the text to stay that way.
+    """
+    for day, source in IDX_EXCHANGE_HOLIDAYS.items():
+        assert str(day.year) in source, (
+            f"{day} is sourced from a label that does not name {day.year}: {source!r}"
+        )
+    assert len(set(IDX_EXCHANGE_HOLIDAYS.values())) == len(IDX_EXCHANGE_HOLIDAYS), (
+        "two closures share one year-less category label, so the per-year citation is lost"
+    )
+
+
+def test_indonesia_holidays_hands_out_a_read_only_view_not_the_cached_dict():
+    """A caller cannot poison the process-wide cache through the return value.
+
+    ``lru_cache`` returns the same object every call, so a mutable ``dict`` here
+    is one stray assignment away from a wrong answer for every later caller in
+    the process.  The cache stays internally; the public function hands out a
+    read-only mapping.
+    """
+    first = market_calendar.indonesia_holidays(2026)
+    assert market_calendar.indonesia_holidays(2026) is first, "the cache stopped caching"
+
+    with pytest.raises(TypeError):
+        first[date(2026, 1, 1)] = "tampered"      # type: ignore[index]
+
+    assert date(2026, 1, 1) in market_calendar.indonesia_holidays(2026)
+    assert market_calendar.indonesia_holidays(2026)[date(2026, 1, 1)].startswith("Tahun Baru")
+
+
 def test_a_date_typed_datetime_is_accepted_as_well_as_a_date():
     """``datetime`` is a ``date`` subclass; the predicate must not crash on one."""
     assert is_trading_day(datetime(2026, 10, 16, 14, 15)) is True
@@ -442,6 +567,79 @@ def test_the_warning_names_the_last_curated_year():
     assert market_calendar.HOLIDAY_DATA_LAST_YEAR < 2030
 
 
+def test_the_coverage_boundary_is_tied_to_the_data_it_describes():
+    """The constant and ``IDX_EXCHANGE_HOLIDAYS`` cannot drift apart.
+
+    Nothing else connects them: a maintainer who bumps
+    ``HOLIDAY_DATA_LAST_YEAR`` to 2027 without adding 2027's 31 December closure
+    — a real exchange-only closure — silently removes the warning for the year
+    whose final session is closed, which is exactly the quiet wrong answer this
+    module exists to prevent.  The module asserts the same relation at import;
+    this is the copy a reader finds next to the data.
+    """
+    assert HOLIDAY_DATA_LAST_YEAR == max(IDX_EXCHANGE_HOLIDAYS).year
+    assert HOLIDAY_DATA_LAST_YEAR in {d.year for d in IDX_EXCHANGE_HOLIDAYS}
+
+
+def test_a_date_before_the_holiday_data_warns_and_still_answers(caplog):
+    """The mirror of the upper boundary, so the asymmetry is not an oversight.
+
+    ``holidays``' Indonesia calendar has ``start_year = 1946``; before that the
+    list is empty and every weekday answers ``True`` — the same one-sided risk R1
+    accepts, but silent at the bottom while the top warns.  Both ends now warn
+    and neither raises.
+    """
+    with caplog.at_level(logging.WARNING, logger="market_calendar"):
+        assert is_trading_day(date(1900, 1, 2)) is True      # a Tuesday
+    messages = [r.getMessage() for r in caplog.records]
+    assert messages, "a pre-1946 weekday was answered without a warning"
+    assert any("1900" in m for m in messages), messages
+    assert any(str(market_calendar.HOLIDAY_DATA_FIRST_YEAR) in m for m in messages), messages
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="market_calendar"):
+        for _ in range(5):
+            is_trading_day(date(1900, 1, 2))
+    assert caplog.records == [], [r.getMessage() for r in caplog.records]
+
+
+def test_the_first_covered_year_is_the_librarys_own_start_year():
+    """The lower bound is the library's, not a number someone liked."""
+    assert market_calendar.HOLIDAY_DATA_FIRST_YEAR == 1946
+    assert (
+        holidays.country_holidays("ID", years=1946).start_year
+        == market_calendar.HOLIDAY_DATA_FIRST_YEAR
+    )
+
+
+def test_this_modules_hard_dependencies_are_pinned_against_what_is_installed():
+    """``holidays`` and ``tzdata`` must be declared, not inherited by luck.
+
+    ``ZoneInfo("Asia/Jakarta")`` reads the IANA database, which Windows does not
+    ship: without ``tzdata`` the ``WIB`` definition at import time raises
+    ``ZoneInfoNotFoundError``.  Both packages reached this venv transitively
+    (``pip show tzdata`` → required-by kombu, pandas, tzlocal), so a bare install
+    of ``requirements.txt`` was one import away from failing.  The pin is checked
+    against the installed version so the manifest and the environment cannot part
+    company quietly.
+    """
+    declared: dict[str, str] = {}
+    manifest = Path(__file__).resolve().parents[1] / "requirements.txt"
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line.startswith("#") or "==" not in line:
+            continue
+        name, _, version = line.partition("==")
+        declared[name.strip()] = version.strip()
+
+    for package in ("holidays", "tzdata"):
+        assert package in declared, f"{package} is not pinned in requirements.txt"
+        installed = importlib.metadata.version(package)
+        assert declared[package] == installed, (
+            f"requirements.txt pins {package}=={declared[package]}, {installed} is installed"
+        )
+
+
 def test_a_covered_date_does_not_warn(caplog):
     with caplog.at_level(logging.WARNING, logger="market_calendar"):
         is_trading_day(date(2026, 10, 16))
@@ -454,3 +652,101 @@ def test_signal_windows_also_warns_beyond_coverage(caplog):
     with caplog.at_level(logging.WARNING, logger="market_calendar"):
         signal_windows(date(2031, 3, 4))
     assert caplog.records, "signal_windows answered past coverage silently"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# THE GATE — a closed day is answered loudly, and can be gated on request
+# ═══════════════════════════════════════════════════════════════════════════════
+
+#: A Friday, and a public holiday.
+CHRISTMAS = date(2026, 12, 25)
+#: Cuti Bersama Tahun Baru Imlek — a Monday, and the category most often missed.
+CUTI_BERSAMA_2026 = date(2026, 2, 16)
+#: The exchange-only closure: not a public holiday, so a bare ``holidays`` misses it.
+YEAR_END_CLOSURE = date(2026, 12, 31)
+
+
+@pytest.mark.parametrize("day", [SATURDAY, date(2026, 10, 18), CHRISTMAS,
+                                 CUTI_BERSAMA_2026, YEAR_END_CLOSURE])
+def test_signal_windows_warns_on_a_non_trading_day(day, caplog):
+    """The failure this plan exists to remove, made impossible to miss.
+
+    A Phase 4 scheduler that iterates ``signal_windows(today)`` without the
+    second call emitted all three signals on Christmas and on every ``cuti
+    bersama`` day, silently.  The clock still answers — inspecting a future date
+    is a real use — but it now says out loud that the answer is not tradeable.
+    """
+    with caplog.at_level(logging.WARNING, logger="market_calendar"):
+        windows = signal_windows(day)
+    assert len(windows) == 3, "the clock no longer answers for inspection"
+    messages = [r.getMessage() for r in caplog.records]
+    assert messages, f"{day} produced three signals with no warning at all"
+    assert any(day.isoformat() in m for m in messages), messages
+
+
+def test_signal_windows_says_nothing_on_a_trading_day(caplog):
+    """No new noise: the warning is for closures, not for every call."""
+    with caplog.at_level(logging.WARNING, logger="market_calendar"):
+        signal_windows(FRIDAY)
+        signal_windows(TUESDAY)
+    assert caplog.records == [], [r.getMessage() for r in caplog.records]
+
+
+@pytest.mark.parametrize("day", [SATURDAY, date(2026, 10, 18), CHRISTMAS,
+                                 CUTI_BERSAMA_2026, YEAR_END_CLOSURE])
+def test_trading_day_signal_windows_is_empty_for_a_closure(day, caplog):
+    """The gated form: a caller wanting the safe default writes one call.
+
+    ``[]`` here is not the "safe default indistinguishable from a real value"
+    defect the repository's conventions name: it is the answer to *which signals
+    fire today*, and on a closed day exactly zero do.  Unlike ``signal_windows``,
+    this function is silent — there is nothing to inspect, because the caller
+    asked the question that has no tradeable ambiguity.
+    """
+    with caplog.at_level(logging.WARNING, logger="market_calendar"):
+        assert trading_day_signal_windows(day) == []
+    assert caplog.records == [], [r.getMessage() for r in caplog.records]
+
+
+def test_trading_day_signal_windows_is_the_same_three_windows_on_a_trading_day():
+    """The gate adds nothing and removes nothing on an open day."""
+    for day in MON_THU + (FRIDAY,):
+        windows = trading_day_signal_windows(day)
+        assert [name for name, _ in windows] == ["open", "post_lunch", "pre_close"]
+        assert windows == signal_windows(day)
+
+
+def test_trading_day_signal_windows_accepts_a_datetime_like_the_other_two():
+    assert trading_day_signal_windows(datetime(2026, 10, 17, 11, 0)) == []
+    assert trading_day_signal_windows(datetime(2026, 10, 16, 11, 0)) == signal_windows(FRIDAY)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# THE CLOCK — the one place this module reads it, and why it is WIB
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_wib_today_is_derived_from_wib_not_the_host_clock(monkeypatch):
+    """03:00 WIB on 2 January is still 1 January in UTC — the api container's zone.
+
+    The instant is the exact hazard, not a convenient one.  31 December 2025 and
+    1 January 2026 are both closures, so a scheduler on a UTC host that asks
+    ``date.today()`` at 03:00 WIB on 2 January asks about a *closed* day, gets
+    ``False`` from ``is_trading_day``, and skips the first trading day of the year
+    without saying anything.  ``wib_today`` converts the instant before taking the
+    date, so it cannot be off by a day during the seven hours the two calendars
+    disagree.
+    """
+    instant = datetime(2026, 1, 1, 20, 0, tzinfo=timezone.utc)   # 2026-01-02 03:00 WIB
+    monkeypatch.setattr(market_calendar, "_now", lambda: instant)
+
+    assert wib_today() == date(2026, 1, 2)
+    assert wib_today() != instant.date(), "wib_today is reading the host's date"
+    assert is_trading_day(date(2025, 12, 31)) is False, "the two-day closure"
+    assert is_trading_day(instant.date()) is False, "the host's date is not the hazard claimed"
+    assert is_trading_day(wib_today()) is True, "the trading day would have been skipped"
+
+
+def test_wib_today_agrees_with_the_jakarta_clock():
+    """And with the real clock, so the function is not merely a test seam."""
+    assert wib_today() == datetime.now(WIB).date()
+    assert isinstance(wib_today(), date)
