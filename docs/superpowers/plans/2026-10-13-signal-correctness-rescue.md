@@ -270,9 +270,9 @@ def test_build_features_does_no_io(raw_ohlcv, ihsg_frame, fundamentals_dict, mon
     monkeypatch.setattr(p, "fetch_google_trends", explode)
 
     out = p.build_features(
-        raw_ohlcv, "AAAA.JK",
+        raw_ohlcv, "BBCA.JK",
         fundamentals=fundamentals_dict, usdidr=None, fred_macro=None, bi_rate=None,
-        ihsg=ihsg_frame, all_ticker_data={"AAAA.JK": raw_ohlcv["AAAA.JK"].dropna()},
+        ihsg=ihsg_frame, all_ticker_data={"BBCA.JK": raw_ohlcv["BBCA.JK"].dropna()},
         news_sentiment=0.2, google_trend=0.0, vp_features={}, idx_fundamentals={},
         mode="full", with_target=True,
     )
@@ -323,8 +323,8 @@ git commit -m "refactor: extract pure build_features from engineer_features_for_
 def test_no_placeholder_nan_columns(raw_ohlcv, ihsg_frame, fundamentals_dict, monkeypatch):
     import serve
     monkeypatch.setattr(serve, "load_universe_context",
-                        lambda: (raw_ohlcv, ihsg_frame, {"AAAA.JK": raw_ohlcv["AAAA.JK"].dropna()}))
-    out = serve.build_inference_features(raw_ohlcv["AAAA.JK"].dropna(), "AAAA.JK", fundamentals_dict)
+                        lambda: (raw_ohlcv, ihsg_frame, {"BBCA.JK": raw_ohlcv["BBCA.JK"].dropna()}))
+    out = serve.build_inference_features(raw_ohlcv["BBCA.JK"].dropna(), "BBCA.JK", fundamentals_dict)
     all_nan = [c for c in out.columns if out[c].isna().all()]
     assert all_nan == [], f"features still faked at inference: {all_nan}"
 
@@ -491,7 +491,7 @@ from model_store import ModelNotFound, resolve_model_folder
 
 def test_unknown_ticker_raises(monkeypatch, tmp_path):
     import model_store
-    monkeypatch.setattr(model_store, "load_model_index", lambda: {"AAAA.JK": "m-1"})
+    monkeypatch.setattr(model_store, "load_model_index", lambda: {"BBCA.JK": "m-1"})
     with pytest.raises(ModelNotFound):
         resolve_model_folder("ZZZZ.JK")
 
@@ -499,7 +499,7 @@ def test_no_fallback_to_first_folder(monkeypatch):
     import model_store
     monkeypatch.setattr(model_store, "load_model_index", lambda: {})
     with pytest.raises(ModelNotFound):
-        resolve_model_folder("AAAA.JK")
+        resolve_model_folder("BBCA.JK")
 ```
 
 - [ ] **Step 2: Run it and confirm it fails**
@@ -548,8 +548,8 @@ def test_index_roundtrip(tmp_path, monkeypatch):
     import model_store
     p = tmp_path / "model_index.json"
     monkeypatch.setattr(model_store, "index_path", lambda: p)
-    write_model_index({"AAAA.JK": "m-1"}, p)
-    assert json.loads(p.read_text())["ticker_to_model"] == {"AAAA.JK": "m-1"}
+    write_model_index({"BBCA.JK": "m-1"}, p)
+    assert json.loads(p.read_text())["ticker_to_model"] == {"BBCA.JK": "m-1"}
 ```
 
 - [ ] **Step 2: Run it and confirm it fails**
@@ -594,21 +594,21 @@ def test_fast_and_slow_path_agree(tmp_path, monkeypatch):
     monkeypatch.setattr(serve, "PRED_CACHE_DB", str(tmp_path / "c.db"))
     schema = ["volatility_20d", "rsi"]
     row = pd.Series({"volatility_20d": 9.0, "rsi": 0.1})
-    serve._cache_put("AAAA.JK", row, schema, "0900")
-    got = serve._cache_get("AAAA.JK", schema, "0900")
+    serve._cache_put("BBCA.JK", row, schema, "0900")
+    got = serve._cache_get("BBCA.JK", schema, "0900")
     assert got["volatility_20d"] == 9.0 and got["rsi"] == 0.1
 
 def test_window_change_is_a_miss(tmp_path, monkeypatch):
     import serve
     monkeypatch.setattr(serve, "PRED_CACHE_DB", str(tmp_path / "c.db"))
-    serve._cache_put("AAAA.JK", pd.Series({"rsi": 1.0}), ["rsi"], "0900")
-    assert serve._cache_get("AAAA.JK", ["rsi"], "1330") is None
+    serve._cache_put("BBCA.JK", pd.Series({"rsi": 1.0}), ["rsi"], "0900")
+    assert serve._cache_get("BBCA.JK", ["rsi"], "1330") is None
 
 def test_schema_change_is_a_miss(tmp_path, monkeypatch):
     import serve
     monkeypatch.setattr(serve, "PRED_CACHE_DB", str(tmp_path / "c.db"))
-    serve._cache_put("AAAA.JK", pd.Series({"rsi": 1.0}), ["rsi"], "0900")
-    assert serve._cache_get("AAAA.JK", ["rsi", "volatility_20d"], "0900") is None
+    serve._cache_put("BBCA.JK", pd.Series({"rsi": 1.0}), ["rsi"], "0900")
+    assert serve._cache_get("BBCA.JK", ["rsi", "volatility_20d"], "0900") is None
 ```
 
 - [ ] **Step 2: Run it and confirm it fails**
@@ -654,7 +654,7 @@ def test_sentiment_failure_is_flagged(monkeypatch):
     monkeypatch.setattr(serve, "build_inference_features",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("news api down")))
     client = TestClient(serve.app)
-    r = client.post("/predict", json={"ticker": "AAAA.JK"})
+    r = client.post("/predict", json={"ticker": "BBCA.JK"})
     assert r.status_code in (500, 502)
     assert "sentiment" in r.text or "news api down" in r.text
 
