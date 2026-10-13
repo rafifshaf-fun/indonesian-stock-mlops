@@ -23,3 +23,7 @@ joblib==1.5.3
 prometheus_client==0.25.0
 PyYAML==6.0.3
 requests==2.34.2
+# Indonesia's public holidays and cuti bersama, read by src/market_calendar.py;
+# its release notes name the years it added, which is what the calendar's
+# annual refresh checks first
+holidays==0.106
