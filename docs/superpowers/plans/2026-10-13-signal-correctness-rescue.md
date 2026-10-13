@@ -359,7 +359,7 @@ git commit -m "fix(serve): build inference features with the training builder (F
 
 **Files:**
 - Create: `src/features/schema.py`
-- Modify: `src/train.py:229-300`, `src/serve.py`, `mlruns/1/models/model_index.json` (written by training, not by hand)
+- Modify: `src/train.py:229-300` (schema persistence only — **not** `src/serve.py`; see Step 5)
 - Test: `tests/test_feature_schema.py`
 
 **Interfaces:**
@@ -403,9 +403,9 @@ Implement the four names above. `align_to_schema` must reorder by name and raise
 
 In `src/train.py`, replace the per-ticker `_select_features_shap` call with a single selection computed once over the pooled frame, then train every ticker on that same ordered list. Write `feature_schema.json` into each logged model's directory before `log_model`.
 
-- [ ] **Step 5: Enforce the schema at load time**
+- [ ] **Step 5: Do NOT wire enforcement here (deferred to Task 1.6)**
 
-In `src/serve.py` and Task 1.6's `model_store`, load the model's `feature_schema.json` and pass the computed frame through `align_to_schema`. A mismatch must fail the request, not degrade it.
+This task originally wired enforcement into `src/serve.py`. Task 1.6 moves all model loading into `src/model_store.py`, so wiring it here would be thrown away. **Do not modify `src/serve.py` in this task.** Task 1.6 owns enforcement: `load_model_for(ticker)` returns `(model, feature_columns)` and its callers pass the computed frame through `align_to_schema`, failing the request on mismatch.
 
 - [ ] **Step 6: Run the tests and confirm they pass**
 
@@ -942,7 +942,7 @@ git add docs/measurement-2026-10-13.md
 git commit -m "docs: honest post-fix measurement at three cost levels"
 ```
 
-### Task 3.4: Decision gate (no code)
+### Task 3.3: Decision gate (no code)
 
 - [ ] **Step 1: Answer three questions in writing**
 
