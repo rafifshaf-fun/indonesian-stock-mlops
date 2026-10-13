@@ -19,7 +19,7 @@ TICKERS = [
 # ── Sector Groupings (for cross-stock features) ───────────────────────────────
 SECTORS = {
     "banking": ["BBCA.JK", "BBRI.JK", "BMRI.JK", "BBNI.JK", "BBTN.JK", "BRIS.JK", "ARTO.JK"],
-    "energy_mining": ["ADRO.JK", "ANTM.JK", "PTBA.JK", "ITMG.JK", "MEDC.JK", "PGEO.JK", "INCO.JK", "MDKA.JK", "MBMA.JK", "BREN.JK", "AADI.JK", "AKRA.JK"],
+    "energy_mining": ["ADRO.JK", "ANTM.JK", "PTBA.JK", "ITMG.JK", "MEDC.JK", "PGEO.JK", "INCO.JK", "MDKA.JK", "MBMA.JK", "BREN.JK", "AADI.JK", "AKRA.JK", "ADMR.JK"],
     "telco": ["TLKM.JK", "ISAT.JK", "EXCL.JK", "TOWR.JK"],
     "consumer": ["UNVR.JK", "ICBP.JK", "INDF.JK", "JPFA.JK", "CPIN.JK", "KLBF.JK", "SIDO.JK", "AMRT.JK", "MAPI.JK", "MAPA.JK"],
     "infra_construction": ["SMGR.JK", "CTRA.JK", "SMRA.JK", "JSMR.JK", "PGAS.JK"],
@@ -71,6 +71,8 @@ TICKER_SEARCH_TERMS = {
     "MAPA.JK": "MAP Aktif Adiperkasa", "MAPI.JK": "Mitra Adiperkasa",
     "MBMA.JK": "Merdeka Battery", "MDKA.JK": "Merdeka Copper",
     "MEDC.JK": "Medco Energi", "PGEO.JK": "Pertamina Geothermal",
+    "INCO.JK": "Vale Indonesia", "ITMG.JK": "Indo Tambangraya Megah",
+    "SIDO.JK": "Sido Muncul",
 }
 
 # ── Feature Flags (toggle feature categories on/off) ───────────────────────────

@@ -119,7 +119,7 @@ python scripts/seed_metrics.py
 
 echo Step 5: Pre-warming prediction cache for instant first request...
 python -c "import asyncio, sys; sys.path.insert(0,'scripts'); from seed_metrics import seed_all; asyncio.run(seed_all(concurrency=4))"
-goto END
+if not "%user_choice%"=="7" if not "%user_choice%"=="8" goto END
 
 :: ── OPTIONS 7 & 8 ──────────────────────────────────────────────────────
 if "%user_choice%"=="7" (

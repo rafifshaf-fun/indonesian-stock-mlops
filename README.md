@@ -274,7 +274,7 @@ python cli.py sentiment --all                    # All 45
 # Training
 python cli.py train                              # Train all models (sequential)
 python cli.py train --parallel                   # All 45 in parallel (15-20 min)
-python cli.py train --parallel --no-shap         # Parallel without SHAP pruning
+python src/train.py --parallel --no-shap         # Parallel without SHAP pruning
 python cli.py train --ticker BBCA.JK --tune      # Tune single ticker
 
 # Status & Info
