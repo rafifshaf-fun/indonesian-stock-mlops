@@ -1,6 +1,9 @@
 import sys, os, time
 sys.path.insert(0, os.path.dirname(__file__))
 
+import hashlib
+import json
+
 import mlflow
 import pandas as pd
 import numpy as np
@@ -100,11 +103,21 @@ async def _warmup_prediction_cache():
     logger.info("Prediction cache pre-warm started (top %d tickers)...", len(priority))
     warmed = 0
     for ticker in priority:
-        cached, _ = _cache_get(ticker)
-        if cached is not None:
-            warmed += 1
-            continue
         try:
+            # The model's own contract, from the one model selector, *before* the
+            # download: a ticker the index does not map has nothing to cache, so
+            # warming it would spend a Yahoo Finance call to build a row that is
+            # then dropped.  ``load_best_model`` is that selector plus the
+            # per-process model cache, and it raises the same ``ModelNotFound`` /
+            # ``FeatureSchemaError`` the request path raises.
+            model, trained_cols = load_best_model(ticker)
+
+            # The key carries the model's schema, so the check has to be made
+            # with it: a row cached for another schema is not a warm entry.
+            if _cache_get(ticker, trained_cols, CACHE_WINDOW_DEFAULT) is not None:
+                warmed += 1
+                continue
+
             df = await asyncio.to_thread(
                 yf.download, ticker, period="250d", auto_adjust=True, progress=False
             )
@@ -117,14 +130,11 @@ async def _warmup_prediction_cache():
             fundamentals = await asyncio.to_thread(fetch_fundamentals, ticker)
             latest = build_inference_features(df, ticker, fundamentals)
 
-            model, trained_cols = load_best_model(ticker)
-
             # The model's own contract decides the column set and its order —
-            # the same call the /predict slow path makes, so a pre-warmed vector
-            # is the vector a request would compute.
-            latest_df = align_to_schema(latest, trained_cols)
-            feature_vec = np.asarray(latest_df.iloc[0], dtype=np.float32)
-            _cache_put(ticker, feature_vec)
+            # the same call the /predict slow path makes, so a pre-warmed row is
+            # the row a request would compute and store.
+            feature_row = _warm_feature_row(latest, trained_cols)
+            _cache_put(ticker, feature_row, trained_cols, CACHE_WINDOW_DEFAULT)
             warmed += 1
             logger.debug("Pre-warmed: %s", ticker)
         except Exception as e:
@@ -148,44 +158,223 @@ except ValueError:
 model_cache = {}
 
 # ── Prediction Cache (SQLite) — sub-second predictions after first hit ──────
+#
+# One cache, one key, one reconciliation (F6, F7).  What this block replaced:
+#
+# * the cache stored a bare ``numpy`` vector under a key of ``(ticker, date)``,
+#   and the request path rebuilt a feature frame by **zipping that vector
+#   positionally** onto the current model's column order, defaulting any
+#   shortfall to ``0.0``.  A vector written by a different model — a retrain, or
+#   another ticker's model — was silently permuted across features.
+# * the cache-hit path filled a column the model wanted but the vector lacked
+#   with ``0.0``, while the cache-miss path filled it with ``NaN``, so the same
+#   ticker on the same day had two different answers (measured 0.187 against
+#   0.303, straddling the 0.50 threshold).
+#
+# The fix is structural rather than defensive: the key now carries a fingerprint
+# of the model's schema, so values written for a different column set are a
+# **miss** and a positional zip has nothing to zip; the row itself is stored
+# keyed by column *name*; and the single frame builder below is the only thing
+# that turns a row into a model input, so the fast and slow paths cannot diverge.
 import sqlite3
-import pickle
 
 PRED_CACHE_DB = os.path.join(BASE_DIR, "data", "prediction_cache.db")
+
+#: The cache key's column set.  ``date`` is not part of the key: it is
+#: overwritten on every put and checked for "today" on every get, so one key
+#: holds only the current day's row.
+CACHE_COLUMNS = ("ticker", "window", "schema_hash", "date", "features")
+
+#: Fingerprint namespace and version.  Bumped rather than migrated when the
+#: stored encoding changes: an entry written by an older encoding then misses
+#: instead of being read as if it matched, which is the whole point of the key.
+_CACHE_FINGERPRINT_VERSION = "v1"
+
+#: The one documented trading-window default (R1).  The cache key includes the
+#: window, but serving has no notion of a trading window yet — Task 1.10 builds
+#: the IDX calendar and Phase 4 schedules the three daily signals — so today
+#: every caller passes this same value and behaviour is unchanged.  When Task
+#: 1.10 has real windows it passes them through the parameter that already
+#: exists here, and a 09:00 row can never be served as a 13:30 one: a different
+#: window is a different key, hence a miss, hence a recompute.
+CACHE_WINDOW_DEFAULT = "daily"
+
+
+def _cache_schema_hash(schema) -> str:
+    """Fingerprint a model's ordered feature schema for the cache key.
+
+    Order is part of the fingerprint, not just the name set: XGBoost is fitted
+    on a positionally-scaled matrix, so the same names in a different order are a
+    different model input (see ``features.schema``).  Names are stringified first
+    so a caller passing a ``numpy`` array of names — which ``load_model_for``
+    does — fingerprints identically to a caller passing a ``list``.
+
+    Returns:
+        A stable hex digest.  A schema whose names cannot be marshalled is not
+        silently skipped: it is a programming error, not a cache advisory, and
+        :class:`TypeError` says so.
+    """
+    names = [str(name) for name in schema]
+    payload = json.dumps(names, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(
+        f"{_CACHE_FINGERPRINT_VERSION}|{payload}".encode("utf-8")
+    ).hexdigest()
+
+
+def _cache_columns(path) -> list[str]:
+    """Column names of the ``cache`` table at ``path``, or ``[]`` when there is none."""
+    conn = sqlite3.connect(str(path))
+    try:
+        return [row[1] for row in conn.execute("PRAGMA table_info(cache)")]
+    finally:
+        conn.close()
+
 
 def _get_cache_conn():
     os.makedirs(os.path.dirname(PRED_CACHE_DB), exist_ok=True)
     conn = sqlite3.connect(PRED_CACHE_DB)
+    # ``CREATE TABLE IF NOT EXISTS`` will not change the columns of a table that
+    # already exists, so a database created by the pre-Task-1.8 version keeps its
+    # old shape ``(ticker, date, features BLOB, ohlcv BLOB)`` and *every* query
+    # against the new columns fails.  The shape is inspected and a mismatched
+    # table is dropped and recreated (R5).  Dropping is safe by construction —
+    # the contents are a regenerable cache, and the cost is one slow request per
+    # ticker — and it must not throw on a fresh database, where there is no
+    # table to inspect at all.
+    existing = _cache_columns(PRED_CACHE_DB)
+    if existing and set(existing) != set(CACHE_COLUMNS):
+        logger.warning(
+            "Prediction cache %s has the old shape %s — dropping and recreating "
+            "as %s; its contents are a regenerable cache, so the cost is one "
+            "recompute per ticker",
+            PRED_CACHE_DB, existing, list(CACHE_COLUMNS),
+        )
+        conn.execute("DROP TABLE cache")
     conn.execute("CREATE TABLE IF NOT EXISTS cache "
-                 "(ticker TEXT PRIMARY KEY, date TEXT, features BLOB, ohlcv BLOB)")
+                 "(ticker TEXT, window TEXT, schema_hash TEXT, date TEXT, "
+                 "features TEXT, PRIMARY KEY (ticker, window, schema_hash))")
     conn.commit()
     return conn
 
-def _cache_put(ticker: str, feature_vec: np.ndarray, ohlcv_df: pd.DataFrame | None = None):
-    conn = _get_cache_conn()
-    today = str(date.today())
-    conn.execute("INSERT OR REPLACE INTO cache VALUES (?, ?, ?, ?)",
-                 (ticker, today,
-                  pickle.dumps(feature_vec),
-                  pickle.dumps(ohlcv_df) if ohlcv_df is not None else None))
-    conn.commit()
-    conn.close()
 
-def _cache_get(ticker: str) -> tuple[np.ndarray | None, pd.DataFrame | None]:
-    """Returns (feature_vector, ohlcv_dataframe) or (None, None) if stale/missing."""
+def _cache_put(ticker: str, feature_row: pd.Series, schema: list[str],
+               window: str = CACHE_WINDOW_DEFAULT) -> None:
+    """Store one ticker's latest feature row under the current model's key.
+
+    Args:
+        ticker: Exact ticker key, e.g. ``"BBCA.JK"``.
+        feature_row: The feature values, **keyed by column name**.  Storing the
+            names is what removes the positional zip: a value can no longer be
+            read back under a column it was not computed for.  ``NaN`` is a
+            legitimate value here (the served row carries it for the columns
+            ``tests/test_serve_parity.py`` pins), and round-trips as ``NaN``.
+        schema: The model's ordered feature contract — the same list passed to
+            ``align_to_schema``.  It is fingerprinted into the key, so a row
+            written for one column set is invisible to another.
+        window: The trading window this row belongs to (R1); see
+            :data:`CACHE_WINDOW_DEFAULT`.
+
+    R4: the values are JSON, **never** ``pickle``.  This database is intended to
+    become shared, and a shared store of pickled objects is a
+    code-execution vector for anyone who can write to it.  JSON is data — a
+    reader can be handed one without becoming an executor.
+    """
+    record = {str(name): _as_float(value) for name, value in feature_row.items()}
+    payload = json.dumps(record, allow_nan=True)
+    with _get_cache_conn() as conn:
+        conn.execute("INSERT OR REPLACE INTO cache VALUES (?, ?, ?, ?, ?)",
+                     (ticker, str(window), _cache_schema_hash(schema),
+                      str(date.today()), payload))
+
+
+def _cache_get(ticker: str, schema: list[str],
+               window: str = CACHE_WINDOW_DEFAULT) -> pd.Series | None:
+    """Return ``ticker``'s cached feature row for today, or ``None``.
+
+    ``None`` covers every way the cache cannot answer: no entry, an entry from
+    another day, another window, or a schema that fingerprints differently from
+    the model about to consume it.  A schema mismatch is deliberately a **miss**
+    rather than an adaptation — that is what makes the positional zip
+    unreachable, because a hit can only ever carry values computed for exactly
+    these columns (F6).
+
+    Returns:
+        ``pd.Series`` keyed by column name, or ``None``.  A row whose encoding
+        decodes yet does not match the requested schema is a ``warning`` and a
+        miss: an entry that cannot be used is a degradation worth seeing.
+    """
+    key = _cache_schema_hash(schema)
     conn = _get_cache_conn()
-    today = str(date.today())
-    row = conn.execute("SELECT date, features, ohlcv FROM cache WHERE ticker = ?",
-                       (ticker,)).fetchone()
-    conn.close()
-    if row and row[0] == today and row[1]:
-        try:
-            features = pickle.loads(row[1])
-            ohlcv = pickle.loads(row[2]) if row[2] else None
-            return features, ohlcv
-        except Exception:
-            pass
-    return None, None
+    try:
+        row = conn.execute(
+            "SELECT features FROM cache WHERE ticker = ? AND window = ? "
+            "AND schema_hash = ? AND date = ?",
+            (ticker, str(window), key, str(date.today())),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if row is None or not row[0]:
+        return None
+
+    try:
+        stored = json.loads(row[0])
+    except ValueError as exc:
+        logger.warning("Prediction cache entry for %s is not valid JSON (%s) — "
+                       "treated as a miss", ticker, exc)
+        return None
+    if not isinstance(stored, dict):
+        logger.warning("Prediction cache entry for %s is not keyed by column "
+                       "name (found %s) — treated as a miss",
+                       ticker, type(stored).__name__)
+        return None
+
+    expected = [str(name) for name in schema]
+    if sorted(stored) != sorted(expected):
+        logger.warning(
+            "Prediction cache entry for %s does not match the model's schema "
+            "(%d stored columns vs %d expected) — treated as a miss",
+            ticker, len(stored), len(expected),
+        )
+        return None
+    return pd.Series({name: stored[name] for name in expected}, dtype=float)
+
+
+def _as_float(value):
+    """``float`` for a feature value, or ``NaN`` when it is not numeric.
+
+    ``NaN`` is the honest reading of "this column carried no number": it is what
+    the builder already puts in an empty feature, and it is a value XGBoost
+    handles.  A ``0.0`` here would be the fabricated default this task removes.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _prediction_frame(feature_row: pd.Series, schema: list[str]) -> pd.DataFrame:
+    """The single model input: one row, in the schema's exact order.
+
+    Every path that predicts — cache hit, cache miss, warmup, batch miss —
+    builds its frame here, so "the fast path and the slow path agree" is a
+    property of there being one construction rather than a coincidence that has
+    to be re-checked.  ``align_to_schema`` is the only reconciliation and it
+    raises for a column this row cannot produce; nothing pads, and nothing
+    defaults to ``0.0`` (F7).
+    """
+    return align_to_schema(pd.DataFrame([feature_row]), schema)
+
+
+def _warm_feature_row(latest: pd.DataFrame, schema: list[str]) -> pd.Series:
+    """A computed 1-row frame as a name-keyed row ready for the cache.
+
+    The counterpart of :func:`_prediction_frame` on the write side, and the
+    reason ``feature_row`` and ``schema`` in :func:`_cache_put` are always
+    consistent: the row that is stored is the row that was aligned, so the
+    stored names are exactly the model's columns, in the model's order.
+    """
+    return align_to_schema(latest, schema).iloc[0]
 
 # ── Daily Caches ──────────────────────────────────────────────────────────────
 _cache_date = None
@@ -561,7 +750,13 @@ def cache_status():
     """Show prediction cache status."""
     conn = _get_cache_conn()
     today = str(date.today())
-    row = conn.execute("SELECT COUNT(*) FROM cache WHERE date = ?", (today,)).fetchone()
+    # Today's entries for the window serving currently uses (R1): one ticker now
+    # holds one row per (window, schema), so a bare COUNT over the table would
+    # report a coverage figure no single request path can achieve.
+    row = conn.execute(
+        "SELECT COUNT(*) FROM cache WHERE date = ? AND window = ?",
+        (today, CACHE_WINDOW_DEFAULT),
+    ).fetchone()
     cached_count = row[0] if row else 0
     total = conn.execute("SELECT COUNT(*) FROM cache").fetchone()[0]
     conn.close()
@@ -586,17 +781,20 @@ async def predict(request: PredictRequest, background_tasks: BackgroundTasks):
         background_tasks.add_task(refresh_daily_cache)
 
         # ── Fast path: check prediction cache ──────────────────────────
-        cached_features, cached_ohlcv = _cache_get(request.ticker)
+        # The key is (ticker, window, schema fingerprint), so `trained_cols` has
+        # to be in hand first: a row cached for another model's column set is a
+        # miss, not a vector to re-zip (F6).
         model, trained_cols = load_best_model(request.ticker)
+        cached_row = _cache_get(request.ticker, trained_cols, CACHE_WINDOW_DEFAULT)
 
-        if cached_features is not None:
+        if cached_row is not None:
             logger.debug("Cache HIT for %s — sub-200ms prediction", request.ticker)
-            # Align cached features to model columns
-            latest_dict = {col: 0.0 for col in trained_cols}
-            for i, col in enumerate(trained_cols):
-                if i < len(cached_features):
-                    latest_dict[col] = float(cached_features[i])
-            latest_df = pd.DataFrame([latest_dict])
+            # The stored row is keyed by column name and was written for exactly
+            # this schema, so the only reconciliation is align_to_schema — the
+            # same call the slow path makes.  Nothing here fills a shortfall:
+            # the `0.0` default that stood here was one half of F7, and it made
+            # a hit disagree with the miss that produced the row.
+            latest_df = _prediction_frame(cached_row, trained_cols)
 
             prediction = int(model.predict(latest_df)[0])
             probability = float(model.predict_proba(latest_df)[0][1])
@@ -650,14 +848,19 @@ async def predict(request: PredictRequest, background_tasks: BackgroundTasks):
         latest_df = align_to_schema(latest, trained_cols)
         latest_row = latest_df.iloc[0]
 
-        # 6. Cache feature vector for next request (fast path)
+        # 6. Cache the feature row for the next request (fast path) — keyed by
+        #    the model's schema and the window, so the hit path can only read
+        #    back values intended for exactly these columns (F6).  The row
+        #    cached is the aligned one, so what the hit path rebuilds is what
+        #    this request predicted on: the two paths converge here (F7).
         try:
-            feature_vec = np.array([float(latest_row.get(c, 0.0)) for c in trained_cols],
-                                   dtype=np.float32)
-            _cache_put(request.ticker, feature_vec)
+            _cache_put(request.ticker, latest_row, trained_cols, CACHE_WINDOW_DEFAULT)
             logger.debug("Cached features for %s (%d cols)", request.ticker, len(trained_cols))
         except Exception as e:
-            logger.debug("Failed to cache features for %s: %s", request.ticker, e)
+            # Best-effort: a prediction without a cache entry is slower, not
+            # wrong.  Reported at warning, because a cache that never fills is a
+            # degradation that would otherwise be invisible.
+            logger.warning("Failed to cache features for %s: %s", request.ticker, e)
 
         prediction = int(model.predict(latest_df)[0])
         probability = float(model.predict_proba(latest_df)[0][1])
