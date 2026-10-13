@@ -19,7 +19,6 @@ sys.path.insert(0, os.path.dirname(__file__))
 import pandas as pd
 import numpy as np
 import mlflow
-import mlflow.xgboost
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -32,6 +31,8 @@ from config import (
     TICKERS, DATA_PROCESSED_CSV_PATH, MLFLOW_EXPERIMENT,
     MLFLOW_DB, TRAINING_CONFIG, get_logger,
 )
+from features.schema import FeatureSchemaError, align_to_schema
+from model_store import ModelNotFound, load_model_for
 from train import load_features, prepare_xy, prune_features
 
 warnings.filterwarnings("ignore")
@@ -43,7 +44,7 @@ mlflow.set_tracking_uri(f"sqlite:///{mlflow_db_path}")
 BACKTEST_EXPERIMENT = "backtest"
 
 # ── Model cache ───────────────────────────────────────────────────────────────
-_model_cache = {}  # ticker -> model
+_model_cache = {}  # ticker -> (model, feature_columns)
 
 # ── Default parameters ────────────────────────────────────────────────────────
 DEFAULT_CONFIDENCE_THRESHOLD = 0.5   # Only trade if prob > this
@@ -78,55 +79,20 @@ def backtest_ticker(ticker: str, df_features: pd.DataFrame,
     Returns:
         dict of backtest metrics
     """
-    # ── Load model from filesystem using model index ─────────────────
+    # ── Load the model through the one selector (Task 1.6) ────────────
+    # model_store reads the same model_index.json the API reads, so the
+    # backtester and the API resolve a ticker to the same folder by
+    # construction (F9).  The old scan of sorted(os.listdir(...), reverse=True)
+    # is gone: it answered an unmapped ticker with the alphabetically last
+    # folder's model, which is not the folder the API would have chosen.
     global _model_cache
-    if ticker in _model_cache:
-        model = _model_cache[ticker]
-        loaded = True
-    else:
-        models_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                  "mlruns", "1", "models")
-        index_path = os.path.join(models_dir, "model_index.json")
-        model = None
-        loaded = False
-
-        # Try model index first
-        if os.path.exists(index_path):
-            try:
-                import json
-                with open(index_path) as f:
-                    index_data = json.load(f)
-                ticker_map = index_data.get("ticker_to_model", {})
-                if ticker in ticker_map:
-                    mf = ticker_map[ticker]["model_folder"]
-                    artifact_dir = os.path.join(models_dir, mf, "artifacts")
-                    if os.path.exists(os.path.join(artifact_dir, "MLmodel")):
-                        model = mlflow.xgboost.load_model(artifact_dir)
-                        logger.info("Loaded model for %s from index: %s", ticker, mf)
-                        loaded = True
-            except Exception as e:
-                logger.warning("Index load failed for %s: %s", ticker, e)
-
-        # Fallback: scan all models
-        if not loaded and os.path.isdir(models_dir):
-            for mf in sorted(os.listdir(models_dir), reverse=True):
-                mlf = os.path.join(models_dir, mf, "artifacts", "MLmodel")
-                if os.path.exists(mlf):
-                    try:
-                        model = mlflow.xgboost.load_model(os.path.join(models_dir, mf, "artifacts"))
-                        logger.info("Fallback: loaded model for %s from %s", ticker, mf)
-                        loaded = True
-                        break
-                    except Exception as e:
-                        logger.debug("Failed to load %s: %s", mf, e)
-                        continue
-
-        if loaded and model is not None:
-            _model_cache[ticker] = model
-
-    if not loaded or model is None:
-        logger.warning("No model found for %s — skipping", ticker)
-        return None
+    if ticker not in _model_cache:
+        try:
+            _model_cache[ticker] = load_model_for(ticker)
+        except ModelNotFound as e:
+            logger.warning("No model for %s — skipping (%s)", ticker, e)
+            return None
+    model, trained_cols = _model_cache[ticker]
 
     # ── Prepare ticker data ───────────────────────────────────────────────
     ticker_df = df_features[df_features["ticker"] == ticker].copy()
@@ -142,20 +108,19 @@ def backtest_ticker(ticker: str, df_features: pd.DataFrame,
     if X.shape[0] == 0 or X.shape[1] == 0:
         return None
 
-    # Get expected feature names from model
-    if hasattr(model, "feature_names_in_"):
-        trained_cols = list(model.feature_names_in_)
-    elif hasattr(model, "get_booster"):
-        trained_cols = model.get_booster().feature_names
-    else:
-        trained_cols = X.columns.tolist()
-
-    # Align features
-    for col in trained_cols:
-        if col not in X.columns:
-            X[col] = np.nan
-    X = X[[c for c in trained_cols if c in X.columns]]
-    X = X[trained_cols]
+    # Align features to the model's own contract.  align_to_schema raises for a
+    # column the model expects and this frame cannot build — the loop that used
+    # to insert NaN for exactly those columns is gone, because a padded column
+    # is a feature the model never saw during training.  A ticker whose model
+    # cannot be met is skipped with a warning naming it, rather than aborting
+    # the other 44: the fleet is made consistent by the retrain, not by
+    # weakening the contract here.
+    try:
+        X = align_to_schema(X, trained_cols)
+    except FeatureSchemaError as e:
+        logger.warning("Skipping %s — its model's feature contract cannot be met: %s",
+                       ticker, e)
+        return None
 
     # ── Walk-forward simulation ───────────────────────────────────────────
     n = len(X)

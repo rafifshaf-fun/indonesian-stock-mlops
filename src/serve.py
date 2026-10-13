@@ -1,14 +1,13 @@
-import sys, os, json, time
+import sys, os, time
 sys.path.insert(0, os.path.dirname(__file__))
 
 import mlflow
-import mlflow.xgboost
 import pandas as pd
 import numpy as np
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
-from typing import List
+from typing import Any, List
 import uvicorn
 from prometheus_fastapi_instrumentator import Instrumentator
 from prometheus_client import Counter, Histogram
@@ -27,12 +26,19 @@ from features import (
 # The one builder both paths share (Task 1.2).  Imported from its own module
 # because features/__init__.py does not re-export it.
 from features.pipeline import build_features
+# The model's feature contract (Task 1.4), applied wherever a computed frame
+# meets a model's columns, and the one model selector (Task 1.6).  Both are
+# imported rather than reimplemented here: this module no longer knows how the
+# model store is laid out or how a model's columns are discovered.
+from features.schema import FeatureSchemaError, align_to_schema
+from model_store import ModelNotFound, load_model_for, load_model_index
 
 logger = get_logger(__name__)
 
 # ── Dynamic path resolution ──
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MLRUNS_DIR = os.path.join(BASE_DIR, "mlruns")
+# The model store's path lives in model_store.model_dir() alone; this module
+# deliberately builds no part of it (Task 1.6, R3).
 
 mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow:5000"))
 
@@ -44,21 +50,21 @@ _model_index = {}
 
 @app.on_event("startup")
 async def startup_load_index():
-    """Load model index at startup. Models are loaded lazily on first use."""
+    """Load the model index at startup. Models are loaded lazily on first use."""
     global _model_index
-    models_dir = os.path.join(MLRUNS_DIR, "1", "models")
-    index_path = os.path.join(models_dir, "model_index.json")
 
-    if os.path.exists(index_path):
-        try:
-            with open(index_path, "r") as f:
-                data = json.load(f)
-            _model_index = data.get("ticker_to_model", {})
-            logger.info("Loaded model index with %d tickers", len(_model_index))
-        except Exception as e:
-            logger.warning("Failed to load model index: %s", e)
+    # model_store reads the index file, warns loudly about every way it can be
+    # unusable, and returns {} rather than raising, so startup survives a
+    # missing index.  An empty mapping is not benign, though: it means every
+    # ticker now 404s, which is the whole point of deleting the old fallback.
+    _model_index = load_model_index()
+    if _model_index:
+        logger.info("Loaded model index with %d tickers", len(_model_index))
     else:
-        logger.warning("No model index found at %s", index_path)
+        logger.warning(
+            "Model index maps no tickers — every /predict will fail with 404 "
+            "until scripts/build_model_index.py has been run"
+        )
 
     # Warm up cache in background (don't block startup)
     asyncio.create_task(_warmup_model_cache())
@@ -68,23 +74,19 @@ async def startup_load_index():
 
 async def _warmup_model_cache():
     """Gradually warm up model cache in background after startup."""
-    models_dir = os.path.join(MLRUNS_DIR, "1", "models")
     logger.info("Background model warmup started (%d tickers)", len(_model_index))
     loaded = 0
-    for ticker, info in list(_model_index.items())[:10]:  # Top 10 only
+    for ticker in list(_model_index)[:10]:  # Top 10 only
         if ticker in model_cache:
             continue
-        model_folder = info["model_folder"]
-        artifact_dir = os.path.join(models_dir, model_folder, "artifacts")
-        mlmodel_file = os.path.join(artifact_dir, "MLmodel")
-        if os.path.exists(mlmodel_file):
-            try:
-                model = mlflow.xgboost.load_model(artifact_dir)
-                model_cache[ticker] = model
-                loaded += 1
-                logger.debug("Warmup: loaded %s", ticker)
-            except Exception as e:
-                logger.debug("Warmup failed for %s: %s", ticker, e)
+        try:
+            model_cache[ticker] = load_model_for(ticker)
+            loaded += 1
+            logger.debug("Warmup: loaded %s", ticker)
+        except Exception as e:
+            # A model the index names but which cannot be loaded is a
+            # degradation: it is reported, not swallowed at debug level.
+            logger.warning("Warmup failed for %s: %s", ticker, e)
     logger.info("Background warmup complete: %d models loaded", loaded)
 
 
@@ -115,24 +117,19 @@ async def _warmup_prediction_cache():
             fundamentals = await asyncio.to_thread(fetch_fundamentals, ticker)
             latest = build_inference_features(df, ticker, fundamentals)
 
-            model = load_best_model(ticker)
-            trained_cols = get_feature_names(model)
-            if not trained_cols:
-                continue
+            model, trained_cols = load_best_model(ticker)
 
-            for col in trained_cols:
-                if col not in latest.columns:
-                    latest[col] = np.nan
-
-            feature_vec = np.array(
-                [float(latest[trained_cols].iloc[0].get(c, 0.0)) for c in trained_cols],
-                dtype=np.float32
-            )
+            # The model's own contract decides the column set and its order —
+            # the same call the /predict slow path makes, so a pre-warmed vector
+            # is the vector a request would compute.
+            latest_df = align_to_schema(latest, trained_cols)
+            feature_vec = np.asarray(latest_df.iloc[0], dtype=np.float32)
             _cache_put(ticker, feature_vec)
             warmed += 1
             logger.debug("Pre-warmed: %s", ticker)
         except Exception as e:
-            logger.debug("Pre-warm skipped for %s: %s", ticker, e)
+            # Best-effort warmup, but a skip is a degradation and is reported.
+            logger.warning("Pre-warm skipped for %s: %s", ticker, e)
             continue
     logger.info("Prediction cache pre-warm complete: %d/%d tickers cached",
                 warmed, len(priority))
@@ -145,6 +142,9 @@ except ValueError:
     PREDICTION_COUNTER = REGISTRY._names_to_collectors.get("stock_predictions_total")
     CONFIDENCE_HISTOGRAM = REGISTRY._names_to_collectors.get("prediction_confidence")
 
+# ticker -> (model, feature_columns), exactly what model_store.load_model_for
+# returns: the columns are cached with the model so a cached model can never be
+# aligned against a different model's contract.
 model_cache = {}
 
 # ── Prediction Cache (SQLite) — sub-second predictions after first hit ──────
@@ -215,72 +215,36 @@ def refresh_daily_cache():
     except Exception as e:
         logger.warning("Cache refresh failed: %s", e)
 
-def load_best_model(ticker: str):
-    """Load the best model for a ticker from the local models directory.
+def load_best_model(ticker: str) -> tuple[Any, list[str]]:
+    """Load the model the index maps to ``ticker``, with its feature contract.
 
-    Uses model index (loaded at startup) to map ticker -> model folder,
-    bypassing the MLflow server entirely. Falls back to first available
-    model if index is missing or ticker is not found.
+    Selection is delegated to :mod:`model_store`, which reads
+    ``model_index.json`` and raises when the ticker has no entry.  The two
+    substitutions this function used to perform — reusing a ``_fallback`` model,
+    and scanning every folder for the first loadable one — are gone: an unmapped
+    ticker is a 404, not another ticker's model (F2), and the backtester resolves
+    through the same index, so the two can no longer disagree (F9).
+
+    The model and its columns are cached together, so the columns the API aligns
+    its frame to are the columns of the model it just loaded.
+
+    Raises:
+        HTTPException: ``404`` when the index maps no model to ``ticker`` (or the
+            folder it names holds none); ``500`` when the model cannot be loaded
+            or its feature contract cannot be read.
     """
     if ticker in model_cache:
         return model_cache[ticker]
 
-    models_dir = os.path.join(MLRUNS_DIR, "1", "models")
-    if not os.path.isdir(models_dir):
-        raise HTTPException(status_code=500, detail="Models directory not found")
+    try:
+        entry = load_model_for(ticker)
+    except ModelNotFound as e:
+        raise HTTPException(status_code=404, detail=f"No model found for {ticker}") from e
+    except FeatureSchemaError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
-    # Try model index first (loaded at startup)
-    model_info = _model_index.get(ticker)
-
-    if model_info:
-        model_folder = model_info["model_folder"]
-        artifact_dir = os.path.join(models_dir, model_folder, "artifacts")
-        mlmodel_file = os.path.join(artifact_dir, "MLmodel")
-        if os.path.exists(mlmodel_file):
-            try:
-                model = mlflow.xgboost.load_model(artifact_dir)
-                logger.info("Loaded model for %s from index: %s", ticker, model_folder)
-                model_cache[ticker] = model
-                return model
-            except Exception as e:
-                logger.warning("Failed to load indexed model for %s: %s", ticker, e)
-
-    # Fallback: use preloaded fallback model
-    if "_fallback" in model_cache:
-        logger.warning("Using fallback model for %s (not ideal)", ticker)
-        model_cache[ticker] = model_cache["_fallback"]
-        return model_cache[ticker]
-
-    # Last resort: scan all models and use first valid one
-    logger.warning("Model index miss for %s, scanning all models (slow!)", ticker)
-    for model_folder in sorted(os.listdir(models_dir)):
-        artifact_dir = os.path.join(models_dir, model_folder, "artifacts")
-        mlmodel_file = os.path.join(artifact_dir, "MLmodel")
-        if not os.path.exists(mlmodel_file):
-            continue
-        try:
-            model = mlflow.xgboost.load_model(artifact_dir)
-            logger.info("Fallback: loaded model for %s from %s", ticker, model_folder)
-            model_cache[ticker] = model
-            return model
-        except Exception:
-            continue
-
-    raise HTTPException(status_code=404, detail=f"No model found for {ticker}")
-
-def get_feature_names(model) -> list:
-    """Extract expected feature names from a model (handles calibration wrappers)."""
-    # XGBoost models store feature_names_in_
-    if hasattr(model, "feature_names_in_"):
-        return list(model.feature_names_in_)
-    # CalibratedClassifierCV wraps the base estimator
-    if hasattr(model, "estimator") and hasattr(model.estimator, "feature_names_in_"):
-        return list(model.estimator.feature_names_in_)
-    # Try base estimator attribute
-    if hasattr(model, "get_booster"):
-        booster = model.get_booster()
-        return booster.feature_names if booster.feature_names else []
-    return []
+    model_cache[ticker] = entry
+    return entry
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SHARED FEATURE BUILDING FOR INFERENCE
@@ -616,10 +580,7 @@ async def predict(request: PredictRequest, background_tasks: BackgroundTasks):
 
         # ── Fast path: check prediction cache ──────────────────────────
         cached_features, cached_ohlcv = _cache_get(request.ticker)
-        model = load_best_model(request.ticker)
-        trained_cols = get_feature_names(model)
-        if not trained_cols:
-            raise HTTPException(status_code=500, detail="Model has no feature names")
+        model, trained_cols = load_best_model(request.ticker)
 
         if cached_features is not None:
             logger.debug("Cache HIT for %s — sub-200ms prediction", request.ticker)
@@ -675,13 +636,12 @@ async def predict(request: PredictRequest, background_tasks: BackgroundTasks):
         # 4. Build features using shared functions
         latest = build_inference_features(df, request.ticker, fundamentals)
 
-        # 5. Align features to trained columns
-        for col in trained_cols:
-            if col not in latest.columns:
-                latest[col] = np.nan
-
-        latest_row = latest[trained_cols].iloc[0]
-        latest_df = pd.DataFrame([latest_row])
+        # 5. Align features to the model's own contract.  align_to_schema raises
+        #    FeatureSchemaError for any column the model expects and this frame
+        #    cannot produce; the NaN padding that used to stand here silently
+        #    converted a missing feature into a value the model never saw.
+        latest_df = align_to_schema(latest, trained_cols)
+        latest_row = latest_df.iloc[0]
 
         # 6. Cache feature vector for next request (fast path)
         try:
@@ -755,14 +715,12 @@ async def predict_batch(request: BatchPredictRequest, background_tasks: Backgrou
                 fundamentals = _fundamentals_cache[ticker]["data"]
 
             latest = build_inference_features(df, ticker, fundamentals)
-            model = load_best_model(ticker)
-            trained_cols = get_feature_names(model)
+            model, trained_cols = load_best_model(ticker)
 
-            for col in trained_cols:
-                if col not in latest.columns:
-                    latest[col] = np.nan
-
-            latest_df = pd.DataFrame([latest[trained_cols].iloc[0]])
+            # Same contract, same failure mode as the single-ticker path: a
+            # model whose columns this frame cannot satisfy is an error, never
+            # a NaN-padded prediction.
+            latest_df = align_to_schema(latest, trained_cols)
             prediction = int(model.predict(latest_df)[0])
             probability = float(model.predict_proba(latest_df)[0][1])
             signal = "BUY" if prediction == 1 else "SELL"

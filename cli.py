@@ -154,7 +154,6 @@ def _predict_api_all(tickers: list, timeout: int) -> list:
 
 
 def _predict_local_all(tickers: list) -> list:
-    import mlflow.xgboost
     import pandas as pd
     import numpy as np
     import yfinance as yf
@@ -165,6 +164,8 @@ def _predict_local_all(tickers: list) -> list:
         inject_macro_features, fetch_fundamentals,
         fetch_usdidr, fetch_fred_macro, fetch_bi_rate,
     )
+    from features.schema import align_to_schema
+    from model_store import ModelNotFound, load_model_for
     from config import FEATURE_FLAGS
 
     results = []
@@ -193,7 +194,6 @@ def _predict_local_all(tickers: list) -> list:
             bi_rate = fetch_bi_rate(start, end)
             fundamentals = fetch_fundamentals(ticker)
             df = inject_macro_features(df, fundamentals, usdidr, fred_macro, bi_rate)
-            df["google_trend"] = 0.0
 
             if FEATURE_FLAGS.get("news_sentiment", True):
                 from features.fetchers import fetch_news_sentiment
@@ -201,33 +201,21 @@ def _predict_local_all(tickers: list) -> list:
             else:
                 df["news_sentiment"] = 0.0
 
-            # Load model via index
-            models_dir = os.path.join(os.path.dirname(__file__), "mlruns", "1", "models")
-            index_path = os.path.join(models_dir, "model_index.json")
-            model = None
-            if os.path.exists(index_path):
-                with open(index_path) as f:
-                    ticker_map = json.load(f).get("ticker_to_model", {})
-                if ticker in ticker_map:
-                    mf = ticker_map[ticker]["model_folder"]
-                    artifact_dir = os.path.join(models_dir, mf, "artifacts")
-                    if os.path.exists(os.path.join(artifact_dir, "MLmodel")):
-                        model = mlflow.xgboost.load_model(artifact_dir)
-            if model is None:
-                results.append({"ticker": ticker, "error": "No model found"})
+            # Load the model through the one selector: the index decides, and an
+            # unmapped ticker is an error rather than another ticker's model.
+            try:
+                model, trained_cols = load_model_for(ticker)
+            except ModelNotFound:
+                results.append({
+                    "ticker": ticker,
+                    "error": "No model found for this ticker. Run build_model_index.py first.",
+                })
                 continue
 
-            if hasattr(model, "feature_names_in_"):
-                trained_cols = list(model.feature_names_in_)
-            else:
-                trained_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-
+            # The model's own contract decides the column set and its order; a
+            # column it expects and this pipeline cannot build is an error.
             numeric_df = df.select_dtypes(include=[np.number])
-            latest = numeric_df.iloc[[-1]].copy()
-            for col in trained_cols:
-                if col not in latest.columns:
-                    latest[col] = np.nan
-            latest_df = pd.DataFrame([latest[trained_cols].iloc[0]])
+            latest_df = align_to_schema(numeric_df.iloc[[-1]].copy(), trained_cols)
 
             prediction = int(model.predict(latest_df)[0])
             probability = float(model.predict_proba(latest_df)[0][1])
