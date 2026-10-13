@@ -1,157 +1,157 @@
 #!/usr/bin/env python
-"""Build a ticker-to-model mapping index.
+"""Rebuild the ticker-to-model index from the logged models' run metadata.
 
-Scans all model folders in mlruns/1/models/, loads each model once,
-extracts its expected feature names, matches them against ticker-specific
-feature sets, and saves a model_index.json.
+Scans every logged model under ``mlruns/1/models/``, reads the ``run_id`` from
+each ``MLmodel``, asks MLflow which ticker that run was for, and writes the
+mapping through ``model_store.write_model_index`` — the index's one writer, so
+this command and training produce the same file shape and share the same
+"never write an empty index" guard.
+
+A model whose ticker cannot be resolved from MLflow metadata is reported as
+**unresolved** and the script **exits non-zero**.  It never falls back to
+guessing a ticker from the model's own feature names against the features CSV:
+that guess invented ticker identity, which is how the committed index came to
+name models training never associated with those tickers (F10).  Retraining is
+the remedy — training writes the index itself now.
 
 Usage:
     python scripts/build_model_index.py
 """
-import sys, os, json
-import numpy as np
-import pandas as pd
+import os
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
-import mlflow.xgboost
+
+import mlflow
+import yaml
+
+import model_store
+from config import MLFLOW_DB, TICKERS, get_logger
+
+logger = get_logger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODELS_DIR = os.path.join(BASE_DIR, 'mlruns', '1', 'models')
-INDEX_FILE = os.path.join(MODELS_DIR, 'model_index.json')
-FEATURES_FILE = os.path.join(BASE_DIR, 'data', 'processed', 'features.csv')
+
+#: MLflow's run metadata lives in the sqlite tracking store.  Without this URI
+#: ``MlflowClient()`` resolves the *file* store (``./mlruns``) and every
+#: ``get_run`` fails — the failure the old bare ``except Exception: pass`` hid,
+#: which is why the script could resolve nothing and guessed instead.
+MLFLOW_TRACKING_URI = f"sqlite:///{os.path.join(BASE_DIR, MLFLOW_DB)}"
+
+#: The run name training gives a ticker's run (``src/train.py``).
+RUN_NAME_PREFIX = "xgb_"
+
+#: How many unresolved folders to list before the tail is summarised.
+REPORT_LIMIT = 5
 
 
-def get_feature_names(model) -> list:
-    if hasattr(model, 'feature_names_in_'):
-        return list(model.feature_names_in_)
-    if hasattr(model, 'estimator') and hasattr(model.estimator, 'feature_names_in_'):
-        return list(model.estimator.feature_names_in_)
-    if hasattr(model, 'get_booster'):
-        return model.get_booster().feature_names or []
-    return []
+def ticker_from_run(client, run_id: str) -> str:
+    """The ticker MLflow recorded for ``run_id``, or ``""`` when it has none.
+
+    Read from the run's name and tags/params, exactly as training wrote them.
+    Raises whatever ``get_run`` raises — the caller reports it and counts the
+    model as unresolved rather than continuing quietly.
+    """
+    run = client.get_run(run_id)
+
+    run_name = run.data.tags.get("mlflow.runName", "")
+    if run_name.startswith(RUN_NAME_PREFIX):
+        ticker = run_name[len(RUN_NAME_PREFIX):]
+        if ticker:
+            return ticker
+
+    for source in (run.data.tags, run.data.params):
+        ticker = source.get("ticker", "")
+        if ticker:
+            return ticker
+    return ""
 
 
-def build_index():
-    print(f"Loading features from {FEATURES_FILE}...")
-    df = pd.read_csv(FEATURES_FILE, low_memory=False)
-    tickers = df['ticker'].unique() if 'ticker' in df.columns else []
-    print(f"Found {len(tickers)} tickers in features CSV")
+def build_index() -> int:
+    """Write the index and return the process exit status.
 
-    # Build per-ticker feature sets
-    ticker_features = {}
-    for ticker in tickers:
-        tdf = df[df['ticker'] == ticker]
-        if tdf.empty:
+    Returns:
+        ``0`` only when every logged model resolved to a ticker in the universe;
+        ``1`` when any model could not be resolved.  An unresolved model is an
+        index that cannot serve its predictions, so it is a failure of this
+        command, not a warning to be passed over.
+    """
+    models_dir = model_store.model_dir()
+    folders = sorted(path.name for path in models_dir.iterdir() if path.is_dir())
+    print(f"Scanning {len(folders)} model folder(s) under {models_dir}...")
+
+    os.environ["MLFLOW_TRACKING_URI"] = MLFLOW_TRACKING_URI
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    logger.info("Resolving runs through %s", MLFLOW_TRACKING_URI)
+    client = mlflow.tracking.MlflowClient()
+
+    entries: dict[str, str] = {}
+    unresolved: list[tuple[str, str]] = []
+    errors = 0
+    total = 0
+
+    for folder in folders:
+        mlmodel_file = models_dir / folder / "artifacts" / "MLmodel"
+        if not mlmodel_file.is_file():
             continue
-        numeric_cols = set(tdf.select_dtypes(include=[np.number]).columns) - {'target'}
-        ticker_features[ticker] = numeric_cols
 
-    model_folders = sorted(os.listdir(MODELS_DIR))
-    print(f"Scanning {len(model_folders)} model folders...")
-
-    index = {}
-    errors = []
-
-    for i, folder in enumerate(model_folders):
-        artifact_dir = os.path.join(MODELS_DIR, folder, 'artifacts')
-        mlmodel_file = os.path.join(artifact_dir, 'MLmodel')
-        if not os.path.exists(mlmodel_file):
-            continue
-
+        total += 1
+        run_id = ""
         try:
-            # Read run_id from MLmodel file
-            import yaml
-            with open(mlmodel_file) as f:
-                mlmodel_data = yaml.safe_load(f)
-            run_id = mlmodel_data.get("run_id", "")
-
-            # Query MLflow for run params/tags to get ticker
-            client = mlflow.tracking.MlflowClient()
+            with open(mlmodel_file, encoding="utf-8") as handle:
+                run_id = (yaml.safe_load(handle) or {}).get("run_id", "") or ""
+            ticker = ticker_from_run(client, run_id) if run_id else ""
+            if not ticker:
+                reason = (
+                    f"run {run_id} records no ticker in its run name, tags or params"
+                    if run_id else "its MLmodel records no run_id"
+                )
+            elif ticker not in TICKERS:
+                reason = (
+                    f"run {run_id} records ticker {ticker!r}, which is not in the "
+                    f"{len(TICKERS)}-ticker universe"
+                )
+                ticker = ""
+            else:
+                reason = ""
+        except Exception as exc:
+            errors += 1
             ticker = ""
-            if run_id:
-                try:
-                    run = client.get_run(run_id)
-                    run_name = run.data.tags.get("mlflow.runName", "")
-                    if run_name.startswith("xgb_"):
-                        ticker = run_name[4:]
-                    if not ticker:
-                        ticker = run.data.tags.get("ticker", "")
-                    if not ticker:
-                        ticker = run.data.params.get("ticker", "")
-                except Exception:
-                    pass
+            reason = f"MLflow could not be read for run {run_id or '<none>'}: {exc}"
 
-            if ticker and ticker in ticker_features:
-                index[folder] = {
-                    'ticker': ticker,
-                    'match_score': 999,
-                    'n_features': 0,
-                }
-                if (i + 1) % 20 == 0:
-                    print(f"  Processed {i + 1}/{len(model_folders)}...")
-                continue
-
-            # Fallback: load model and match features
-            model = mlflow.xgboost.load_model(artifact_dir)
-            model_features = set(get_feature_names(model))
-
-            if not model_features:
-                continue
-
-            best_ticker = None
-            best_match = 0
-
-            for ticker, tfeats in ticker_features.items():
-                overlap = len(model_features & tfeats)
-                if overlap > best_match:
-                    best_match = overlap
-                    best_ticker = ticker
-
-            index[folder] = {
-                'ticker': best_ticker,
-                'match_score': best_match,
-                'n_features': len(model_features),
-            }
-        except Exception as e:
-            errors.append((folder, str(e)))
+        if ticker:
+            entries[ticker] = folder
             continue
 
-        if (i + 1) % 20 == 0:
-            print(f"  Processed {i + 1}/{len(model_folders)}...")
+        unresolved.append((folder, reason))
+        logger.warning("%s: %s — left unresolved", folder, reason)
 
-    # Build ticker -> model path mapping
-    ticker_to_model = {}
-    for folder, info in index.items():
-        ticker = info['ticker']
-        if ticker and (ticker not in ticker_to_model or
-                       info['match_score'] > ticker_to_model[ticker]['match_score']):
-            ticker_to_model[ticker] = {
-                'model_folder': folder,
-                'match_score': info['match_score'],
-                'n_features': info.get('n_features', info.get('n_model_features', 0)),
-            }
+    print(f"Resolved {len(entries)}/{total} logged model(s) to a ticker in the universe")
 
-    output = {
-        'total_models': len(model_folders),
-        'indexed_models': len(index),
-        'mapped_tickers': len(ticker_to_model),
-        'errors': len(errors),
-        'ticker_to_model': ticker_to_model,
-    }
+    # The shared writer, not a local json.dump: one file shape, and the guard
+    # that refuses to empty a populated index (R3) applies to this command too.
+    # With nothing resolved it writes nothing at all, so a failed rebuild cannot
+    # destroy an index that is still serving predictions.
+    model_store.write_model_index(entries, total_models=total, errors=errors)
 
-    with open(INDEX_FILE, 'w') as f:
-        json.dump(output, f, indent=2)
+    if not unresolved:
+        print("Every logged model resolved; the index was written")
+        return 0
 
-    print(f"\nIndex saved to {INDEX_FILE}")
-    print(f"Mapped {len(ticker_to_model)}/{len(tickers)} tickers to models")
-    if errors:
-        print(f"Errors (first 5): {errors[:5]}")
+    print(f"\n{len(unresolved)} of {total} logged model(s) could NOT be resolved to a ticker:")
+    for folder, reason in unresolved[:REPORT_LIMIT]:
+        print(f"  {folder}: {reason}")
+    if len(unresolved) > REPORT_LIMIT:
+        print(f"  ... and {len(unresolved) - REPORT_LIMIT} more (see the warnings above)")
 
-    print(f"\nSample mappings:")
-    for ticker in sorted(ticker_to_model.keys())[:10]:
-        info = ticker_to_model[ticker]
-        print(f"  {ticker}: {info['model_folder'][:20]}... (score={info['match_score']})")
+    print(
+        "\nGuessing a ticker from the model's own feature names is gone: a model "
+        "whose ticker MLflow does not record cannot be mapped.\n"
+        "Remedy: retrain, so training writes the index itself —\n"
+        "    python src/train.py --parallel --features data/processed/features.csv"
+    )
+    return 1
 
 
 if __name__ == '__main__':
-    build_index()
+    sys.exit(build_index())

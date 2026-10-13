@@ -27,6 +27,7 @@ from features.schema import (
     FeatureSchemaError, align_to_schema, candidate_columns, is_unproducible,
     log_feature_schema,
 )
+from model_store import write_model_index
 
 warnings.filterwarnings("ignore")
 logger = get_logger(__name__)
@@ -353,7 +354,7 @@ def _expanding_cv_splits(X, n_splits=5, gap=10):
 
 def train(ticker: str = "BBCA.JK", tune: bool = False, use_shap: bool = True,
           expand_cv: bool = True, blend_lgbm: bool = True,
-          feature_columns: list[str] | None = None):
+          feature_columns: list[str] | None = None) -> str | None:
     """Train an XGBoost (+ optional LGBM blend) model for a single ticker.
 
     Features: SHAP pruning, expanding walk-forward CV, LGBM soft-vote blending.
@@ -363,6 +364,13 @@ def train(ticker: str = "BBCA.JK", tune: bool = False, use_shap: bool = True,
     pooled frame rather than once per ticker.  When it is omitted the selection
     is made here, pooled and memoised, so a direct call still produces exactly
     the same contract as a full `--parallel` run.
+
+    Returns:
+        The store folder of the model this call logged — the model's MLflow id,
+        as reported by :func:`_logged_model_folder` — or ``None`` when nothing
+        was logged (CI mode, a skipped ticker, or a model whose id could not be
+        read).  The caller turns the pairs into the model index (F10); no folder
+        name is ever derived here.
     """
     df = load_features(FEATURES_PATH)
     df = df[df["ticker"] == ticker].copy().sort_index()
@@ -418,6 +426,12 @@ def train(ticker: str = "BBCA.JK", tune: bool = False, use_shap: bool = True,
     params["nthread"] = 2
 
     mlflow.set_experiment(MLFLOW_EXPERIMENT)
+
+    # The store folder of the model this call logs, or ``None`` when nothing was
+    # logged.  Initialised before the run because the early returns below are
+    # "no model was logged" too, and the caller must not receive a folder for a
+    # model that does not exist (R3/R5).
+    model_folder: str | None = None
 
     with mlflow.start_run(run_name=f"xgb_{ticker}"):
         mlflow.log_params(params)
@@ -511,13 +525,19 @@ def train(ticker: str = "BBCA.JK", tune: bool = False, use_shap: bool = True,
         mlflow.set_tag("ticker", ticker)
         if not IS_CI:
             model_info = mlflow.xgboost.log_model(xgb, "model")
+            # R2/R5: the folder MLflow just created for this model, taken from
+            # the id it returned and never guessed (see _logged_model_folder).  A
+            # model whose id cannot be read contributes no index entry rather
+            # than a folder name that points nowhere.
+            model_folder = _logged_model_folder(model_info, ticker)
             # R4: `log_model` creates the logged-model directory itself, so the
             # contract is attached *after* the fact, to the model id MLflow just
             # returned.  It lands beside MLmodel in that model's artifact
             # directory — mlruns/1/models/<model_id>/artifacts/feature_schema.json
             # — which is the exact directory every consumer already hands to
             # mlflow.xgboost.load_model (src/serve.py, scripts/build_model_index.py).
-            log_feature_schema(model_info.model_id, feature_columns)
+            if model_folder is not None:
+                log_feature_schema(model_folder, feature_columns)
             img = plot_feature_importance(xgb, X.columns, ticker)
             mlflow.log_artifact(img, "feature_importance"); os.remove(img)
             cm = plot_confusion_matrix(y, xgb.predict(X), ticker)
@@ -525,18 +545,74 @@ def train(ticker: str = "BBCA.JK", tune: bool = False, use_shap: bool = True,
         else:
             logger.info("CI mode — metrics only for %s", ticker)
 
+    return model_folder
+
+
+def _logged_model_folder(model_info, ticker: str) -> str | None:
+    """The store folder ``mlflow.xgboost.log_model`` created for ``ticker``.
+
+    R2: MLflow names a logged model's directory after the ``model_id`` it
+    returns, and that was **measured**, not assumed.  Logging a throwaway model
+    into a scratch store laid out exactly like this repository's — tracking URI
+    ``sqlite:///<root>/mlflow.db``, the experiment's artifact location
+    ``<root>/mlruns/1``, which is what ``mlflow.db`` records for experiment 1 —
+    produced one directory under ``<root>/mlruns/1/models/``, named
+    ``m-<32 hex>``, and ``ModelInfo.artifact_path`` was
+    ``<root>/mlruns/1/models/<that same name>/artifacts``.  The id is therefore
+    used verbatim: no prefix, no scanning, no overlap test.
+
+    R5: ``log_model`` runs only outside CI, so ``model_info`` may be absent or
+    carry no id (MLflow does not guarantee one).  Either way this returns
+    ``None`` **with a warning** rather than raising: the ticker is left out of
+    the index and fails loudly at prediction time, which is what an index entry
+    pointing at a folder nothing ever created would not do.
+    """
+    model_id = getattr(model_info, "model_id", None)
+    if isinstance(model_id, str) and model_id:
+        return model_id
+
+    logger.warning(
+        "%s: the logged model reported no model id (%r) — it is left out of the "
+        "model index, so no prediction can resolve it until the next retrain",
+        ticker, model_info,
+    )
+    return None
+
 
 def _train_one(args):
-    """Wrapper for parallel execution."""
+    """Wrapper for parallel execution.
+
+    Returns ``(ticker, ok, folder)``: ``ok`` is whether training raised (as
+    before), and ``folder`` is the store folder of the model that was logged,
+    or ``None``.  The parent needs the folder to build the index, and this
+    tuple is the only thing that crosses the process boundary — the workers
+    return it and never write the index themselves (F10: one writer, in the
+    parent).
+    """
     ticker, tune, feats, feature_columns = args
     global FEATURES_PATH
     FEATURES_PATH = feats
     try:
-        train(ticker, tune=tune, feature_columns=feature_columns)
-        return ticker, True
+        folder = train(ticker, tune=tune, feature_columns=feature_columns)
+        return ticker, True, folder
     except Exception as e:
         logger.error("%s failed: %s", ticker, e)
-        return ticker, False
+        return ticker, False, None
+
+
+def _index_entries_from_results(results) -> dict[str, str]:
+    """``ticker -> model folder`` from the tuples the loky workers returned.
+
+    Only a worker that both succeeded and reported the folder MLflow created
+    contributes an entry; a failed worker and a CI-mode worker (trained, nothing
+    logged) contribute nothing.  No folder name is derived here — the index
+    cannot name a model that was never logged.
+    """
+    return {
+        ticker: folder
+        for ticker, ok, folder in results
+        if ok and folder
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -577,9 +653,20 @@ if __name__ == "__main__":
         logger.info("Parallel training on %d tickers...", len(tickers))
         tasks = [(t, args.tune, FEATURES_PATH, feature_columns) for t in tickers]
         results = Parallel(n_jobs=-1, backend="loky")(delayed(_train_one)(t) for t in tasks)
-        ok = sum(1 for _, s in results if s)
+        ok = sum(1 for _, s, _ in results if s)
         logger.info("Done: %d/%d tickers trained", ok, len(tickers))
+        entries = _index_entries_from_results(results)
     else:
+        entries = {}
         for t in tickers:
-            train(t, tune=args.tune, feature_columns=feature_columns,
-                  use_shap=use_shap, expand_cv=expand_cv, blend_lgbm=blend)
+            folder = train(t, tune=args.tune, feature_columns=feature_columns,
+                           use_shap=use_shap, expand_cv=expand_cv, blend_lgbm=blend)
+            if folder:
+                entries[t] = folder
+
+    # F10 — the index's single writer, in the parent, once, after every ticker
+    # has been trained and logged.  No worker writes it: a worker returns its
+    # ticker and folder in the tuple above and nothing else.  An empty mapping
+    # is refused inside write_model_index rather than written, so a CI-mode run
+    # (which logs no model at all) cannot empty an index predictions depend on.
+    write_model_index(entries)

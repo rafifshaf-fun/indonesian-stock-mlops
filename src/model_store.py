@@ -47,9 +47,21 @@ This module is the single replacement for both.  Its contract:
     them builds the path from its own relative base and the four cannot drift
     apart again.
 
+``write_model_index(entries, path=None)``
+    The index's **only** writer, beside the reader and through the same
+    :func:`index_path`.  Nothing wrote it on the way out of training, so the
+    committed file could only get staler; now ``src/train.py`` calls this once,
+    in the parent process, after every ticker has been trained and logged, and
+    ``scripts/build_model_index.py`` goes through it too so the file has one
+    shape and one guard wherever it is written from.  An empty mapping is
+    refused at ``warning`` rather than written: the CI path logs no model at
+    all, and ``mapped_tickers: 0`` over a populated index disables every
+    prediction while the file still looks like a valid index.
+
 **R4 — where a directory scan is allowed.**  ``scripts/build_model_index.py``
-is an explicit rebuild command: it scans the store, loads every model and
-writes the index.  That scan is legitimate and stays there.  It is forbidden
+is an explicit rebuild command: it scans the store, reads each logged model's
+run metadata and writes the index through the writer above.  That scan is
+legitimate and stays there.  It is forbidden
 here: neither :func:`resolve_model_folder` nor :func:`load_model_for` ever
 calls ``os.listdir`` on the store.  A request path may only read the index and
 the single folder the index names.
@@ -58,6 +70,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+from collections.abc import Mapping
 from typing import Any
 
 import config
@@ -138,8 +151,9 @@ def load_model_index() -> dict[str, str]:
 
     Returns:
         The mapping, or ``{}`` when the index cannot be used.  The file's entry
-        shape (``{"model_folder": ..., "match_score": ..., "n_features": ...}``)
-        is normalised to the folder name; an entry without one is dropped.
+        shape (``{"model_folder": ..., "match_score": ..., "n_features": ...}``,
+        the shape the pre-F10 rebuild wrote) is normalised to the folder name;
+        an entry without one is dropped.
 
     Every degradation logs at ``warning`` — once per process per *distinct*
     diagnostic (see :func:`_warn_once`), because this function runs on the
@@ -148,11 +162,32 @@ def load_model_index() -> dict[str, str]:
     :class:`ModelNotFound`, and that must be visible rather than read as "no
     models exist".
     """
-    path = index_path()
+    return _read_index_entries(index_path())
+
+
+def _discard(*_args: Any, **_kwargs: Any) -> None:
+    """Diagnostic sink for :func:`_read_index_entries`'s quiet mode."""
+
+
+def _read_index_entries(path: pathlib.Path, *, quiet: bool = False) -> dict[str, str]:
+    """Parse an index file into ``ticker -> model folder``.
+
+    Args:
+        path: The index file to read.
+        quiet: Suppress the diagnostics.  :func:`write_model_index` reads the
+            file only to avoid dropping mappings it is not rewriting, and the
+            state it is about to overwrite is not a live degradation: reporting
+            it as one would bury the write's own outcome.
+
+    Returns:
+        The mapping, or ``{}`` when the file cannot be used — absent, unreadable,
+        not JSON, not an object, or carrying no ``ticker_to_model`` mapping.
+    """
+    warn = _discard if quiet else _warn_once
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError as exc:
-        _warn_once(
+        warn(
             ("unreadable", str(path), type(exc).__name__),
             "Model index %s is unreadable (%s) — no ticker can be resolved", path, exc,
         )
@@ -161,7 +196,7 @@ def load_model_index() -> dict[str, str]:
     try:
         parsed = json.loads(raw)
     except ValueError as exc:
-        _warn_once(
+        warn(
             ("not-json", str(path), str(exc)),
             "Model index %s is not valid JSON (%s) — no ticker can be resolved",
             path, exc,
@@ -169,7 +204,7 @@ def load_model_index() -> dict[str, str]:
         return {}
 
     if not isinstance(parsed, dict):
-        _warn_once(
+        warn(
             ("not-an-object", str(path), type(parsed).__name__),
             "Model index %s must hold a JSON object, found %s — no ticker can be resolved",
             path, type(parsed).__name__,
@@ -178,7 +213,7 @@ def load_model_index() -> dict[str, str]:
 
     entries = parsed.get("ticker_to_model")
     if not isinstance(entries, dict):
-        _warn_once(
+        warn(
             ("no-ticker-mapping", str(path), type(entries).__name__),
             "Model index %s carries no ticker_to_model mapping — no ticker can be resolved",
             path,
@@ -191,18 +226,99 @@ def load_model_index() -> dict[str, str]:
         if isinstance(folder, str) and folder:
             index[str(ticker)] = folder
         else:
-            _warn_once(
+            warn(
                 ("entry-without-folder", str(path), str(ticker)),
                 "Model index entry for %s names no model folder (%r) — ignored", ticker, entry
             )
 
     if not index:
-        _warn_once(
+        warn(
             ("empty-index", str(path)),
             "Model index %s maps no tickers — every prediction will fail until "
             "scripts/build_model_index.py is run", path,
         )
     return index
+
+
+def write_model_index(entries: Mapping[str, str], path: pathlib.Path | None = None, *,
+                      total_models: int | None = None, errors: int = 0) -> None:
+    """Write ``ticker -> model folder`` into the store's index (F10).
+
+    This is the index's only writer.  ``src/train.py`` calls it once, in the
+    parent process, after every ticker has been trained and logged, so the file
+    cannot go stale behind a retrain; ``scripts/build_model_index.py`` — the
+    explicit rebuild — writes through it as well, so the index has one shape and
+    one guard wherever it is written from.
+
+    The folder name is never derived here.  Training passes the id MLflow
+    reported for the model it just logged (``ModelInfo.model_id``, the name of
+    the directory under ``mlruns/1/models/``) and the rebuild passes the folder
+    it resolved a run to; an entry whose folder cannot be resolved is not
+    written at all.
+
+    Args:
+        entries: ``ticker -> model folder`` pairs produced by *this* run.
+        path: Where to write.  Defaults to :func:`index_path` — the same
+            accessor :func:`load_model_index` reads through.
+        total_models: How many models the run examined, when that is more than
+            it could map: the rebuild scans every folder and may fail to resolve
+            some.  Defaults to the number of entries.
+        errors: How many models the run could not resolve or load.
+
+    Merging: mappings already in ``path`` for tickers this run did **not**
+    retrain are carried over.  A full retrain names every ticker and so writes
+    exactly the file a wholesale replace would; a partial one (``--tune``
+    covers ten tickers and ``--ticker`` one) would otherwise unmap the rest and
+    silently disable their predictions — the same failure as writing the file
+    empty, one step earlier.
+
+    R3: an **empty** mapping is refused, at ``warning``, and the file is left
+    untouched.  In CI no model is logged at all (``log_model`` runs only outside
+    CI), and overwriting a populated index with ``mapped_tickers: 0`` would
+    disable every prediction while the file still looked like a valid index.
+
+    A write that fails is a ``warning`` and nothing else: the run's models are
+    already logged, and the index is rewritten by the next run.
+    """
+    target = index_path() if path is None else pathlib.Path(path)
+    named = {str(ticker): str(folder) for ticker, folder in entries.items() if folder}
+
+    if not named:
+        logger.warning(
+            "Refusing to write an empty model index: this run produced no "
+            "ticker -> model mapping (no model was logged, or none could be "
+            "resolved). %s is left unchanged — an index that maps nothing "
+            "disables every prediction", target,
+        )
+        return
+
+    mapping = {**_read_index_entries(target, quiet=True), **named}
+    payload = {
+        "total_models": len(named) if total_models is None else int(total_models),
+        "indexed_models": len(named),
+        "mapped_tickers": len(mapping),
+        "errors": int(errors),
+        "ticker_to_model": {ticker: mapping[ticker] for ticker in sorted(mapping)},
+    }
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+    except OSError as exc:
+        logger.warning(
+            "Model index %s could not be written (%s) — %d ticker(s) stay "
+            "unmapped, and every prediction for them fails until it is rebuilt",
+            target, exc, len(named),
+        )
+        return
+
+    carried = len(mapping) - len(named)
+    logger.info(
+        "Model index %s now maps %d ticker(s): %d from this run%s",
+        target, len(mapping), len(named),
+        f", {carried} kept from earlier runs" if carried else "",
+    )
 
 
 def resolve_model_folder(ticker: str) -> str:
