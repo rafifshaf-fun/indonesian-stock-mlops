@@ -238,6 +238,16 @@ def engineer_features_for_ticker(df, ticker, fundamentals, usdidr, fred_macro,
     Returns:
         Feature-rich DataFrame or None if insufficient data.
     """
+    # ── Short-history gate ───────────────────────────────────────────────
+    # Same <50-usable-rows gate as build_features, checked here *first* so a
+    # short-history ticker returns before any per-ticker fetch.  This is the
+    # pre-refactor order: the extraction had moved the gate behind the
+    # sentiment/volume-profile/fundamentals calls, which cost needless network
+    # requests under CACHE_CONFIG["rate_limit_delay_seconds"].  build_features
+    # keeps its own identical guard for callers that hand it data directly.
+    if len(dropna(df[ticker].copy())) < 50:
+        return None
+
     # ── News Sentiment ───────────────────────────────────────────────────
     news_sentiment = 0.0
     if FEATURE_FLAGS.get("news_sentiment", True) and mode != "ci":
