@@ -1,23 +1,22 @@
-yfinance
-pandas
-numpy
-ta
-scikit-learn
-mlflow
-xgboost
-fastapi
-uvicorn
-pydantic
-prometheus-fastapi-instrumentator
-pandas-datareader
-fredapi
-pytrends
-matplotlib
-pyarrow
-optuna
-tenacity
-vaderSentiment
-nltk
-shap
-lightgbm
-aiohttp
+yfinance==1.4.1
+pandas==2.3.3
+numpy==2.4.6
+ta==0.11.0
+scikit-learn==1.9.0
+mlflow==3.13.0
+xgboost==3.2.0
+fastapi==0.137.1
+uvicorn==0.49.0
+pydantic==2.13.4
+prometheus-fastapi-instrumentator==8.0.0
+fredapi==0.5.2
+pytrends==4.9.2
+matplotlib==3.11.0
+# pyarrow is a pandas plugin: it is loaded by name for Parquet I/O (pd.read_parquet/to_parquet), never via `import pyarrow`
+pyarrow==24.0.0
+optuna==4.9.0
+vaderSentiment  # unpinned: not installed in the development venv, so no version is verified
+nltk  # unpinned: not installed in the development venv, so no version is verified
+shap==0.51.0
+lightgbm==4.6.0
+aiohttp==3.14.1
