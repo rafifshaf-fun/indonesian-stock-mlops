@@ -180,10 +180,16 @@ import sqlite3
 
 PRED_CACHE_DB = os.path.join(BASE_DIR, "data", "prediction_cache.db")
 
-#: The cache key's column set.  ``date`` is not part of the key: it is
-#: overwritten on every put and checked for "today" on every get, so one key
-#: holds only the current day's row.
+#: The cache key's column set, **in the order the table is written**.  ``date``
+#: is not part of the key: it is overwritten on every put and checked for "today"
+#: on every get, so one key holds only the current day's row.
 CACHE_COLUMNS = ("ticker", "window", "schema_hash", "date", "features")
+
+#: The declared primary key, in key order.  It is what makes ``INSERT OR
+#: REPLACE`` an update rather than a second row for the same key, and it is
+#: checked separately from the columns because a table can carry all five names
+#: and no key at all.
+CACHE_PRIMARY_KEY = ("ticker", "window", "schema_hash")
 
 #: Fingerprint namespace and version.  Bumped rather than migrated when the
 #: stored encoding changes: an entry written by an older encoding then misses
@@ -221,13 +227,33 @@ def _cache_schema_hash(schema) -> str:
     ).hexdigest()
 
 
-def _cache_columns(path) -> list[str]:
-    """Column names of the ``cache`` table at ``path``, or ``[]`` when there is none."""
+def _cache_table_info(path) -> list[tuple]:
+    """``PRAGMA table_info(cache)`` rows, or ``[]`` when the table does not exist.
+
+    Each row is ``(cid, name, type, notnull, default, pk)``.  ``pk`` is the
+    1-based position of the column inside the table's PRIMARY KEY, or ``0`` when
+    the column is not part of one.  The migration needs the whole row rather than
+    the names: a table with the right *names* in another order, or with no key at
+    all, still takes the positional ``INSERT OR REPLACE`` below.
+    """
     conn = sqlite3.connect(str(path))
     try:
-        return [row[1] for row in conn.execute("PRAGMA table_info(cache)")]
+        return [tuple(row) for row in conn.execute("PRAGMA table_info(cache)")]
     finally:
         conn.close()
+
+
+def _cache_columns(path) -> list[str]:
+    """``cache``'s column names at ``path``, in table order; ``[]`` when absent.
+
+    Ordered, not a set: see :func:`_cache_table_info`.
+    """
+    return [row[1] for row in _cache_table_info(path)]
+
+
+def _cache_primary_key(info) -> list[str]:
+    """The primary key described by ``_cache_table_info`` rows, in key order."""
+    return [name for _, name in sorted((row[5], row[1]) for row in info if row[5])]
 
 
 def _get_cache_conn():
@@ -241,13 +267,23 @@ def _get_cache_conn():
     # the contents are a regenerable cache, and the cost is one slow request per
     # ticker — and it must not throw on a fresh database, where there is no
     # table to inspect at all.
-    existing = _cache_columns(PRED_CACHE_DB)
-    if existing and set(existing) != set(CACHE_COLUMNS):
+    #
+    # Both the ordered column list *and* the primary key are compared.  Names
+    # alone would accept a table whose columns are permuted, and the write below
+    # binds positionally, so ``window`` would be written into ``ticker``; names
+    # alone would also accept a keyless table, where ``INSERT OR REPLACE`` never
+    # replaces and one key accumulates rows.
+    info = _cache_table_info(PRED_CACHE_DB)
+    existing = [row[1] for row in info]
+    existing_key = _cache_primary_key(info)
+    if info and (existing != list(CACHE_COLUMNS)
+                 or existing_key != list(CACHE_PRIMARY_KEY)):
         logger.warning(
-            "Prediction cache %s has the old shape %s — dropping and recreating "
-            "as %s; its contents are a regenerable cache, so the cost is one "
-            "recompute per ticker",
-            PRED_CACHE_DB, existing, list(CACHE_COLUMNS),
+            "Prediction cache %s has the old shape %s with primary key %s — "
+            "dropping and recreating as %s with primary key %s; its contents are "
+            "a regenerable cache, so the cost is one recompute per ticker",
+            PRED_CACHE_DB, existing, existing_key,
+            list(CACHE_COLUMNS), list(CACHE_PRIMARY_KEY),
         )
         conn.execute("DROP TABLE cache")
     conn.execute("CREATE TABLE IF NOT EXISTS cache "
@@ -279,12 +315,20 @@ def _cache_put(ticker: str, feature_row: pd.Series, schema: list[str],
     code-execution vector for anyone who can write to it.  JSON is data — a
     reader can be handed one without becoming an executor.
     """
-    record = {str(name): _as_float(value) for name, value in feature_row.items()}
+    record = {str(name): _as_float(value, str(name))
+              for name, value in feature_row.items()}
     payload = json.dumps(record, allow_nan=True)
-    with _get_cache_conn() as conn:
-        conn.execute("INSERT OR REPLACE INTO cache VALUES (?, ?, ?, ?, ?)",
-                     (ticker, str(window), _cache_schema_hash(schema),
-                      str(date.today()), payload))
+    # ``with conn:`` commits; it does not close (``sqlite3.Connection.__exit__``
+    # only ends the transaction), so the handle is released explicitly here as it
+    # already was in ``_cache_get`` and ``_cache_columns``.
+    conn = _get_cache_conn()
+    try:
+        with conn:
+            conn.execute("INSERT OR REPLACE INTO cache VALUES (?, ?, ?, ?, ?)",
+                         (ticker, str(window), _cache_schema_hash(schema),
+                          str(date.today()), payload))
+    finally:
+        conn.close()
 
 
 def _cache_get(ticker: str, schema: list[str],
@@ -301,7 +345,11 @@ def _cache_get(ticker: str, schema: list[str],
     Returns:
         ``pd.Series`` keyed by column name, or ``None``.  A row whose encoding
         decodes yet does not match the requested schema is a ``warning`` and a
-        miss: an entry that cannot be used is a degradation worth seeing.
+        miss: an entry that cannot be used is a degradation worth seeing.  So is
+        a stored value that is not a number (only an external writer can produce
+        one — this store is intended to be shared): it is a ``warning`` naming
+        the column and a miss, never the ``ValueError`` a bare
+        ``pd.Series(..., dtype=float)`` raises, which would surface as a 500.
     """
     key = _cache_schema_hash(schema)
     conn = _get_cache_conn()
@@ -337,44 +385,69 @@ def _cache_get(ticker: str, schema: list[str],
             ticker, len(stored), len(expected),
         )
         return None
-    return pd.Series({name: stored[name] for name in expected}, dtype=float)
+
+    values: dict[str, float] = {}
+    for name in expected:
+        try:
+            values[name] = float(stored[name])
+        except (TypeError, ValueError):
+            logger.warning(
+                "Prediction cache entry for %s holds a non-numeric value for "
+                "column %r (%r) — treated as a miss", ticker, name, stored[name],
+            )
+            return None
+    return pd.Series(values, dtype=float)
 
 
-def _as_float(value):
+def _as_float(value, column: str):
     """``float`` for a feature value, or ``NaN`` when it is not numeric.
 
     ``NaN`` is the honest reading of "this column carried no number": it is what
     the builder already puts in an empty feature, and it is a value XGBoost
     handles.  A ``0.0`` here would be the fabricated default this task removes.
+
+    ``column`` is required and is named in the ``warning``: reading a non-number
+    as ``NaN`` is a degradation, and the global constraint is that every
+    degradation is visible at ``warning`` or above rather than silent.
     """
     try:
         return float(value)
     except (TypeError, ValueError):
+        logger.warning("Feature column %r holds %r, which is not a number — "
+                       "read as NaN", column, value)
         return float("nan")
 
 
-def _prediction_frame(feature_row: pd.Series, schema: list[str]) -> pd.DataFrame:
+def _prediction_frame(feature_row, schema: list[str]) -> pd.DataFrame:
     """The single model input: one row, in the schema's exact order.
 
     Every path that predicts — cache hit, cache miss, warmup, batch miss —
     builds its frame here, so "the fast path and the slow path agree" is a
     property of there being one construction rather than a coincidence that has
-    to be re-checked.  ``align_to_schema`` is the only reconciliation and it
-    raises for a column this row cannot produce; nothing pads, and nothing
-    defaults to ``0.0`` (F7).
+    to be re-checked.
+
+    ``feature_row`` is either a name-keyed ``pd.Series`` (the cache-hit path, and
+    the warmup path through :func:`_warm_feature_row`) or the one-row frame
+    ``build_inference_features`` computes (the miss path and the batch path, both
+    of which used to call ``align_to_schema`` directly).  ``align_to_schema`` is
+    the only reconciliation either way and it raises for a column the frame
+    cannot produce; nothing pads, and nothing defaults to ``0.0`` (F7).
     """
-    return align_to_schema(pd.DataFrame([feature_row]), schema)
+    frame = feature_row if isinstance(feature_row, pd.DataFrame) \
+        else pd.DataFrame([feature_row])
+    return align_to_schema(frame, schema)
 
 
 def _warm_feature_row(latest: pd.DataFrame, schema: list[str]) -> pd.Series:
     """A computed 1-row frame as a name-keyed row ready for the cache.
 
-    The counterpart of :func:`_prediction_frame` on the write side, and the
+    The counterpart of :func:`_prediction_frame` on the write side — it goes
+    *through* it, so the write side cannot drift from the read side — and the
     reason ``feature_row`` and ``schema`` in :func:`_cache_put` are always
     consistent: the row that is stored is the row that was aligned, so the
     stored names are exactly the model's columns, in the model's order.
     """
-    return align_to_schema(latest, schema).iloc[0]
+    return _prediction_frame(latest, schema).iloc[0]
 
 # ── Daily Caches ──────────────────────────────────────────────────────────────
 _cache_date = None
@@ -750,11 +823,17 @@ def cache_status():
     """Show prediction cache status."""
     conn = _get_cache_conn()
     today = str(date.today())
-    # Today's entries for the window serving currently uses (R1): one ticker now
-    # holds one row per (window, schema), so a bare COUNT over the table would
-    # report a coverage figure no single request path can achieve.
+    # Today's *tickers* for the window serving currently uses (R1): one ticker
+    # holds one row per (window, schema fingerprint), so a bare COUNT over the
+    # table reports a coverage figure no single request path can achieve — after
+    # a mid-day retrain that changes a model's columns, the same ticker is two
+    # rows and ``coverage`` would read ``90/45 (200%)``.  The figure is consumed
+    # as "how many of the 45 tickers" (see
+    # monitoring/indonesian_stock_dashboard_v3.json), so it counts distinct
+    # tickers, while ``total_cached`` below stays the honest row count of what is
+    # actually stored.
     row = conn.execute(
-        "SELECT COUNT(*) FROM cache WHERE date = ? AND window = ?",
+        "SELECT COUNT(DISTINCT ticker) FROM cache WHERE date = ? AND window = ?",
         (today, CACHE_WINDOW_DEFAULT),
     ).fetchone()
     cached_count = row[0] if row else 0
@@ -841,11 +920,15 @@ async def predict(request: PredictRequest, background_tasks: BackgroundTasks):
         # 4. Build features using shared functions
         latest = build_inference_features(df, request.ticker, fundamentals)
 
-        # 5. Align features to the model's own contract.  align_to_schema raises
+        # 5. Build the model input with the single frame builder.  It is
+        #    ``align_to_schema`` for this computed frame, so behaviour is
+        #    unchanged, but the miss path no longer builds its own input: the
+        #    frame this request predicts on is the frame the builder produces for
+        #    every other path, hit and batch included.  ``align_to_schema`` raises
         #    FeatureSchemaError for any column the model expects and this frame
         #    cannot produce; the NaN padding that used to stand here silently
         #    converted a missing feature into a value the model never saw.
-        latest_df = align_to_schema(latest, trained_cols)
+        latest_df = _prediction_frame(latest, trained_cols)
         latest_row = latest_df.iloc[0]
 
         # 6. Cache the feature row for the next request (fast path) — keyed by
@@ -927,10 +1010,10 @@ async def predict_batch(request: BatchPredictRequest, background_tasks: Backgrou
             latest = build_inference_features(df, ticker, fundamentals)
             model, trained_cols = load_best_model(ticker)
 
-            # Same contract, same failure mode as the single-ticker path: a
-            # model whose columns this frame cannot satisfy is an error, never
-            # a NaN-padded prediction.
-            latest_df = align_to_schema(latest, trained_cols)
+            # Same contract, same failure mode, and the same builder as the
+            # single-ticker path: a model whose columns this frame cannot satisfy
+            # is an error, never a NaN-padded prediction.
+            latest_df = _prediction_frame(latest, trained_cols)
             prediction = int(model.predict(latest_df)[0])
             probability = float(model.predict_proba(latest_df)[0][1])
             signal = "BUY" if prediction == 1 else "SELL"
