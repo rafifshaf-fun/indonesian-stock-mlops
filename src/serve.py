@@ -1,4 +1,4 @@
-import sys, os, json
+import sys, os, json, time
 sys.path.insert(0, os.path.dirname(__file__))
 
 import mlflow
@@ -21,10 +21,12 @@ from config import (
     TICKERS, MLFLOW_EXPERIMENT, FEATURE_FLAGS, get_logger,
 )
 from features import (
-    compute_ta_features, compute_custom_features, compute_enhanced_mas,
-    compute_ict_features, inject_macro_features,
     fetch_fundamentals, fetch_usdidr, fetch_fred_macro, fetch_bi_rate,
+    load_data, load_ihsg_data, compute_cross_stock_features,
 )
+# The one builder both paths share (Task 1.2).  Imported from its own module
+# because features/__init__.py does not re-export it.
+from features.pipeline import build_features
 
 logger = get_logger(__name__)
 
@@ -284,75 +286,185 @@ def get_feature_names(model) -> list:
 # SHARED FEATURE BUILDING FOR INFERENCE
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def build_inference_features(df: pd.DataFrame, ticker: str,
-                             fundamentals: dict) -> pd.DataFrame:
-    """Build features for a single inference request using shared functions.
+# The inference-time universe snapshot.  Module-level names rather than literals
+# inside load_universe_context(), so a test can point them at a tmp_path without
+# touching the real data/ tree.
+UNIVERSE_RAW_PATH = os.path.join(BASE_DIR, "data", "raw", "stocks.csv")
+IHSG_PATH = os.path.join(BASE_DIR, "data", "raw", "ihsg.csv")
 
-    Mirrors the training feature pipeline but designed for real-time use:
-    - Skips intraday volume profile (too slow)
-    - Skips cross-stock features (not available at inference without full dataset)
-    - Skips ICT features if flag disabled
+# How much history the cross-stock (breadth/sector) pass is given at inference.
+# It only ever contributes the latest row, whose every column needs at most six
+# rows of history, so 30 leaves a five-fold margin while keeping the pass ~30x
+# cheaper than walking the full 1500-row universe per request.  Configurable as
+# a module attribute so the equivalence test can compare it against the full
+# history.
+CROSS_STOCK_WINDOW_ROWS = 30
 
-    Args:
-        df: OHLCV DataFrame for a single ticker (250 days)
-        ticker: Ticker symbol
-        fundamentals: Dict of fundamental metrics
+_universe_context = None
+
+
+def load_universe_context():
+    """Load the daily universe snapshot that inference-time context needs.
+
+    The market-context and sector features the builder computes belong to a
+    ticker *relative to the universe* (IHSG, its sector peers, breadth), so a
+    single request's OHLCV frame is not enough to build them — this is where
+    serving gets the rest.
 
     Returns:
-        Latest row as a 1-row DataFrame with all features.
+        ``(raw_ohlcv, ihsg, all_ticker_data)``: the multi-ticker OHLCV frame in
+        yfinance ``group_by="ticker"`` layout, the IHSG index frame, and
+        ``{ticker: dropna(raw_ohlcv[ticker])}`` for every configured ticker.
+
+    Any source that cannot be read degrades to an empty frame/dict with a
+    ``warning``, so a missing file yields absent/NaN context columns instead of
+    an exception.  The result is cached for the life of the process, so a
+    request pays the disk read at most once.
     """
-    if FEATURE_FLAGS.get("ta_indicators", True):
-        df = compute_ta_features(df)
+    global _universe_context
+    if _universe_context is not None:
+        return _universe_context
 
-    df = compute_custom_features(df)
+    raw_ohlcv = pd.DataFrame()
+    try:
+        raw_ohlcv = load_data(UNIVERSE_RAW_PATH)
+    except Exception as e:
+        logger.warning("Universe raw data unavailable at %s: %s", UNIVERSE_RAW_PATH, e)
 
-    if FEATURE_FLAGS.get("enhanced_mas", True):
-        df = compute_enhanced_mas(df)
+    ihsg = pd.DataFrame()
+    try:
+        ihsg = load_ihsg_data(IHSG_PATH)
+    except Exception as e:
+        logger.warning("IHSG data unavailable at %s: %s", IHSG_PATH, e)
 
-    if FEATURE_FLAGS.get("ict_suite", True):
-        df = compute_ict_features(df)
+    # Same per-ticker extraction build_feature_set does, so the cross-stock
+    # features are computed from identical inputs on both paths.
+    all_ticker_data = {}
+    for ticker in TICKERS:
+        try:
+            all_ticker_data[ticker] = dropna(raw_ohlcv[ticker].copy())
+        except KeyError:
+            pass
 
-    # Inject macro from daily cache
-    usdidr = _usdidr_cache if _usdidr_cache is not None else pd.DataFrame()
-    fred_macro = _fred_cache if _fred_cache is not None else pd.DataFrame()
-    bi_rate = _bi_cache if _bi_cache is not None else pd.Series(dtype=float)
+    _universe_context = (raw_ohlcv, ihsg, all_ticker_data)
+    return _universe_context
 
-    df = inject_macro_features(df, fundamentals, usdidr, fred_macro, bi_rate)
-    df["google_trend"] = 0.0
 
-    # News sentiment
+def universe_age_days() -> int:
+    """Age in whole days of the raw universe file the features are built from.
+
+    Reads the *universe* file's mtime (``UNIVERSE_RAW_PATH``) — not IHSG's, and
+    not the process's.  The universe frame is what the market-context and sector
+    features are computed from, so it is the file whose staleness makes those
+    features stale.
+
+    Returns:
+        Whole days since that file was last written, or ``-1`` when the file is
+        absent.  ``-1`` means *unknown*, never *fresh*: an absent file has no
+        age, and reporting 0 would claim it had just been ingested.
+    """
+    try:
+        mtime = os.path.getmtime(UNIVERSE_RAW_PATH)
+    except OSError as e:
+        logger.warning("Universe file %s unavailable — staleness unknown: %s",
+                       UNIVERSE_RAW_PATH, e)
+        return -1
+    return int((time.time() - mtime) // 86400)
+
+
+def build_inference_features(df: pd.DataFrame, ticker: str,
+                             fundamentals: dict) -> pd.DataFrame:
+    """Build the features for one inference request with the training builder.
+
+    Delegates to the same ``build_features`` the training path uses, fed from
+    the daily caches instead of the pipeline's per-run fetches, so a feature is
+    either a real computed value or genuinely absent — never a placeholder.
+
+    Args:
+        df: OHLCV DataFrame for a single ticker (250 days), single-level columns
+            as returned by ``yfinance.download(ticker)``
+        ticker: Ticker symbol
+        fundamentals: Dict of fundamental metrics from fetch_fundamentals()
+
+    Returns:
+        Latest row as a 1-row DataFrame, or an empty DataFrame when the ticker
+        has fewer than the builder's 50 usable rows (the API layer rejects that
+        case before calling).
+    """
+    # Volume profile and IDX fundamentals are deliberately NOT passed: vp_*
+    # needs a 5-minute intraday download and idn_* needs a per-ticker network
+    # fetch, neither of which serving can do without adding per-request network
+    # I/O.  Both families are therefore absent from the inference frame by
+    # design — and because that is a standing decision rather than a runtime
+    # failure, it is not logged per request (Task 1.9 owns failure visibility).
+    # The model's feature contract (feature_schema.json, Task 1.4) is derived so
+    # that it never expects a column serving cannot supply.
+    raw_ohlcv, ihsg, all_ticker_data = load_universe_context()
+
+    # build_features selects its ticker with df[ticker], i.e. it wants the
+    # multi-ticker yfinance group_by="ticker" layout, while a serving request
+    # carries one ticker with flat columns.  Widen the frame here instead of
+    # loosening the builder's contract: one top-level entry for this ticker,
+    # its fields underneath.
+    multi = pd.concat({ticker: df}, axis=1)
+
+    # Sentiment is fetched the way serving has always fetched it: flag-gated,
+    # and 0.0 on any failure.  It is handed to the builder as a value rather
+    # than written into the frame so the builder keeps ownership of the column.
+    news_sentiment = 0.0
     if FEATURE_FLAGS.get("news_sentiment", True):
         try:
             from features.fetchers import fetch_news_sentiment
-            df["news_sentiment"] = fetch_news_sentiment(ticker)
+            news_sentiment = fetch_news_sentiment(ticker)
         except Exception:
-            df["news_sentiment"] = 0.0
-    else:
-        df["news_sentiment"] = 0.0
+            news_sentiment = 0.0
 
-    # Placeholder columns — batch assign via dict to avoid fragmentation
-    placeholders = {}
-    for f in ["idn_der", "idn_roe", "idn_roa", "idn_current_ratio",
-              "idn_gpm", "idn_npm", "idn_eps_growth", "idn_bvps",
-              "idn_per", "idn_pbv"]:
-        placeholders[f] = np.nan
-    for f in ["vp_poc", "vp_poc_distance", "vp_vah", "vp_val",
-              "vp_value_area_width", "vp_close_in_value_area", "vp_volume_skew",
-              "vp_vwap_deviation", "vp_volume_at_close", "vp_profile_shape",
-              "vp_open_drive", "vp_close_drive", "vp_intraday_volatility",
-              "vp_intraday_range", "vp_intraday_trend", "vp_relative_volume",
-              "vp_volume_trend_5d", "vp_high_volume_nodes", "vp_vwap_deviation_std"]:
-        placeholders[f] = np.nan
-    for f in ["ihsg_return_1d", "ihsg_return_5d", "relative_strength_1d",
-              "relative_strength_5d", "beta_20d", "correlation_20d",
-              "market_breadth", "market_advance_decline", "sector_return_1d",
-              "sector_relative_strength", "sector_rank_5d", "sector_volume_ratio",
-              "usdidr_stress"]:
-        placeholders[f] = np.nan
-    df = pd.concat([df, pd.DataFrame(placeholders, index=df.index)], axis=1)
+    featured = build_features(
+        multi, ticker,
+        fundamentals=fundamentals,
+        usdidr=_usdidr_cache,
+        fred_macro=_fred_cache,
+        bi_rate=_bi_cache,
+        ihsg=ihsg,
+        all_ticker_data=all_ticker_data,
+        news_sentiment=news_sentiment,
+        google_trend=0.0,
+        vp_features=None,
+        idx_fundamentals=None,
+        mode="full",
+        with_target=False,
+    )
 
-    # Return latest row
-    numeric_df = df.select_dtypes(include=[np.number])
+    if featured is None:
+        logger.warning("Fewer than 50 usable rows for %s — no features built", ticker)
+        return pd.DataFrame()
+
+    # Cross-stock features (breadth, sector return/rank/volume) are applied by
+    # build_feature_set after every ticker is engineered, because they need the
+    # whole universe.  Serving has the whole universe from
+    # load_universe_context(), so it applies them at the same point for the same
+    # reason.
+    if FEATURE_FLAGS.get("market_context", True) and all_ticker_data:
+        # compute_cross_stock_features walks every index label against every
+        # ticker, so on the real universe (1553 rows x 45 tickers) the full
+        # history costs ~29 s of CPU.  Serving returns only the latest row, and
+        # every cross-stock column for that row is a function of at most the last
+        # six rows (a 5-day return needs six), so the same function is applied to
+        # a bounded tail window that still contains the row being served.  The
+        # served row is identical either way — pinned by
+        # tests/test_serve_parity.py::test_cross_stock_window_matches_full_history
+        # and measured on the real universe in task-1.3-report.md.  Without the
+        # window the first request per ticker stalls the event loop for ~30 s,
+        # because this function is called synchronously from the async handler.
+        cutoff = featured.index[-CROSS_STOCK_WINDOW_ROWS:][0]
+        featured = compute_cross_stock_features(
+            featured.loc[cutoff:].copy(),
+            ticker,
+            {t: d.loc[cutoff:] for t, d in all_ticker_data.items()},
+            TICKERS,
+        )
+
+    numeric_df = featured.select_dtypes(include=[np.number])
     return numeric_df.iloc[[-1]].copy()
 
 # ═══════════════════════════════════════════════════════════════════════════════
