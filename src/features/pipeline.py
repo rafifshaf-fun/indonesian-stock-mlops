@@ -40,6 +40,35 @@ from .volume_profile import compute_volume_profile_features
 from .market import load_ihsg_data, compute_market_context, compute_cross_stock_features
 
 
+class _NotSupplied:
+    """Sentinel type for a keyword argument the caller never passed at all.
+
+    ``None`` cannot carry this meaning: it is a *value*, and for the three
+    family arguments of :func:`build_features` it means "this family is
+    deliberately absent" — the serving path passes ``None`` on purpose, because
+    it cannot obtain volume-profile, IDX-fundamental or Google-Trends values
+    without per-request network I/O.  The sentinel instead means "the caller
+    omitted the argument", which is the forgetful-caller case the omission
+    warning exists for.
+
+    One value cannot express both.  Conflating them made serving log two
+    warnings on every healthy request, which trains operators to ignore
+    warnings and so defeats the visibility the warning was added to create.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        """Readable in a log line or a debugger, unlike a bare ``object()``."""
+        return "<not supplied>"
+
+
+#: Default for the family keyword arguments of :func:`build_features`; see
+#: :class:`_NotSupplied`.  Omitting an argument that defaults to this and whose
+#: ``FEATURE_FLAGS`` entry is on is a degradation and is logged at ``warning``.
+_NOT_SUPPLIED = _NotSupplied()
+
+
 def load_data(path: str) -> pd.DataFrame:
     """Load raw OHLCV data (yfinance MultiIndex format)."""
     return pd.read_csv(path, header=[0, 1], index_col=0, parse_dates=True)
@@ -99,13 +128,29 @@ def compute_target(df: pd.DataFrame) -> pd.DataFrame:
 
 def build_features(df, ticker, *, fundamentals, usdidr, fred_macro, bi_rate,
                    ihsg=None, all_ticker_data=None, news_sentiment=0.0,
-                   google_trend=0.0, vp_features=None, idx_fundamentals=None,
+                   google_trend=_NOT_SUPPLIED, vp_features=_NOT_SUPPLIED,
+                   idx_fundamentals=_NOT_SUPPLIED,
                    mode="full", with_target=False) -> pd.DataFrame:
     """Build the feature frame for one ticker from already-fetched inputs.
 
     Pure: this function performs no I/O.  It never fetches, reads or writes
     anything — every value it needs arrives as an argument, which is what lets
     the training path and the serving path share one implementation.
+
+    The three family arguments ``google_trend``, ``vp_features`` and
+    ``idx_fundamentals`` default to the module sentinel ``_NOT_SUPPLIED`` rather
+    than to ``None``, so that two different absences stay distinguishable:
+
+    * **the argument was omitted** — the caller never supplied this family.  The
+      family's columns are omitted and the omission is logged at ``warning``
+      when the family's ``FEATURE_FLAGS`` entry is on and ``mode != 'ci'``,
+      because a family that quietly vanishes is a degradation; and
+    * **the argument is an explicit ``None``** — the caller declares the absence
+      deliberate (serving cannot obtain these families without per-request
+      network I/O).  The columns are omitted and nothing is logged: an
+      intentional omission is a design decision, not a fault.
+
+    Neither case ever fabricates a column.
 
     Args:
         df: Raw multi-ticker OHLCV DataFrame (yfinance MultiIndex format)
@@ -120,22 +165,25 @@ def build_features(df, ticker, *, fundamentals, usdidr, fred_macro, bi_rate,
             features are applied by build_feature_set once every ticker has been
             engineered, because the sector/breadth columns need the full frame.
         news_sentiment: Sentiment score to store (used when the flag is on and
-            mode is not 'ci'; otherwise the column is 0.0)
+            mode is not 'ci'; otherwise the column is 0.0).  This keeps its
+            ``0.0`` default deliberately: it is the value the column always
+            carries, and the visibility of a *failed* sentiment fetch belongs to
+            the serving overlay (``PredictResponse.degraded``), not here.
         google_trend: Trend value to materialise as a ``google_trend`` column.
-            ``None`` means "no value available" and leaves the column absent —
-            the training wrapper passes ``None`` because build_feature_set
-            fetches and joins its own ``google_trend`` column, and two frames
-            both carrying that column make ``DataFrame.join`` raise.  The
-            default is 0.0 per this function's published interface.
+            ``None`` means "deliberately no value": the column is not
+            materialised and nothing is logged, which is what serving passes —
+            a constant would fabricate a column the model consumes.  Omitting the
+            argument means the caller did not supply the family: the column is
+            still not materialised (never a ``0.0`` constant) and the omission is
+            logged at ``warning``.
         vp_features: Dict of volume profile features from
             compute_volume_profile_features() (optional; applied only when the
-            flag is on and mode is not 'ci').  ``None`` means "no values
-            supplied": the columns are omitted, and the omission is logged at
-            ``warning`` because it is a degradation, not a decision this
-            function can make silently (R3).
+            flag is on and mode is not 'ci').  ``None`` means "deliberately not
+            supplied": the columns are omitted and nothing is logged.  Omitting
+            the argument omits the same columns and logs the omission at
+            ``warning`` (R3).
         idx_fundamentals: Dict of IDX fundamental fields (optional).  ``None``
-            means "no values supplied": the columns are omitted and the
-            omission is logged at ``warning``, exactly as for ``vp_features``.
+            and omission behave exactly as for ``vp_features``.
         mode: 'full', 'incremental', or 'ci' (CI mode skips intraday)
         with_target: When True, compute the binary target and set the ``ticker``
             column.  Off by default because compute_target() drops the final row
@@ -190,19 +238,20 @@ def build_features(df, ticker, *, fundamentals, usdidr, fred_macro, bi_rate,
 
     # ── Volume Profile (skip in CI mode) ─────────────────────────────────
     if FEATURE_FLAGS.get("volume_profile", True) and mode != "ci":
-        if vp_features is None:
-            # R3: the family is on and this is not CI mode, so the caller was
-            # *supposed* to supply these 19 columns and did not.  They stay
-            # omitted — fabricating them is the defect this task exists to
-            # remove — but the omission is no longer invisible: serving calls
-            # this function directly, and a forgetful caller would otherwise
-            # reproduce the original placeholder defect with no log line.
+        if vp_features is _NOT_SUPPLIED:
+            # The caller never passed this family, so the 19 vp_* columns are
+            # missing from a run whose flag says they belong there.  That is a
+            # degradation, not a decision: named at warning, and still omitted —
+            # fabricating them is the defect this task exists to remove.  An
+            # explicit None takes the branch below and is silent, because a
+            # caller that says "deliberately absent" has made a decision.
             logger.warning(
-                "volume_profile family omitted for %s: vp_features is None while "
-                "FEATURE_FLAGS['volume_profile'] is on and mode=%r",
-                ticker, mode,
+                "volume_profile family not supplied for %s: the vp_features "
+                "argument was omitted while FEATURE_FLAGS['volume_profile'] is "
+                "on and mode=%r; the 19 vp_* columns stay absent (pass None to "
+                "declare the absence deliberate)", ticker, mode,
             )
-        else:
+        elif vp_features is not None:
             for col, val in vp_features.items():
                 ticker_df[col] = val
 
@@ -212,27 +261,38 @@ def build_features(df, ticker, *, fundamentals, usdidr, fred_macro, bi_rate,
 
     # ── IDX Fundamentals ────────────────────────────────────────────────
     if FEATURE_FLAGS.get("idx_fundamentals", True):
-        if idx_fundamentals is None:
-            # R3, same shape as volume_profile above: the flag is on and the
-            # argument was left at its ``None`` default, so the ten idn_* columns
-            # are omitted.  Named at warning, omitted as before.
+        if idx_fundamentals is _NOT_SUPPLIED:
+            # Same shape as volume_profile above: the flag is on and the argument
+            # was never passed, so the ten idn_* columns are omitted invisibly.
+            # Named at warning, omitted as before; an explicit None is silent.
             logger.warning(
-                "idx_fundamentals family omitted for %s: idx_fundamentals is None "
-                "while FEATURE_FLAGS['idx_fundamentals'] is on", ticker,
+                "idx_fundamentals family not supplied for %s: the "
+                "idx_fundamentals argument was omitted while "
+                "FEATURE_FLAGS['idx_fundamentals'] is on; the idn_* columns stay "
+                "absent (pass None to declare the absence deliberate)", ticker,
             )
-        else:
+        elif idx_fundamentals is not None:
             for col, val in idx_fundamentals.items():
                 ticker_df[col] = val
 
     # ── Google Trends ───────────────────────────────────────────────────
-    # Materialised only when the caller supplies a value (None == absent), so
-    # that build_feature_set can still join its own `google_trend` column.
-    if (
-        FEATURE_FLAGS.get("google_trends", True)
-        and mode != "ci"
-        and google_trend is not None
-    ):
-        ticker_df["google_trend"] = google_trend
+    # Materialised only when the caller supplies a value.  ``None`` is the
+    # deliberate absence (serving cannot reproduce the fetch, and any constant
+    # would fabricate a column the model consumes), while the sentinel is a
+    # caller that forgot the family — named, and still not fabricated.  Before
+    # the sentinel the default was ``0.0``, so "left at its default" was
+    # indistinguishable from "the caller passed 0.0": a safe default
+    # indistinguishable from a real value.
+    if FEATURE_FLAGS.get("google_trends", True) and mode != "ci":
+        if google_trend is _NOT_SUPPLIED:
+            logger.warning(
+                "google_trend not supplied for %s: the google_trend argument was "
+                "omitted while FEATURE_FLAGS['google_trends'] is on and mode=%r; "
+                "the column stays absent rather than defaulting to 0.0",
+                ticker, mode,
+            )
+        elif google_trend is not None:
+            ticker_df["google_trend"] = google_trend
 
     # ── Shared: Target ─────────────────────────────────────────────────
     if with_target:
@@ -294,6 +354,12 @@ def engineer_features_for_ticker(df, ticker, fundamentals, usdidr, fred_macro,
     if FEATURE_FLAGS.get("idx_fundamentals", True):
         idx_fundamentals = fetch_idx_fundamentals(ticker)
 
+    # Every family is passed *explicitly* — including ``google_trend=None``,
+    # which is a deliberate absence (build_feature_set fetches and joins its own
+    # ``google_trend`` column, and two frames both carrying it make
+    # ``DataFrame.join`` raise).  Nothing here is left to the sentinel default,
+    # so the training path never triggers the omission warning: an omission it
+    # warns about is a real caller mistake, not this wrapper.
     return build_features(
         df, ticker,
         fundamentals=fundamentals, usdidr=usdidr, fred_macro=fred_macro,

@@ -63,6 +63,11 @@ Python 3.11, local venv at `venv/`.
   component that failed (`["sentiment"]`), the overlay logs at `warning`, and
   `compute_volume_profile_features`/`build_features` warn when a family is
   omitted. A safe default indistinguishable from a real value is the defect.
+  "Omitted" means the argument was *not passed*: `build_features`'s
+  `google_trend`, `vp_features` and `idx_fundamentals` default to the sentinel
+  `features.pipeline._NOT_SUPPLIED`, so an explicit `None` — a deliberate
+  absence, which is what serving passes — stays silent while a forgotten family
+  warns. Both omit the columns; neither fabricates them.
 - `/predict/batch` raises `HTTPException(502, detail=...)` for a ticker that
   cannot be predicted. It used to answer `prediction: 0` (SELL) with
   `probability_up: 0.0` under HTTP 200, which a caller could trade on.
@@ -97,9 +102,11 @@ Python 3.11, local venv at `venv/`.
 - Serving builds features by calling the same I/O-free `features.pipeline.build_features` that
   training uses, so the two paths cannot drift. The `vp_*`, `idn_*` and `google_trend` families
   are deliberately absent at inference — serving cannot produce them without per-request network
-  I/O — and are excluded from the feature contract. Because `build_features` now warns whenever a
-  family's flag is on and its argument is `None`, serving logs those deliberate omissions at
-  `warning` once per request; that is expected, not a fault.
+  I/O — and are excluded from the feature contract. Serving passes each of them as an explicit
+  `None`, which `build_features` reads as "deliberately absent", so a healthy request logs no
+  omission warning at all and `degraded` stays `[]`. The omission warning fires only when a caller
+  leaves the argument out entirely (the `_NOT_SUPPLIED` sentinel), which is the forgotten-family
+  degradation; before the sentinel, serving's two standing omissions warned on every request.
 - Rebuilding the index is mandatory after every retrain, and the API loads it
   once at startup — restart the container (`--force-recreate api`) to pick it up.
 - Training all 45 tickers takes ~15-20 min with `--parallel`. `--tune` covers only

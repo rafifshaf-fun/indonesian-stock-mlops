@@ -647,12 +647,17 @@ def build_inference_features(df: pd.DataFrame, ticker: str,
     #   every field, and all ten columns are all-NaN in the committed parquet.
     #   There is nothing to reproduce.
     #
-    # Because absence is a standing decision rather than a runtime failure, it is
-    # not logged per request here (Task 1.9 owns failure visibility, and the
-    # builder now names every omitted family at ``warning`` — see
-    # ``features.pipeline.build_features``).  The model's feature contract
-    # (feature_schema.json, Task 1.4) is derived so that it never expects a
-    # column serving cannot supply.
+    # Because absence is a standing decision rather than a runtime failure, no
+    # family is *omitted* from the call below: each is passed an explicit value,
+    # or an explicit ``None`` when there is nothing to pass.  ``build_features``
+    # distinguishes the two — omitting the keyword means "the caller forgot this
+    # family" and logs one ``warning``, while an explicit ``None`` means
+    # "deliberately absent" and logs nothing (see the ``_NOT_SUPPLIED`` sentinel
+    # in ``features.pipeline``).  Passing ``None`` is what keeps a healthy
+    # request silent: warning on every request would teach operators to ignore
+    # the warning that this task exists to make visible (Task 1.9).  The model's
+    # feature contract (feature_schema.json, Task 1.4) is derived so that it
+    # never expects a column serving cannot supply.
     raw_ohlcv, ihsg, all_ticker_data = load_universe_context()
 
     # build_features selects its ticker with df[ticker], i.e. it wants the
@@ -684,8 +689,12 @@ def build_inference_features(df: pd.DataFrame, ticker: str,
         news_sentiment=news_sentiment,
         # None, not a constant: a value here would materialise a fabricated
         # google_trend column at inference while training carries real fetched
-        # values (see the family rationale above).
+        # values (see the family rationale above).  Explicit None (not an omitted
+        # keyword): the builder logs the *omitted* case at warning, and this
+        # absence is deliberate.
         google_trend=None,
+        # Explicit None for the same reason: deliberate absence, not a family
+        # this caller forgot.
         vp_features=None,
         idx_fundamentals=None,
         mode="full",

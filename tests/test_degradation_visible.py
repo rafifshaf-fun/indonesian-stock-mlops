@@ -429,18 +429,35 @@ def test_a_healthy_batch_ticker_still_returns_a_signal(tmp_path, monkeypatch):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# R3 — an omitted feature family is named at warning
+# R3 — an omitted feature family is named at warning; a deliberate None is not
 # ═══════════════════════════════════════════════════════════════════════════════
+# ``build_features`` distinguishes two absences that used to be the same value:
+#
+# * the argument was **omitted** (its default is a sentinel) — the caller forgot
+#   the family, which is a degradation and is logged at ``warning``;
+# * the argument is an explicit **None** — the caller declares the absence
+#   deliberate (serving cannot obtain vp_*/idn_*/google_trend without per-request
+#   network I/O), which is a design decision and is logged not at all.
+#
+# Both cases still omit the columns.  Warning on the second case is what made
+# serving log two warnings on every healthy request, which trains operators to
+# ignore warnings and so defeats the visibility this task exists to create.
 
-def test_an_omitted_feature_family_warns_and_still_omits(
+def _omission_warnings(caplog, family: str) -> list[str]:
+    """Records at WARNING or above naming ``family``, rendered as text."""
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno >= logging.WARNING and family in r.getMessage()
+    ]
+
+
+def test_an_omitted_feature_family_warns_once_and_still_omits(
         raw_ohlcv, ihsg_frame, fundamentals_dict, caplog):
-    """R3: omission stays omission — it just stops being invisible.
+    """One warning per forgotten family, and the family stays absent.
 
-    ``vp_features=None`` and ``idx_fundamentals=None`` mean "this caller has no
-    values"; the columns stay absent, exactly as before.  What changes is that
-    the omission is now reported, because the serving path calls
-    ``build_features`` directly and a forgetful caller would otherwise reproduce
-    the fabricated-placeholder defect invisibly.
+    The two arguments are *not passed at all* here, which is the only shape that
+    now warns: a caller that leaves both families to their defaults has
+    reproduced the fabricated-placeholder defect invisibly.
     """
     import features.pipeline as p
 
@@ -449,22 +466,75 @@ def test_an_omitted_feature_family_warns_and_still_omits(
             raw_ohlcv, "BBCA.JK",
             fundamentals=fundamentals_dict, usdidr=None, fred_macro=None,
             bi_rate=None, ihsg=ihsg_frame, news_sentiment=0.0,
-            google_trend=-0.5, vp_features=None, idx_fundamentals=None,
+            google_trend=-0.5,
             mode="full", with_target=True,
         )
 
     assert out is not None
     # Omitted, not fabricated: the volume profile family is simply absent.  The
     # ``idn_*`` names also arrive from ``inject_macro_features`` (the
-    # ``fundamentals`` fixture keys are ``idn_der``/``idn_roe``/…), so
-    # ``idx_fundamentals=None`` removes the family's *second* writer rather than
-    # the column names; the warning is the observable change, and the negative
-    # control below is what separates the two.
+    # ``fundamentals`` fixture keys are ``idn_der``/``idn_roe``/…), so the
+    # omission here removes the family's *second* writer rather than the column
+    # names; the warning is the observable change.
     assert not [c for c in out.columns if c.startswith("vp_")]
 
-    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
-    assert any("volume_profile" in m for m in warnings), warnings
-    assert any("idx_fundamentals" in m for m in warnings), warnings
+    vp = _omission_warnings(caplog, "volume_profile")
+    idn = _omission_warnings(caplog, "idx_fundamentals")
+    assert len(vp) == 1, vp
+    assert len(idn) == 1, idn
+    assert all(r.levelno == logging.WARNING for r in caplog.records
+               if r.levelno >= logging.WARNING), caplog.records
+
+
+def test_an_omitted_google_trend_warns_and_is_not_fabricated(
+        raw_ohlcv, ihsg_frame, fundamentals_dict, caplog):
+    """The third family, and the one whose default used to be a value.
+
+    ``google_trend`` defaulted to ``0.0``, so "left at its default" was
+    indistinguishable from "the caller passed 0.0" — a safe default
+    indistinguishable from a real value, which is the defect.  With the sentinel
+    the omission is detectable, it is named, and the column is not materialised.
+    """
+    import features.pipeline as p
+
+    with caplog.at_level(logging.WARNING):
+        out = p.build_features(
+            raw_ohlcv, "BBCA.JK",
+            fundamentals=fundamentals_dict, usdidr=None, fred_macro=None,
+            bi_rate=None, ihsg=ihsg_frame, news_sentiment=0.0,
+            vp_features={}, idx_fundamentals={},
+            mode="full", with_target=True,
+        )
+
+    assert out is not None
+    assert "google_trend" not in out.columns
+    named = _omission_warnings(caplog, "google_trend")
+    assert len(named) == 1, named
+
+
+def test_a_deliberate_none_is_silent_and_still_omits(
+        raw_ohlcv, ihsg_frame, fundamentals_dict, caplog):
+    """The distinction itself: explicit ``None`` is a decision, not a fault.
+
+    This is exactly what serving passes (``serve.build_inference_features``), so
+    it is also the pin that the healthy serving path stays warning-free.
+    """
+    import features.pipeline as p
+
+    with caplog.at_level(logging.WARNING):
+        out = p.build_features(
+            raw_ohlcv, "BBCA.JK",
+            fundamentals=fundamentals_dict, usdidr=None, fred_macro=None,
+            bi_rate=None, ihsg=ihsg_frame, news_sentiment=0.0,
+            google_trend=None, vp_features=None, idx_fundamentals=None,
+            mode="full", with_target=True,
+        )
+
+    assert out is not None
+    assert not [c for c in out.columns if c.startswith("vp_")]
+    assert "google_trend" not in out.columns
+    for family in ("volume_profile", "idx_fundamentals", "google_trend"):
+        assert _omission_warnings(caplog, family) == [], caplog.records
 
 
 def test_a_supplied_family_is_not_reported_as_omitted(
@@ -488,6 +558,66 @@ def test_a_supplied_family_is_not_reported_as_omitted(
     families = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert not [m for m in families if "volume_profile" in m], families
     assert not [m for m in families if "idx_fundamentals" in m], families
+    assert not [m for m in families if "google_trend" in m], families
+
+
+def test_a_healthy_serving_request_logs_no_omission_warning(
+        raw_ohlcv, ihsg_frame, fundamentals_dict, tmp_path, monkeypatch, caplog):
+    """The whole point: the serving path is silent about its standing omissions.
+
+    This drives the *real* ``serve.build_inference_features`` — the only serving
+    caller of ``build_features`` — through ``POST /predict``, with the universe,
+    macro caches and sentiment stubbed offline.  It is the request shape an
+    operator sees on a healthy day, and it must produce neither an omission
+    warning nor a ``degraded`` entry.
+    """
+    import serve
+    import features.fetchers as fetchers
+    from datetime import date as _date
+
+    monkeypatch.setattr(serve, "PRED_CACHE_DB", str(tmp_path / "cache.db"))
+    # ``SCHEMA``'s ``rsi`` is a *cached-row* column name that no computed frame
+    # actually carries (``ta`` names it ``momentum_rsi``); this test runs the
+    # real builder, so the contract it aligns to is one the builder really
+    # produces.
+    monkeypatch.setattr(serve, "load_best_model",
+                        lambda ticker: (_StubModel(), ["ret_1d"]))
+    serve.model_cache.clear()
+
+    # The slow path is the one that calls the builder, so the download, the
+    # fundamentals fetch and the daily macro refresh must all be local.  Pinning
+    # ``_cache_date`` to today makes the background refresh return immediately
+    # rather than reach for the network after the response.
+    monkeypatch.setattr(serve, "_cache_date", str(_date.today()))
+    monkeypatch.setattr(serve, "fetch_fundamentals", lambda ticker: {})
+    monkeypatch.setattr(serve.yf, "download",
+                        lambda *a, **k: raw_ohlcv["BBCA.JK"].dropna().copy())
+    monkeypatch.setattr(fetchers, "fetch_news_sentiment", lambda ticker: 0.25)
+
+    all_ticker_data = {t: raw_ohlcv[t].dropna() for t in ("BBCA.JK", "BBRI.JK", "BMRI.JK")}
+    monkeypatch.setattr(serve, "load_universe_context",
+                        lambda: (raw_ohlcv, ihsg_frame, all_ticker_data))
+    index = raw_ohlcv.index
+    monkeypatch.setattr(serve, "_usdidr_cache", pd.DataFrame(
+        {"usdidr_rate": np.linspace(15_000.0, 15_600.0, len(index)),
+         "usdidr_return": np.full(len(index), 0.0004)}, index=index))
+    monkeypatch.setattr(serve, "_fred_cache",
+                        pd.DataFrame({"fed_rate": np.full(len(index), 5.25)}, index=index))
+    monkeypatch.setattr(serve, "_bi_cache",
+                        pd.Series(6.0, index=index, name="bi_rate_official"))
+
+    client = TestClient(serve.app)
+    with caplog.at_level(logging.WARNING):
+        response = client.post("/predict", json={"ticker": "BBCA.JK"})
+
+    assert response.status_code == 200, response.text
+    # Healthy path: nothing failed, so nothing is reported as degraded.
+    assert response.json()["degraded"] == [], response.json()
+
+    noisy = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert [m for m in noisy if "not supplied" in m] == [], noisy
+    for family in ("volume_profile", "idx_fundamentals", "google_trend"):
+        assert _omission_warnings(caplog, family) == [], noisy
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
