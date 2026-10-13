@@ -615,6 +615,39 @@ def _index_entries_from_results(results) -> dict[str, str]:
     }
 
 
+def _train_sequentially(tickers, *, tune: bool, feature_columns: list[str] | None,
+                        use_shap: bool, expand_cv: bool, blend_lgbm: bool) -> dict[str, str]:
+    """Train ``tickers`` one at a time, containing each ticker's failure.
+
+    The sequential mirror of ``_train_one`` plus ``_index_entries_from_results``:
+    a ticker whose training raises is logged at ``error`` and skipped, and the
+    loop carries on, so the one writer at the end of ``main`` is still reached.
+    Without that, a single ticker's exception propagates out of the loop and the
+    process dies before ``write_model_index`` runs — leaving the index stale
+    behind a run that logged models, which is the failure F10 exists to end.
+    ``plot_feature_importance`` raising *after* ``log_model`` for a model with
+    fewer than its ``top_n`` features is exactly that case; the parallel path
+    already survives it, so the sequential path must too.  (The plot bug itself
+    is pre-existing and not fixed here.)
+
+    Returns:
+        ``ticker -> model folder`` for the tickers that logged a model.  A
+        skipped ticker, a CI-mode ticker and a failed ticker all contribute
+        nothing; no folder name is ever derived here.
+    """
+    entries: dict[str, str] = {}
+    for ticker in tickers:
+        try:
+            folder = train(ticker, tune=tune, feature_columns=feature_columns,
+                           use_shap=use_shap, expand_cv=expand_cv, blend_lgbm=blend_lgbm)
+        except Exception as exc:
+            logger.error("%s failed: %s", ticker, exc)
+            continue
+        if folder:
+            entries[ticker] = folder
+    return entries
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -657,12 +690,12 @@ if __name__ == "__main__":
         logger.info("Done: %d/%d tickers trained", ok, len(tickers))
         entries = _index_entries_from_results(results)
     else:
-        entries = {}
-        for t in tickers:
-            folder = train(t, tune=args.tune, feature_columns=feature_columns,
-                           use_shap=use_shap, expand_cv=expand_cv, blend_lgbm=blend)
-            if folder:
-                entries[t] = folder
+        # Contained per ticker, like the parallel path: one ticker's exception
+        # must not abort the loop and skip the index write below.
+        entries = _train_sequentially(
+            tickers, tune=args.tune, feature_columns=feature_columns,
+            use_shap=use_shap, expand_cv=expand_cv, blend_lgbm=blend,
+        )
 
     # F10 — the index's single writer, in the parent, once, after every ticker
     # has been trained and logged.  No worker writes it: a worker returns its

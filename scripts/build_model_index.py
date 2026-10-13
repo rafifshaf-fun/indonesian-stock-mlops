@@ -7,12 +7,15 @@ mapping through ``model_store.write_model_index`` — the index's one writer, so
 this command and training produce the same file shape and share the same
 "never write an empty index" guard.
 
-A model whose ticker cannot be resolved from MLflow metadata is reported as
-**unresolved** and the script **exits non-zero**.  It never falls back to
-guessing a ticker from the model's own feature names against the features CSV:
-that guess invented ticker identity, which is how the committed index came to
-name models training never associated with those tickers (F10).  Retraining is
-the remedy — training writes the index itself now.
+A model whose ticker cannot be resolved from MLflow metadata is reported at
+``warning``.  The script **exits non-zero when a ticker in the universe is left
+without a model** — never merely because a logged-model folder from an earlier
+retrain could not be resolved, since those folders outlive the run ids a fresh
+tracking DB keeps and can never be resolved by anything this command does.  It
+never falls back to guessing a ticker from the model's own feature names against
+the features CSV: that guess invented ticker identity, which is how the committed
+index came to name models training never associated with those tickers (F10).
+Retraining is the remedy — training writes the index itself now.
 
 Usage:
     python scripts/build_model_index.py
@@ -71,10 +74,18 @@ def build_index() -> int:
     """Write the index and return the process exit status.
 
     Returns:
-        ``0`` only when every logged model resolved to a ticker in the universe;
-        ``1`` when any model could not be resolved.  An unresolved model is an
-        index that cannot serve its predictions, so it is a failure of this
-        command, not a warning to be passed over.
+        ``0`` when every ticker in the universe is mapped; ``1`` when any ticker
+        in the universe is left without a model.
+
+    **The criterion is the universe, not the folders on disk.**  Training never
+    prunes a logged model's folder, so a retrain leaves the previous store beside
+    the new one: those folders keep run ids that a later tracking DB does not
+    have, and no rebuild can ever resolve them.  Judging this command by "every
+    folder resolved" therefore made every post-retrain rebuild exit ``1`` on a
+    healthy index — and ``start.bat``'s weekly path treats a non-zero exit as a
+    failed step, so the container restart that publishes the new index never ran.
+    Unresolvable folders are reported at ``warning`` and do not fail the command;
+    a ticker with no model still does.
     """
     models_dir = model_store.model_dir()
     folders = sorted(path.name for path in models_dir.iterdir() if path.is_dir())
@@ -126,7 +137,14 @@ def build_index() -> int:
         unresolved.append((folder, reason))
         logger.warning("%s: %s — left unresolved", folder, reason)
 
-    print(f"Resolved {len(entries)}/{total} logged model(s) to a ticker in the universe")
+    # The failure this command exists to report, counted against the thing the
+    # index has to serve: a ticker in the universe with no model to resolve.
+    missing = [ticker for ticker in TICKERS if ticker not in entries]
+
+    print(
+        f"Resolved {len(entries)}/{len(TICKERS)} ticker(s) in the universe "
+        f"from {total} logged model folder(s)"
+    )
 
     # The shared writer, not a local json.dump: one file shape, and the guard
     # that refuses to empty a populated index (R3) applies to this command too.
@@ -134,15 +152,36 @@ def build_index() -> int:
     # destroy an index that is still serving predictions.
     model_store.write_model_index(entries, total_models=total, errors=errors)
 
-    if not unresolved:
-        print("Every logged model resolved; the index was written")
+    if unresolved:
+        # Stale folders from an earlier retrain, a run whose metadata cannot be
+        # read, or a run for a ticker outside the universe.  Reported, and
+        # reported loudly, but never the reason to fail: they cannot be resolved
+        # by anything this command does.
+        print(
+            f"\n{len(unresolved)} logged model folder(s) resolved to no ticker in "
+            f"the universe — stale folders from earlier runs, or unreadable run "
+            f"metadata.  They do not fail this command:"
+        )
+        for folder, reason in unresolved[:REPORT_LIMIT]:
+            print(f"  {folder}: {reason}")
+        if len(unresolved) > REPORT_LIMIT:
+            print(f"  ... and {len(unresolved) - REPORT_LIMIT} more (see the warnings above)")
+
+    if not missing:
+        print(
+            f"\nEvery one of the {len(TICKERS)} ticker(s) in the universe resolves "
+            f"to a model; the index was written"
+        )
         return 0
 
-    print(f"\n{len(unresolved)} of {total} logged model(s) could NOT be resolved to a ticker:")
-    for folder, reason in unresolved[:REPORT_LIMIT]:
-        print(f"  {folder}: {reason}")
-    if len(unresolved) > REPORT_LIMIT:
-        print(f"  ... and {len(unresolved) - REPORT_LIMIT} more (see the warnings above)")
+    print(
+        f"\n{len(missing)} of {len(TICKERS)} ticker(s) in the universe have no "
+        f"model the index can name:"
+    )
+    for ticker in missing[:REPORT_LIMIT]:
+        print(f"  {ticker}")
+    if len(missing) > REPORT_LIMIT:
+        print(f"  ... and {len(missing) - REPORT_LIMIT} more")
 
     print(
         "\nGuessing a ticker from the model's own feature names is gone: a model "

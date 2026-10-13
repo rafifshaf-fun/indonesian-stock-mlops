@@ -56,7 +56,14 @@ This module is the single replacement for both.  Its contract:
     shape and one guard wherever it is written from.  An empty mapping is
     refused at ``warning`` rather than written: the CI path logs no model at
     all, and ``mapped_tickers: 0`` over a populated index disables every
-    prediction while the file still looks like a valid index.
+    prediction while the file still looks like a valid index.  The write itself
+    is **atomic** — a temporary sibling flushed to disk and renamed over the
+    target — because this file is the single point of failure for every
+    prediction and truncating it in place would leave an unreadable index behind
+    any interruption.  A write that merges also says, at ``warning``, how many
+    mappings it carried over for tickers this run did not map: with merge
+    semantics, "the ticker failed to log" and "the ticker was not attempted"
+    otherwise produce the same file.
 
 **R4 — where a directory scan is allowed.**  ``scripts/build_model_index.py``
 is an explicit rebuild command: it scans the store, reads each logged model's
@@ -69,7 +76,9 @@ the single folder the index names.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
+import tempfile
 from collections.abc import Mapping
 from typing import Any
 
@@ -92,6 +101,10 @@ EXPERIMENT_ID = "1"
 
 #: The marker file MLflow writes in a logged model's artifact directory.
 MLMODEL_FILENAME = "MLmodel"
+
+#: How many carried-over tickers a merge warning names before summarising the
+#: rest.  A ``--tune`` run carries dozens; naming them all buries the message.
+REPORTED_TICKERS = 5
 
 #: Repository root, derived from this module rather than from the caller's cwd.
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -277,6 +290,13 @@ def write_model_index(entries: Mapping[str, str], path: pathlib.Path | None = No
     CI), and overwriting a populated index with ``mapped_tickers: 0`` would
     disable every prediction while the file still looked like a valid index.
 
+    The write is atomic: the payload is dumped into a temporary sibling of
+    ``target``, flushed to disk, and then renamed over it.  Opening the target
+    itself would truncate a working index before the new bytes were known to be
+    writable, and this file is the single point of failure for every prediction —
+    an interruption in the middle would leave every lookup failing on a file that
+    used to work.
+
     A write that fails is a ``warning`` and nothing else: the run's models are
     already logged, and the index is rewritten by the next run.
     """
@@ -301,10 +321,19 @@ def write_model_index(entries: Mapping[str, str], path: pathlib.Path | None = No
         "ticker_to_model": {ticker: mapping[ticker] for ticker in sorted(mapping)},
     }
 
+    temporary: pathlib.Path | None = None
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        with open(target, "w", encoding="utf-8") as handle:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=target.parent,
+            prefix=f"{target.name}.", suffix=".tmp", delete=False,
+        ) as handle:
+            temporary = pathlib.Path(handle.name)
             json.dump(payload, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        temporary = None
     except OSError as exc:
         logger.warning(
             "Model index %s could not be written (%s) — %d ticker(s) stay "
@@ -312,12 +341,32 @@ def write_model_index(entries: Mapping[str, str], path: pathlib.Path | None = No
             target, exc, len(named),
         )
         return
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except OSError:  # pragma: no cover — best-effort cleanup
+                pass
 
-    carried = len(mapping) - len(named)
+    carried = sorted(set(mapping) - set(named))
+    if carried:
+        # Merge semantics keep a partial retrain from unmapping the tickers it
+        # did not touch, which also makes "this ticker failed to log" look
+        # exactly like "this ticker was not attempted".  The writer is the only
+        # place that knows which of the two it is, so it says so.
+        logger.warning(
+            "Model index %s carries %d mapping(s) for ticker(s) this run did not "
+            "retrain (%s%s) — they are kept; a ticker that failed to log looks the "
+            "same here as one this run never attempted",
+            target, len(carried), ", ".join(carried[:REPORTED_TICKERS]),
+            f", and {len(carried) - REPORTED_TICKERS} more"
+            if len(carried) > REPORTED_TICKERS else "",
+        )
+
     logger.info(
         "Model index %s now maps %d ticker(s): %d from this run%s",
         target, len(mapping), len(named),
-        f", {carried} kept from earlier runs" if carried else "",
+        f", {len(carried)} kept from earlier runs" if carried else "",
     )
 
 

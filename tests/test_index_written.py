@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import types
 import warnings as _warnings
 
@@ -185,6 +186,121 @@ def test_an_empty_index_may_still_be_written_to_the_empty_store(tmp_path, monkey
     write_model_index({"BBCA.JK": "m-1"})
 
     assert json.loads(p.read_text())["ticker_to_model"] == {"BBCA.JK": "m-1"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# The write is atomic — the index is never truncated in place
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_the_write_goes_through_a_temporary_sibling(tmp_path, monkeypatch):
+    """The new bytes are dumped beside the target, never into it.
+
+    The index is the single point of failure for every prediction, so the write
+    must not open the target itself: truncating it before the new payload is
+    known to be writable leaves an unreadable index behind any interruption.
+    """
+    import model_store
+
+    p = tmp_path / "model_index.json"
+    monkeypatch.setattr(model_store, "index_path", lambda: p)
+    write_model_index({"BBCA.JK": "m-1"})
+    before = p.read_text(encoding="utf-8")
+
+    real_dump = json.dump
+    seen: dict = {}
+
+    def _observed(payload, handle, **kwargs):
+        seen["target"] = p.read_text(encoding="utf-8")
+        seen["handle"] = handle.name
+        return real_dump(payload, handle, **kwargs)
+
+    monkeypatch.setattr(model_store.json, "dump", _observed)
+    write_model_index({"BBRI.JK": "m-2"})
+
+    temporary = pathlib.Path(seen["handle"])
+    assert temporary != p, "the payload must not be dumped into the index itself"
+    assert temporary.parent == p.parent, "the temporary must be a sibling of the target"
+    assert seen["target"] == before, "the old index must be intact while the new one is written"
+    assert load_model_index() == {"BBCA.JK": "m-1", "BBRI.JK": "m-2"}
+    assert list(tmp_path.glob("*.tmp")) == [], "the temporary must not be left behind"
+
+
+def test_an_interrupted_write_cannot_truncate_the_index(tmp_path, monkeypatch, caplog):
+    """A write that dies mid-dump leaves the previous index readable.
+
+    ``json.dump`` raising after it has already emitted bytes is the interruption
+    this guards: with ``open(target, "w")`` the target is that half-written file,
+    and every lookup then fails on a file that used to work.
+    """
+    import model_store
+
+    p = tmp_path / "model_index.json"
+    monkeypatch.setattr(model_store, "index_path", lambda: p)
+    write_model_index({"BBCA.JK": "m-1"})
+    before = p.read_bytes()
+
+    def _half_written(payload, handle, **kwargs):
+        handle.write('{"ticker_to_model": {"BB')  # bytes on disk, then the failure
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(model_store.json, "dump", _half_written)
+
+    with caplog.at_level("WARNING"):
+        write_model_index({"BBRI.JK": "m-2"})
+
+    assert p.read_bytes() == before, "an interrupted write must not touch the index"
+    assert load_model_index() == {"BBCA.JK": "m-1"}
+    assert list(tmp_path.glob("*.tmp")) == [], "the abandoned temporary must be cleaned up"
+    assert any("could not be written" in r.getMessage() for r in caplog.records), \
+        [r.getMessage() for r in caplog.records]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# A merge that carries entries is visible at warning
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_carried_entries_are_reported_at_warning(tmp_path, monkeypatch, caplog):
+    """A carried mapping is indistinguishable from a ticker that failed to log.
+
+    Merging is what keeps a ``--tune`` run from unmapping the other 35 tickers,
+    but it also means "this ticker logged nothing this run" looks exactly like
+    "this run never attempted it".  The writer knows which tickers it mapped, so
+    the difference is reported rather than left for a reader to guess.
+    """
+    import model_store
+
+    p = tmp_path / "model_index.json"
+    monkeypatch.setattr(model_store, "index_path", lambda: p)
+    write_model_index({"BBCA.JK": "m-1", "BBRI.JK": "m-2", "TLKM.JK": "m-3"})
+
+    with caplog.at_level("WARNING"):
+        write_model_index({"BBRI.JK": "m-9"})
+
+    assert load_model_index() == {"BBCA.JK": "m-1", "BBRI.JK": "m-9", "TLKM.JK": "m-3"}
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("BBCA.JK" in message and "TLKM.JK" in message for message in warnings), warnings
+    assert any("did not retrain" in message for message in warnings), warnings
+
+
+def test_a_run_that_maps_every_ticker_carries_nothing_and_warns_nothing(
+        tmp_path, monkeypatch, caplog):
+    """A full retrain names every mapped ticker, so there is nothing to carry.
+
+    The warning must describe carrying, not the ordinary act of merging: a full
+    retrain writes exactly the file a wholesale replace would.
+    """
+    import model_store
+
+    p = tmp_path / "model_index.json"
+    monkeypatch.setattr(model_store, "index_path", lambda: p)
+    write_model_index({"BBCA.JK": "m-1", "BBRI.JK": "m-2"})
+
+    with caplog.at_level("WARNING"):
+        write_model_index({"BBCA.JK": "m-7", "BBRI.JK": "m-8"})
+
+    assert not [r for r in caplog.records if r.levelname == "WARNING"], \
+        [r.getMessage() for r in caplog.records]
+    assert load_model_index() == {"BBCA.JK": "m-7", "BBRI.JK": "m-8"}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -380,15 +496,23 @@ def test_a_model_info_without_an_id_is_left_out_with_a_warning(
     ), [r.getMessage() for r in caplog.records]
 
 
-def test_the_worker_hands_the_parent_the_folder(train_module, monkeypatch, caplog):
+def test_the_worker_hands_the_parent_the_folder(train_module, monkeypatch, caplog, tmp_path):
     """The loky worker's return value carries the folder to the parent.
 
     ``_train_one`` runs in a separate process, so the only thing the parent can
     see is this tuple; it is the whole transport for ticker -> folder.
+
+    The features path it is handed is a ``tmp_path`` one: ``_train_one`` assigns
+    the module global ``FEATURES_PATH`` (that is how a loky worker gets the
+    run's frame), and pointing it at a file inside ``tmp_path`` — with the
+    original value pinned through ``monkeypatch`` — keeps the leak out of any
+    test that runs afterwards.
     """
     train = train_module
+    feats = str(tmp_path / "features.csv")
+    monkeypatch.setattr(train, "FEATURES_PATH", feats)
     monkeypatch.setattr(train, "train", lambda ticker, **kwargs: "m-worker-folder")
-    assert train._train_one(("BBCA.JK", False, "features.csv", SCHEMA)) == \
+    assert train._train_one(("BBCA.JK", False, feats, SCHEMA)) == \
         ("BBCA.JK", True, "m-worker-folder")
 
     def _boom(*args, **kwargs):
@@ -396,8 +520,10 @@ def test_the_worker_hands_the_parent_the_folder(train_module, monkeypatch, caplo
 
     monkeypatch.setattr(train, "train", _boom)
     with caplog.at_level("ERROR"):
-        assert train._train_one(("BBCA.JK", False, "features.csv", SCHEMA)) == \
+        assert train._train_one(("BBCA.JK", False, feats, SCHEMA)) == \
             ("BBCA.JK", False, None)
+
+    assert train.FEATURES_PATH == feats, "the worker's global must stay inside tmp_path"
 
 
 def test_the_parent_maps_only_the_workers_that_produced_a_folder(train_module):
@@ -417,3 +543,42 @@ def test_the_parent_maps_only_the_workers_that_produced_a_folder(train_module):
     ])
 
     assert entries == {"BBCA.JK": "m-aaa", "TLKM.JK": "m-bbb"}
+
+
+def test_one_ticker_failing_does_not_abort_the_sequential_run(
+        train_module, monkeypatch, caplog):
+    """The sequential loop contains a ticker's failure, as the parallel path does.
+
+    ``plot_feature_importance`` raises *after* ``log_model`` for a model with
+    fewer than ``top_n`` features, so one ticker's plotting bug would otherwise
+    propagate out of the loop, kill the process before ``write_model_index`` is
+    ever reached, and leave the index stale behind a run that logged models —
+    the parallel path already survives exactly this (``_train_one`` catches, the
+    parent keeps going).  Fixing the plot bug is not this task's; surviving it is.
+    """
+    train = train_module
+    attempted: list[str] = []
+
+    def _train(ticker, **kwargs):
+        attempted.append(ticker)
+        if ticker == "BBRI.JK":
+            raise ValueError("shape mismatch: objects cannot be broadcast")
+        if ticker == "BMRI.JK":
+            return None                    # skipped (too few rows) or CI mode
+        return f"m-{ticker}"
+
+    monkeypatch.setattr(train, "train", _train)
+
+    with caplog.at_level("ERROR"):
+        entries = train._train_sequentially(
+            ["BBCA.JK", "BBRI.JK", "BMRI.JK", "TLKM.JK"],
+            tune=False, feature_columns=SCHEMA,
+            use_shap=True, expand_cv=True, blend_lgbm=True,
+        )
+
+    assert attempted == ["BBCA.JK", "BBRI.JK", "BMRI.JK", "TLKM.JK"], \
+        "a failing ticker must not end the loop"
+    assert entries == {"BBCA.JK": "m-BBCA.JK", "TLKM.JK": "m-TLKM.JK"}
+    assert any(
+        r.levelname == "ERROR" and "BBRI.JK" in r.getMessage() for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]

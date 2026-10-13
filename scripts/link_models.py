@@ -28,7 +28,15 @@ def link_models():
 
     created = 0
     for ticker, info in ticker_to_model.items():
-        src_folder = info['model_folder']
+        # Two entry shapes are in the wild.  F10's writer stores the bare folder
+        # name; the pre-F10 rebuild stored {"model_folder": ..., "match_score":
+        # ..., "n_features": ...}, whose extra fields served the deleted
+        # feature-overlap guess.  Both are read here — this is the only reader
+        # outside model_store, which normalises the same pair.
+        src_folder = info.get('model_folder') if isinstance(info, dict) else info
+        if not isinstance(src_folder, str) or not src_folder:
+            print(f"  SKIP {ticker}: index entry names no model folder ({info!r})")
+            continue
         src_path = os.path.join(MODELS_DIR, src_folder)
         dst_path = os.path.join(BY_TICKER_DIR, ticker)
 
