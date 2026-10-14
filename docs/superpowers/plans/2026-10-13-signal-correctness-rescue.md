@@ -879,6 +879,45 @@ git add mlruns/1/models/model_index.json
 git commit -m "chore: retrain 45 models on raw features with enforced schemas"
 ```
 
+### Task 2.4: Make a fundamentals outage visible (added during execution)
+
+**Files:**
+- Modify: `src/features/fetchers.py`, `src/features/pipeline.py`, `src/serve.py`
+- Test: `tests/test_fundamentals_visible.py`
+
+**Interfaces:**
+- Consumes: Task 1.9's `degraded` mechanism and its `fetch_news_sentiment_status` precedent.
+- Produces: `fetch_fundamentals_status(ticker) -> (dict, bool, str | None)` mirroring the sentiment seam; `PredictResponse.degraded` naming `"fundamentals"` when the source failed; `dividend_yield` no longer fabricated.
+
+**Why this task exists.** Task 2.3's retrain made the 60-name feature contract unconditional for all 45 models, which turned two latent gaps into certain ones. Both are the same "a safe default indistinguishable from a real value" family as F8:
+
+1. `src/features/fetchers.py` returns `{key: np.nan}` for all eight fundamental keys when `yf.Ticker(t).info` raises. `pipeline.inject_macro_features` materialises the five schema-required fundamentals as `NaN`, and `align_to_schema` checks **presence only** — so a Yahoo `.info` outage returns HTTP 200 with a real probability computed on five missing inputs and `degraded: []`. `usdidr_return` is a third instance and *is* in the schema.
+2. `src/features/fetchers.py:48` reads `info.get("dividendYield", np.nan) or 0.0`. `np.nan` is truthy, so the fallback fires on `None` — yfinance's "unknown" — turning an unknown into a fabricated `0.0` in a consumed column. XGBoost reads `0.0` and `NaN` differently.
+
+- [ ] **Step 1: Write the failing test**
+
+Drive the **real** fetcher with a `yf.Ticker(...).info` that raises, then assert the response carries `degraded` containing `"fundamentals"` and a `warning` naming the reason; separately assert an explicit `None` dividend yield reaches the frame as `NaN`, not `0.0`.
+
+- [ ] **Step 2: Confirm RED**
+
+Run: `.\venv\Scripts\python.exe -m pytest tests/test_fundamentals_visible.py -v`
+Expected: FAIL — no status seam exists and `dividend_yield` reads `0.0`.
+
+- [ ] **Step 3: Implement the seam and drop the fabrication**
+
+Add `fetch_fundamentals_status` returning `(values, available, reason)` in the sentiment seam's shape, so callers read a status rather than catching an exception. Keep `fetch_fundamentals` working for existing callers. Drop the `or 0.0`. Thread availability into `degraded` from the serving path.
+
+- [ ] **Step 4: Confirm GREEN and that the success path is unchanged**
+
+Run the new test, then the full suite. A healthy `.info` must still yield the same eight values and `degraded == []`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/features/fetchers.py src/features/pipeline.py src/serve.py tests/test_fundamentals_visible.py
+git commit -m "fix: make a fundamentals outage visible and stop fabricating dividend yield"
+```
+
 ---
 
 ## Phase 3 — Re-measure (decision gate)
