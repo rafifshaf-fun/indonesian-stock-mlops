@@ -61,22 +61,36 @@ _FUNDAMENTAL_FIELDS = {
     "profit_margins": "profitMargins",
 }
 
-#: Why an empty ``.info`` is reported as its own failure mode rather than as
-#: "no fundamentals".  Yahoo answers 200 with an empty body for a delisted or
-#: unknown symbol, and it raises for none of the cases here — which is what makes
-#: an ``except``-based detector structurally insufficient.
-NO_FUNDAMENTALS = "Yahoo returned an empty response for .info — no fundamental data published"
+#: How a response with no fundamental data is reported.  Named for the *fields*,
+#: not for an empty body: the body is never empty.  Yahoo answers 200 with an
+#: empty ``result`` list for a delisted or unknown symbol and raises for none of
+#: these cases — which is what makes an ``except``-based detector structurally
+#: insufficient — and the real ``Quote.info`` property then appends a
+#: complementary key of its own, so the body has a key and no fundamentals.  The
+#: ASCII part comes first and the non-ASCII dash last, as in the sentiment
+#: overlay's warning: on a console whose encoding cannot represent the dash the
+#: tail can render as replacement characters, and the reason is the part an
+#: operator has to be able to read.
+NO_FUNDAMENTAL_FIELDS = (
+    "Yahoo returned no fundamental data for .info - none of the eight fields "
+    "was published"
+)
 
 
 def _published(value):
     """One field's value, with yfinance's ``None`` read as an absent measurement.
 
-    ``None`` cannot be passed through to the frame: ``inject_macro_features``
-    assigns each field with ``df[col] = val``, and assigning ``None`` **deletes
-    the column**.  A schema-required fundamental would then be *absent* rather
-    than NaN, and ``align_to_schema`` raises ``FeatureSchemaError`` on an absent
-    column — so the request would answer a 500 where it used to answer a silent
-    200.  Both are wrong; ``NaN`` is the honest one, and it is the value a field
+    ``None`` cannot be passed through to the frame.  ``inject_macro_features``
+    assigns each field with ``df[col] = val``, and in pandas 2.3.3 assigning
+    ``None`` **creates an object-dtype column** rather than deleting one — and an
+    object column is not numeric, so
+    ``serve.build_inference_features``'s ``select_dtypes(include=[np.number])``
+    (``src/serve.py:819``) drops it before the frame ever reaches
+    ``align_to_schema``.  A schema-required fundamental would then be *absent*
+    when the contract is enforced, and ``align_to_schema``
+    (``src/features/schema.py:218``) raises ``FeatureSchemaError`` — so the
+    request would answer a 500 where it used to answer a silent 200.  Both are
+    wrong; ``NaN`` is the honest one, stays numeric, and is the value a field
     yfinance never published has always reached the fleet as.
     """
     return np.nan if value is None else value
@@ -152,14 +166,36 @@ def fetch_fundamentals_status(ticker: str) -> tuple[dict, bool, Optional[str]]:
         measurement, and ``reason`` then names the failure.  A plain 3-tuple
         rather than a class, mirroring
         :func:`fetch_news_sentiment_status`.
+
+    The "no data" test is on the **fetched fields**, not on the dict:
+
+    * ``not info`` — what stood here — is not a detector for this mode.  The real
+      ``Quote.info`` property (``yfinance/scrapers/quote.py:502-508``) runs
+      ``_fetch_complementary()`` immediately after ``_fetch_info()``, and that
+      function writes a key of its own even when there is nothing to write:
+      ``self.info[k] = None`` (``quote.py:755-760``).  An empty response therefore
+      arrives as ``{'trailingPegRatio': None}``, whose truthiness is ``True`` —
+      measured against the real ``Quote`` fed an in-memory ``YfData``, not
+      inferred.  The predicate returned ``available=True`` with all eight fields
+      ``NaN``, five of them schema-required: exactly the invisible outage this
+      seam exists to remove, surviving on the one shape the brief names.
+    * ``any(field in info ...)`` asks the question the caller actually has — *was
+      any fundamental field published?* — and it is a question about the eight
+      fields rather than about yfinance's bookkeeping, so it holds whatever else
+      the library decides to append to the body.
+
+    A field that is *present* but ``None`` counts as an answer to that question:
+    yfinance publishing ``dividendYield: None`` is a measurement attempt that
+    returned nothing, not a failed fetch, so this does not conflate "field
+    unpublished" with "the source is down".
     """
     try:
         info = yf.Ticker(ticker).info
     except Exception as e:
         return {k: np.nan for k in FUNDAMENTAL_KEYS}, False, _fundamentals_failure_reason(e)
 
-    if not info:
-        return {k: np.nan for k in FUNDAMENTAL_KEYS}, False, NO_FUNDAMENTALS
+    if not any(field in info for field in _FUNDAMENTAL_FIELDS.values()):
+        return {k: np.nan for k in FUNDAMENTAL_KEYS}, False, NO_FUNDAMENTAL_FIELDS
 
     return _fundamental_values(info), True, None
 

@@ -6,9 +6,11 @@ retrain, which gave all 45 models a 60-name feature contract that
 unconditionally requires five fundamentals and ``usdidr_return``:
 
 1. **A Yahoo ``.info`` outage was invisible.**  ``fetch_fundamentals`` caught
-   every exception and returned ``{key: np.nan}`` for the eight fields, and an
-   ``.info`` that answers with an empty dict produced the *same* eight NaNs
-   with no exception at all.  ``pipeline.inject_macro_features`` then
+   every exception and returned ``{key: np.nan}`` for the eight fields, and a
+   ``.info`` that answered with *no fundamentals at all* — the real shape of
+   which is ``{'trailingPegRatio': None}``, appended by
+   ``Quote._fetch_complementary`` after an empty response — produced the *same*
+   eight NaNs with no exception at all.  ``pipeline.inject_macro_features`` then
    materialises the five schema-required fundamentals as constant-NaN columns,
    and ``align_to_schema`` checks **presence only** — so the request answered
    HTTP 200, a real probability, and ``degraded: []``.  Nothing in the response
@@ -26,10 +28,15 @@ failure mode, so the serving path reads a status instead of catching an
 exception the real code never raises.  ``degraded`` names ``"fundamentals"``
 and the reason is logged at ``warning``.
 
-Every test here is offline and drives the **real** fetcher: only ``yf.Ticker``
-(the network) is stood in for, never ``fetch_fundamentals`` or the seam itself.
-A stub that replaces the fetcher could return whatever shape the test liked,
-which is precisely how the F8 tests were vacuous before Task 1.9 rewrote them.
+Every test here is offline and drives the **real** fetcher: only the transport is
+stood in for, never ``fetch_fundamentals`` or the seam itself.  A stub that
+replaces the fetcher could return whatever shape the test liked, which is
+precisely how the F8 tests were vacuous before Task 1.9 rewrote them — and it is
+also how the *first* version of the empty-response test here was vacuous: it
+stubbed ``.info`` to ``{}``, a body the real property does not produce, so the
+defect survived a test that claimed to cover it.  The no-data mode is therefore
+driven through the real ``Quote``/``Ticker`` machinery
+(``_no_fundamentals_ticker``) and its body is asserted, not assumed.
 ``fetch_fundamentals``' four existing stubs elsewhere in the suite are moved to
 the same seam for the same reason: with the status seam in the serving path, a
 stub on the value-only function would be dead code and the tests would silently
@@ -51,6 +58,12 @@ import numpy as np
 import pandas as pd
 import pytest
 import requests
+import yfinance as yf
+
+#: The real ``yf.Ticker``, captured before any test installs a stand-in.  See
+#: ``_no_fundamentals_ticker`` for why the stand-ins must not subclass the
+#: *current* attribute.
+_REAL_TICKER = yf.Ticker
 
 # ``fastapi.testclient`` → ``starlette.testclient`` emits a collection-time
 # ``StarletteDeprecationWarning`` when ``httpx2`` is absent.  A module
@@ -127,7 +140,9 @@ REJECTED_REASON = "HTTP 401"
 UNPARSEABLE_REASON = "not JSON"
 DEAD_ENDPOINT_REASON = "ConnectionError"
 UNKNOWN_REASON = "RuntimeError"
-EMPTY_RESPONSE_REASON = "empty response"
+#: Named for the *fields*, not for an empty body: the body yfinance produces is
+#: not empty (see ``_mode_empty_response`` below).
+EMPTY_RESPONSE_REASON = "no fundamental data"
 
 #: ``serve.build_inference_features`` reads this module-level path, and the
 #: ``universe_context`` fixture below replaces the loader that reads it.
@@ -145,9 +160,13 @@ def _info_ticker(monkeypatch, info):
     object, so patching its ``Ticker`` attribute here is visible to both paths —
     and ``fetch_fundamentals``/``fetch_fundamentals_status`` run for real, which
     is the point.  Nothing in this module replaces the fetcher itself.
-    """
-    import yfinance as yf
 
+    A literal body is the right stand-in for every mode whose shape the *library*
+    does not decide — a rate limit, a rejected key, a dead endpoint, an
+    unparseable body.  It is the wrong one for the empty-200 mode, whose body
+    ``Quote.info`` builds itself: that mode is driven by
+    ``_no_fundamentals_ticker`` instead.
+    """
     class _Ticker:
         def __init__(self, ticker):
             self.ticker = ticker
@@ -157,6 +176,87 @@ def _info_ticker(monkeypatch, info):
             if isinstance(info, Exception):
                 raise info
             return dict(info)
+
+    monkeypatch.setattr(yf, "Ticker", _Ticker)
+
+
+class _EmptyYahoo:
+    """An in-memory Yahoo whose every fundamentals endpoint answers with nothing.
+
+    Duck-typed against the two ``YfData`` methods ``Quote`` actually uses —
+    ``get_raw_json`` and ``cache_get`` — rather than a mock of ``Quote``, so that
+    the real ``Quote.info`` property runs: ``_fetch_info``,
+    ``_fetch_additional_info`` and ``_fetch_complementary``, in that order,
+    including the step that appends the complementary key to the body.  It is the
+    *shape the production library produces* that this file's tests have to
+    exercise, and only the library can produce it.
+
+    Subclassing ``YfData`` would be wrong for a second reason beyond this one:
+    ``YfData`` is a singleton, so a subclass instance would be handed back to
+    other code that asks for one.
+    """
+
+    def __init__(self, *args, **kwargs):
+        # ``YfData.__init__`` builds a requests session; nothing here talks to a
+        # network, so the session is not needed.
+        pass
+
+    @staticmethod
+    def _json(payload):
+        import types
+
+        return types.SimpleNamespace(text=json.dumps(payload))
+
+    def get_raw_json(self, url, params=None, timeout=30):
+        """``quoteSummary`` and v7 ``quote`` both answer 200 with ``result: []``."""
+        if "quoteSummary" in url:
+            return {"quoteSummary": {"result": []}}
+        if "/v7/finance/quote" in url:
+            return {"quoteResponse": {"result": []}}
+        raise AssertionError(f"unexpected get_raw_json url: {url}")
+
+    def cache_get(self, url, params=None, timeout=30):
+        """The fundamentals-timeseries body, *lacking* ``trailingPegRatio``."""
+        if "fundamentals-timeseries" in url:
+            return self._json(
+                {
+                    "timeseries": {
+                        "result": [{"meta": {"type": ["trailingPegRatio"]}}],
+                        "error": None,
+                    }
+                }
+            )
+        raise AssertionError(f"unexpected cache_get url: {url}")
+
+
+def _no_fundamentals_ticker(monkeypatch):
+    """``yf.Ticker`` whose ``.info`` is what the real library returns for no data.
+
+    The measured body is ``{'trailingPegRatio': None}``: ``_fetch_info`` leaves
+    ``_info`` as ``{}`` (both result lists are empty), and ``info`` then runs
+    ``_fetch_complementary`` (``yfinance/scrapers/quote.py:502-508``), which
+    writes ``self.info[k] = None`` for its one key when the timeseries carries no
+    value for it (``quote.py:755-760``).  The body is therefore **truthy**, which
+    is why the predicate that stood here — ``if not info`` — read this response as
+    healthy with all eight fields ``NaN``, five of them schema-required.
+
+    A real ``yf.Ticker`` whose ``get_info`` returns
+    ``Quote(<in-memory YfData>).info``: ``.info`` is the real property calling the
+    real ``_fetch_info``/``_fetch_complementary``, so the body under test is one
+    the *library* built.  Only the transport is in memory.
+
+    The stand-in's base is :data:`_REAL_TICKER`, captured when this module was
+    imported, rather than whatever ``yf.Ticker`` happens to be at call time.
+    Several helpers in this module install their own ``yf.Ticker``, and pytest's
+    ``monkeypatch`` restores them in reverse order — so a class that subclassed the
+    *current* attribute would layer stub on stub, and the resulting chain is not
+    the library anymore.
+    """
+    from yfinance.scrapers.quote import Quote
+
+    class _Ticker(_REAL_TICKER):
+        def get_info(self, proxy=None):
+            return Quote(_EmptyYahoo(), self.ticker).info
 
     monkeypatch.setattr(yf, "Ticker", _Ticker)
 
@@ -200,7 +300,25 @@ def _mode_unknown(monkeypatch):
 
 
 def _mode_empty_response(monkeypatch):
-    """The silent mode: Yahoo answers 200 with an empty body and raises nothing."""
+    """The silent mode: a 200 that raises nothing and publishes no fundamentals.
+
+    Driven through the **real** ``Quote``/``Ticker`` machinery, because this mode
+    is the one whose body the library builds: what arrives is
+    ``{'trailingPegRatio': None}``, not ``{}``.  A hand-built ``{}`` would let a
+    predicate that depends on dict emptiness pass — which is exactly the defect
+    the review found here.
+    """
+    _no_fundamentals_ticker(monkeypatch)
+
+
+def _mode_hand_built_empty_body(monkeypatch):
+    """The conservative case: a body that is literally ``{}``.
+
+    The library does not produce this shape once ``_fetch_complementary``
+    succeeds, so it is not the mode under test — but a body with no keys at all
+    must still be read as unavailable, and a predicate keyed on the eight fetched
+    fields has to answer that without being asked to.
+    """
     _info_ticker(monkeypatch, {})
 
 
@@ -216,15 +334,25 @@ def _modes():
 #: Every production failure mode of the fundamentals fetch.  Only the first five
 #: raise; the last one is the mode that makes the old ``except``-based detection
 #: structurally insufficient — a caller that caught an exception would see a
-#: successful fetch and eight NaNs.
+#: successful fetch and eight NaNs.  The last *two* are the same mode, driven at
+#: the two shapes it can arrive in: the real one (a truthy body carrying only
+#: ``trailingPegRatio``) and the conservative one (no keys at all).
 FAILURE_MODES = [
     pytest.param(_mode_rate_limited, RATE_LIMITED_REASON, id="rate-limited"),
     pytest.param(_mode_rejected, REJECTED_REASON, id="rejected-key"),
     pytest.param(_mode_dead_endpoint, DEAD_ENDPOINT_REASON, id="dead-endpoint"),
     pytest.param(_mode_unparseable, UNPARSEABLE_REASON, id="unparseable-body"),
     pytest.param(_mode_unknown, UNKNOWN_REASON, id="unknown-exception"),
-    pytest.param(_mode_empty_response, EMPTY_RESPONSE_REASON, id="empty-response"),
+    pytest.param(_mode_empty_response, EMPTY_RESPONSE_REASON,
+                 id="no-fundamental-fields"),
+    pytest.param(_mode_hand_built_empty_body, EMPTY_RESPONSE_REASON,
+                 id="empty-body"),
 ]
+
+#: The two failure modes above that are the *same* reason, so the
+#: "every mode has its own reason" test counts distinct modes rather than distinct
+#: strings.
+SAME_REASON_MODES = 2
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -261,14 +389,55 @@ def test_every_failure_mode_has_its_own_reason(monkeypatch):
     import features.fetchers as fetchers
 
     reasons = {}
-    for prepare, _expected in _modes():
+    for prepare, expected in _modes():
         prepare(monkeypatch)
         _values, available, reason = fetchers.fetch_fundamentals_status("BBCA.JK")
         assert available is False
-        reasons[reason] = reasons.get(reason, 0) + 1
+        # The reason is pinned per mode, not merely counted: the two shapes of the
+        # no-data mode share one reason *because they are one mode*, and every
+        # other mode's reason has to carry its own text.
+        assert expected in reason, (expected, reason)
+        # ``expected``, not ``reason``: the two empty-body spellings collapse to
+        # one entry here, which is the point — they are the same failure.
+        reasons[expected] = reasons.get(expected, 0) + 1
 
-    assert len(reasons) == len(FAILURE_MODES), reasons
-    assert all(count == 1 for count in reasons.values()), reasons
+    assert len(reasons) == len(FAILURE_MODES) - SAME_REASON_MODES + 1, reasons
+    assert reasons[EMPTY_RESPONSE_REASON] == SAME_REASON_MODES, reasons
+    assert all(
+        count == 1 for key, count in reasons.items() if key != EMPTY_RESPONSE_REASON
+    ), reasons
+
+
+def test_the_real_empty_info_body_is_truthy_and_carries_no_fundamentals(monkeypatch):
+    """The shape the library produces, measured — not a dict this test built.
+
+    The review's finding, as an assertion: an in-memory Yahoo whose
+    ``quoteSummary`` and v7-quote responses both carry ``result: []``, and whose
+    timeseries body lacks ``trailingPegRatio``, produces the body
+    ``{'trailingPegRatio': None}``.  It is truthy, so a predicate keyed on dict
+    emptiness calls a fundamentals-free 200 healthy — and the eight fields are
+    NaNs with five of them schema-required.  The seam must read the *fields*.
+
+    Also pins that the reason names the fields rather than an "empty response":
+    the response is not empty, which is why the old wording sent an operator
+    looking for a body that never arrives.
+    """
+    import features.fetchers as fetchers
+
+    _no_fundamentals_ticker(monkeypatch)
+    info = yf.Ticker("BBCA.JK").info
+
+    # The premise of the whole test: the body yfinance really builds here is not
+    # empty, so ``not info`` cannot be the detector.
+    assert info == {"trailingPegRatio": None}, info
+    assert bool(info) is True, info
+
+    values, available, reason = fetchers.fetch_fundamentals_status("BBCA.JK")
+
+    assert available is False, values
+    assert reason == EMPTY_RESPONSE_REASON or EMPTY_RESPONSE_REASON in reason, reason
+    assert list(values) == list(FUNDAMENTAL_KEYS), values
+    assert all(pd.isna(v) for v in values.values()), values
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -341,9 +510,48 @@ def _client_for(tmp_path, monkeypatch, schema, frame=None):
     # driving and the ``.info`` stub below would never be reached — which is
     # exactly how a stale 0.0 (or a stale NaN) can be measured as if it were
     # this request's fetch.
-    serve.model_cache.clear()
-    serve._fundamentals_cache.clear()
+    #
+    # ``monkeypatch.setattr`` rather than ``dict.clear()``: clearing mutates
+    # shared state that no fixture restores, so every *later* test in the session
+    # would inherit the emptied dict — the session-leak anti-pattern this suite
+    # documents on ``serve.model_cache`` in
+    # ``tests/test_audit_regressions.py::_serving_client``.  Replacing the object
+    # gives this test a clean cache and restores the original, contents and all,
+    # at teardown.
+    monkeypatch.setattr(serve, "model_cache", {})
+    monkeypatch.setattr(serve, "_fundamentals_cache", {})
     return TestClient(serve.app)
+
+
+@pytest.fixture
+def macro_cache(monkeypatch):
+    """A warm, healthy daily USD/IDR cache — and the day's outcome that goes with it.
+
+    ``inject_macro_features`` writes ``usdidr_return = 0.0`` when the frame is
+    absent, and the serving paths report that in ``degraded`` as ``"macro"`` — so
+    a test that asserts ``degraded == []`` has to install the state a *healthy*
+    macro fetch leaves behind, exactly as the ``healthy_news`` fixture does for
+    sentiment.  Without it such an assertion would be measuring this test
+    process's cold macro cache instead of the code under test.
+
+    ``_macro_outcomes`` is patched rather than left alone because
+    ``_cache_date`` is pinned to 1970 by ``_client_for``: the outcome is the
+    fetch's own record, and the test states it directly rather than depending on
+    which day the suite happens to run.
+    """
+    import serve
+    from datetime import date as _date
+
+    index = pd.bdate_range("2024-01-01", periods=60)
+    monkeypatch.setattr(serve, "_usdidr_cache", pd.DataFrame(
+        {
+            "usdidr_rate": np.linspace(15_000.0, 15_600.0, len(index)),
+            "usdidr_return": np.full(len(index), 0.0004),
+        },
+        index=index,
+    ))
+    monkeypatch.setattr(serve, "_macro_outcomes", {str(_date.today()): None})
+    return serve._usdidr_cache
 
 
 def _capture_model_input(monkeypatch, serve) -> dict:
@@ -409,6 +617,38 @@ def test_the_outage_names_the_reason_in_the_response_path(client, monkeypatch):
 
     assert response.status_code == 200, response.text
     assert "fundamentals" in response.json()["degraded"], response.json()
+
+
+def test_a_contract_with_no_fundamentals_gets_no_constant_nan_claim(
+        tmp_path, monkeypatch, caplog):
+    """The warning is about *this* contract, so a contract without them says less.
+
+    ``_mark_fundamentals`` used to assert unconditionally that five
+    schema-required inputs were constant NaN.  That is true of the current fleet
+    and false of any model trained without fundamentals, and a warning that is
+    false for a request is a warning an operator learns to distrust.  The
+    ``degraded`` entry stays either way — a failed fetch is a failed fetch — so
+    this test pins both halves at once: the softer wording *and* the entry that
+    must not have been softened away with it.
+    """
+    import serve
+
+    client = _client_for(tmp_path, monkeypatch, ["ret_1d"], _price_frame())
+    _info_ticker(monkeypatch, {})
+    assert not (set(["ret_1d"]) & set(serve.FUNDAMENTAL_KEYS)), "anti-vacuity"
+
+    with caplog.at_level(logging.WARNING):
+        caplog.clear()
+        response = client.post("/predict", json={"ticker": "BBCA.JK"})
+
+    assert response.status_code == 200, response.text
+    assert "fundamentals" in response.json()["degraded"], response.json()
+
+    lines = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    fundamentals = [m for m in lines if "Fundamentals unavailable" in m]
+    assert len(fundamentals) == 1, lines
+    assert "contract names no fundamental column" in fundamentals[0], fundamentals
+    assert "five schema-required inputs" not in fundamentals[0], fundamentals
 
 
 def test_the_degradation_survives_the_daily_fundamentals_cache(client, monkeypatch):
@@ -651,12 +891,18 @@ def healthy_news(monkeypatch, tmp_path):
 
 
 def test_a_healthy_request_is_not_degraded_and_carries_real_fundamentals(
-        client, monkeypatch, caplog, healthy_news):
+        client, monkeypatch, caplog, healthy_news, macro_cache):
     """R4 at the response: a healthy ``.info`` gives ``degraded == []``.
 
     The value also reaches the model input: ``pe_ratio`` is the one column in the
     stub contract, and it must carry the fetched 18.4 rather than a NaN or a
     fabricated default.
+
+    ``macro_cache`` is part of "healthy" now that a macro outage is named too: a
+    response is only ``degraded == []`` when every component it reports on is
+    genuinely reporting itself healthy, and asserting the empty list against a
+    cold macro cache would be asserting that the macro check is silent rather
+    than that the request is clean.
     """
     import serve
 
@@ -676,6 +922,21 @@ def test_a_healthy_request_is_not_degraded_and_carries_real_fundamentals(
     assert [m for m in noisy if "Fundamentals unavailable" in m] == [], noisy
 
 
+def test_a_healthy_request_logs_no_macro_warning(
+        client, monkeypatch, caplog, healthy_news, macro_cache):
+    """The negative control: a healthy macro fetch names nothing and warns nothing."""
+    _info_ticker(monkeypatch, HEALTHY_INFO)
+
+    with caplog.at_level(logging.WARNING):
+        caplog.clear()
+        response = client.post("/predict", json={"ticker": "BBCA.JK"})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["degraded"] == [], response.json()
+    noisy = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert [m for m in noisy if "macro" in m] == [], noisy
+
+
 def test_the_testclient_import_wrapper_hides_nothing_else():
     """The one wrapped import captured the one known message and nothing more."""
     assert set(_IMPORT_WARNINGS) <= {EXPECTED_IMPORT_WARNING}, _IMPORT_WARNINGS
@@ -683,14 +944,77 @@ def test_the_testclient_import_wrapper_hides_nothing_else():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 2D — the third instance, measured: ``usdidr_return``
+# 2D — the third instance: ``usdidr_return`` is *named*, and deliberately kept
 # ═══════════════════════════════════════════════════════════════════════════════
 # ``pipeline.inject_macro_features`` writes ``usdidr_rate = NaN`` and
 # ``usdidr_return = 0.0`` when the USD/IDR fetch failed — and ``usdidr_return`` is
 # in all 45 schemas, so it is the same question the ``dividend_yield`` fix
-# answers.  The test below *measures* the current behaviour instead of assuming
-# it, so the report's determination rests on a run rather than on a reading, and
-# so a future change to this branch fails here rather than passing unremarked.
+# answers.  Task 2.4's ruling splits it in two:
+#
+# * the **value** stays ``0.0``.  The committed training artefact carries real
+#   ``usdidr_return`` values, so writing ``NaN`` at serving time would introduce a
+#   *fresh* train/serve skew in a column the fleet consumes; changing it needs a
+#   feature rebuild plus retrain (Phase 4, with the deferred ICT fix).
+# * the **failure is made visible**: the serving paths put ``"macro"`` in
+#   ``degraded`` and log the reason at ``warning``, so the fabricated ``0.0`` can
+#   no longer be read as a measurement of a quiet rupiah.
+#
+# Both halves are pinned below, and the rationale lives in a comment at the
+# branch itself (``src/features/pipeline.py``, the ``else`` on the USD/IDR join)
+# so the residual is explicit at the code rather than only in this report.
+
+
+def _macro_outage(monkeypatch, reason=None):
+    """The state a *failed* USD/IDR fetch leaves: no usable frame, its outcome recorded."""
+    import serve
+    from datetime import date as _date
+
+    monkeypatch.setattr(serve, "_usdidr_cache",
+                        pd.DataFrame(columns=["usdidr_rate", "usdidr_return"]))
+    monkeypatch.setattr(
+        serve, "_macro_outcomes",
+        {str(_date.today()): reason or serve.MACRO_NO_FRAME},
+    )
+    return serve
+
+
+def test_a_macro_outage_is_named_in_degraded_and_the_zero_is_kept(
+        tmp_path, monkeypatch, caplog, healthy_news):
+    """R2's ruling, both halves at the response: named, and still ``0.0``.
+
+    ``"usdidr_return"`` is the contract here, so the frame the model is fed
+    carries the fallback and the assertion on it is about the *model input*
+    rather than about an intermediate.  The response must carry ``"macro"`` in
+    ``degraded`` and log the reason at ``warning`` — the same shape the
+    fundamentals half uses — and the value must still be ``0.0``, because that is
+    the ruling: visibility now, the value change with the Phase 4 rebuild that
+    can also retrain.
+    """
+    import serve
+
+    # A client of this test's own, with ``usdidr_return`` as the contract: a
+    # column a schema does not name never reaches the model input, so the
+    # anti-regression assertion below would otherwise measure nothing.
+    client = _client_for(tmp_path, monkeypatch, ["usdidr_return"], _price_frame())
+
+    _info_ticker(monkeypatch, HEALTHY_INFO)
+    _macro_outage(monkeypatch)
+    seen = _capture_model_input(monkeypatch, serve)
+
+    with caplog.at_level(logging.WARNING):
+        caplog.clear()
+        response = client.post("/predict", json={"ticker": "BBCA.JK"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert "macro" in body["degraded"], body
+    # The anti-regression half of the ruling: the value is *not* substituted.
+    assert "usdidr_return" in seen, seen
+    assert seen["usdidr_return"] == 0.0, seen
+
+    lines = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("USD/IDR" in line and "0.0" in line for line in lines), lines
+
 
 def test_usdidr_return_fallback_fabricates_a_zero():
     """Measured: an absent USD/IDR frame becomes a fabricated ``0.0`` return.
@@ -701,9 +1025,13 @@ def test_usdidr_return_fallback_fabricates_a_zero():
     ``0.0``.  The first loses a row; the second claims the rupiah did not move
     on a day nobody measured it.
 
-    This pins the finding, not its acceptance: it is the evidence the task's R2
-    determination rests on, and ``usdidr_return``'s fix is a separate, tested
-    change (see the report's §R2).
+    **This pins the residual, not its acceptance.**  Task 2.4's controller ruling
+    kept the value and required only that the failure be visible (see
+    ``test_a_macro_outage_is_named_in_degraded_and_the_zero_is_kept`` above and
+    the comment at the branch); replacing the ``0.0`` with ``NaN`` needs a feature
+    rebuild plus retrain plus the same Phase 4 experiment as the deferred ICT fix.
+    This test fails the day that decision is taken, which is what makes the
+    residual explicit rather than implied.
     """
     import features.pipeline as p
 

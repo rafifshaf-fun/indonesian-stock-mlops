@@ -1304,14 +1304,18 @@ def _serving_client(tmp_path, monkeypatch):
     monkeypatch.setattr(
         serve, "load_best_model", lambda ticker: (_StubModel(), list(SCHEMA))
     )
-    # Task 2.4: ``/predict`` resolves fundamentals before the cache is consulted
-    # (the status has to travel with the values, or a later request would report
-    # a failed fetch as healthy), and this suite's network guard makes
-    # ``yf.Ticker`` *raise* — so without a stand-in here the request would
-    # legitimately report ``degraded: ["fundamentals"]`` and this test's healthy
-    # direction would be measuring the guard rather than the sentiment seam.  No
-    # values are needed: ``SCHEMA`` is ``["rsi"]``, so no fundamental column is in
-    # this model's contract.
+    # Task 2.4: the serving path resolves fundamentals through
+    # ``serve.get_fundamentals`` — the status seam, because the eight values
+    # cannot say whether they are a measurement.  It resolves them *inside* the
+    # cache-hit branch (Task 2.4 fix round 1), not before the cache is consulted:
+    # a hit never builds features, so that branch is the only place its response
+    # can learn the status, and resolving outside it would make every miss pay
+    # for two ``.info`` calls.  This suite's network guard makes ``yf.Ticker``
+    # *raise*, so without a stand-in here the request would legitimately report
+    # ``degraded: ["fundamentals"]`` and this test's healthy direction would be
+    # measuring the guard rather than the sentiment seam.  No values are needed:
+    # ``SCHEMA`` is ``["rsi"]``, so no fundamental column is in this model's
+    # contract.
     monkeypatch.setattr(serve, "get_fundamentals", lambda ticker: ({}, True, None))
     # ``/predict`` adds ``refresh_daily_cache`` as a background task.  Pinning
     # the daily-cache date to today makes that task return immediately instead of
@@ -1658,6 +1662,17 @@ def _stub_batch_io(monkeypatch):
     # ``fetch_fundamentals`` stub produced (no values) plus the availability it
     # silently implied.
     monkeypatch.setattr(serve, "get_fundamentals", lambda ticker: ({}, True, None))
+    # Task 2.4 fix round 1: ``/predict/batch`` builds a frame, so it now also
+    # reports a macro outage (``pipe`` writes ``usdidr_return = 0.0`` with no
+    # USD/IDR frame, and the response names that under ``"macro"``).  These tests
+    # are about the *failure-response shape*, not about a cold macro cache, so
+    # the day's healthy outcome is stated here rather than inferred from whatever
+    # the surrounding session left on the module.
+    from datetime import date as _date
+
+    monkeypatch.setattr(serve, "_macro_outcomes", {str(_date.today()): None})
+    monkeypatch.setattr(serve, "_usdidr_cache", pd.DataFrame(
+        columns=["usdidr_rate", "usdidr_return"]))
 
 
 def test_batch_failure_is_error(tmp_path, monkeypatch):

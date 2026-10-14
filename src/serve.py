@@ -26,6 +26,11 @@ from features import (
     fetch_fundamentals_status, fetch_usdidr, fetch_fred_macro, fetch_bi_rate,
     load_data, load_ihsg_data, compute_cross_stock_features,
 )
+# The eight fundamental field names, for the one question a log line about them
+# has to be able to answer honestly: does *this* model's contract consume any of
+# them?  A contract that names none (a model trained without fundamentals) gets
+# no constant-NaN claim in its warning.
+from features.fetchers import FUNDAMENTAL_KEYS
 # The one builder both paths share (Task 1.2).  Imported from its own module
 # because features/__init__.py does not re-export it.
 from features.pipeline import build_features
@@ -37,6 +42,18 @@ from features.schema import FeatureSchemaError, align_to_schema
 from model_store import ModelNotFound, load_model_for, load_model_index
 
 logger = get_logger(__name__)
+
+#: The name ``PredictResponse.degraded`` carries for a failed USD/IDR macro
+#: fetch — its own component, not ``"fundamentals"``: the two go down for
+#: different reasons (``IDR=X`` versus ``.info``), on different endpoints, and an
+#: operator sent to the wrong one has lost the time the label was supposed to
+#: save.
+MACRO = "macro"
+
+#: Why a day's USD/IDR frame was unusable.  ``fetch_usdidr`` swallows its own
+#: failures and returns an empty frame, so "the source is down" and "the source
+#: answered with nothing" are the same state here and are named the same way.
+MACRO_NO_FRAME = "the USD/IDR fetch returned no usable frame"
 
 # ── Dynamic path resolution ──
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -462,6 +479,16 @@ _bi_cache = None
 #: cache would otherwise re-introduce one request later.
 _fundamentals_cache = {}
 
+#: ``str(date)`` -> ``Optional[str]``: the outcome of that day's USD/IDR macro
+#: fetch — ``None`` when it produced a usable frame, the reason when it did not.
+#: Written only by :func:`refresh_daily_cache`, and read by
+#: :func:`macro_degradation`, because the *outcome* is a fact about the fetch
+#: while ``_usdidr_cache is None`` merely means "the refresh has not run in this
+#: process" (an un-warmed, freshly started process) — and a fetch that has not
+#: happened is not an outage.  Keyed by day so yesterday's outcome cannot answer
+#: for today.
+_macro_outcomes: dict[str, Optional[str]] = {}
+
 
 def get_fundamentals(ticker: str) -> tuple[dict, bool, Optional[str]]:
     """``ticker``'s fundamentals for this process, with their availability.
@@ -507,8 +534,27 @@ def refresh_daily_cache():
         _fred_cache = fetch_fred_macro(start_date, end_date)
         _bi_cache = fetch_bi_rate(start_date, end_date)
         _cache_date = today
+        if _usdidr_cache is None or _usdidr_cache.empty \
+                or "usdidr_return" not in _usdidr_cache.columns:
+            # The call itself is wrapped in ``try/except`` inside
+            # ``fetch_usdidr`` and returns an *empty frame* on failure, so an
+            # outage is a 200-shaped empty frame and reaches here rather than the
+            # ``except`` below.  The outcome is recorded so the serving path can
+            # name it in ``degraded`` (R2): the value stays the fabricated 0.0 it
+            # has always been, but it can no longer be mistaken for a
+            # measurement.
+            _macro_outcomes[today] = MACRO_NO_FRAME
+            logger.warning(
+                "USD/IDR fetch for %s..%s returned no usable frame — "
+                "usdidr_rate is NaN and usdidr_return is the 0.0 fallback, "
+                "responses built from it will be marked degraded: %s",
+                start_date, end_date, MACRO_NO_FRAME,
+            )
+        else:
+            _macro_outcomes[today] = None
         logger.info("Daily Macro Cache Updated")
     except Exception as e:
+        _macro_outcomes[today] = f"daily macro cache refresh failed ({type(e).__name__}: {e})"
         logger.warning("Cache refresh failed: %s", e)
 
 def load_best_model(ticker: str) -> tuple[Any, list[str]]:
@@ -913,22 +959,34 @@ def _apply_sentiment_overlay(ticker: str, prob: float, background_tasks=None) ->
     }
 
 
+def _fundamentals_required(trained_cols: Optional[list[str]]) -> bool:
+    """Whether this model's contract consumes any of the eight fundamental fields."""
+    return bool(set(trained_cols or ()) & set(FUNDAMENTAL_KEYS))
+
+
 def _mark_fundamentals(degraded: list[str], ticker: str, available: bool,
-                       reason: Optional[str]) -> list[str]:
+                       reason: Optional[str],
+                       trained_cols: Optional[list[str]] = None) -> list[str]:
     """Name a fundamentals outage in ``degraded``, and log why.
 
-    Five of the eight fundamental fields are required by every model's persisted
-    contract (``pe_ratio``, ``dividend_yield``, ``market_cap``,
-    ``debt_to_equity``, ``return_on_equity``), and an unavailable ``.info``
-    materialises each as a constant-NaN column that ``align_to_schema`` accepts —
-    it checks *presence*, and a column of ``NaN`` is present.  The prediction is
-    therefore still returned, exactly as the sentiment overlay's is, and this
-    function is the only thing that makes it distinguishable from a healthy one
-    (Task 2.4).
+    ``pe_ratio``, ``dividend_yield``, ``market_cap``, ``debt_to_equity`` and
+    ``return_on_equity`` are required by the persisted contract of every model in
+    the current fleet, and an unavailable ``.info`` materialises each as a
+    constant-NaN column that ``align_to_schema`` accepts — it checks *presence*,
+    and a column of ``NaN`` is present.  The prediction is therefore still
+    returned, exactly as the sentiment overlay's is, and this function is the
+    only thing that makes it distinguishable from a healthy one (Task 2.4).
 
     ``available`` is read from the status seam, never inferred from the values:
     an outage and a healthy fetch of a ticker whose fields Yahoo does not publish
     produce the same eight NaNs, so there is nothing in the numbers to detect.
+
+    ``trained_cols`` is the contract the request is being served under.  The
+    warning names five constant-NaN inputs only when that contract actually names
+    a fundamental column — the claim is about *this* prediction, and a model
+    trained without fundamentals would otherwise be given a warning that is
+    false for it.  The ``degraded`` entry is unconditional: a failed fetch is a
+    failed fetch regardless of which columns the model reads.
 
     Returns:
         ``degraded`` with ``"fundamentals"`` appended when the source was
@@ -937,12 +995,68 @@ def _mark_fundamentals(degraded: list[str], ticker: str, available: bool,
     if available:
         return degraded
     degraded.append("fundamentals")
+    if _fundamentals_required(trained_cols):
+        logger.warning(
+            "Fundamentals unavailable (%s) for %s — five schema-required inputs "
+            "are constant NaN in this prediction, response marked degraded",
+            reason or "reason not reported", ticker,
+        )
+    else:
+        logger.warning(
+            "Fundamentals unavailable (%s) for %s — response marked degraded "
+            "(this model's contract names no fundamental column)",
+            reason or "reason not reported", ticker,
+        )
+    return degraded
+
+
+def macro_degradation() -> Optional[str]:
+    """Why the *current* serving frame was built without usable USD/IDR data.
+
+    ``pipeline.inject_macro_features`` writes ``usdidr_return = 0.0`` when the
+    USD/IDR frame is absent, and that column is in all 45 persisted schemas — so
+    a macro outage puts a fabricated "the rupiah did not move" into a
+    model-consumed input.  Task 2.4's ruling keeps the *value* (the committed
+    training artefact carries real values, so substituting ``NaN`` at serving
+    time would create a fresh train/serve skew in a column the fleet consumes;
+    changing it needs a feature rebuild and retrain) and makes the failure
+    *visible* instead: this returns the audit string, or ``None`` when the frame
+    is usable.
+
+    Reads the recorded outcome rather than the cache variable.  ``None`` means
+    the day's fetch has not run in this process — an un-warmed process, which is
+    not an outage — so a fresh start stays quiet; once
+    :func:`refresh_daily_cache` has run, the outcome is a fact and is reported
+    for the rest of the day.
+    """
+    outcome = _macro_outcomes.get(str(date.today()))
+    if outcome is None:
+        return None
+    return f"{outcome} - usdidr_return is the fabricated 0.0, usdidr_rate is NaN"
+
+
+def _mark_macro(degraded: list[str], ticker: str) -> list[str]:
+    """Name a macro outage in ``degraded``, and log why.
+
+    Called on the paths that *build* a frame (the ``/predict`` slow path and
+    ``/predict/batch``): a cache hit does not rebuild features, so no macro value
+    in that response is affected by today's fetch and naming an outage there
+    would be noise about a request that did not use the frame.
+
+    Extracted rather than inlined because this remains an *interim* mechanism:
+    when the ``0.0`` itself is replaced (Phase 4, with the ICT fix), this entry
+    and the ``warning`` go with it.
+    """
+    reason = macro_degradation()
+    if reason is None:
+        return degraded
+    degraded.append(MACRO)
     logger.warning(
-        "Fundamentals unavailable (%s) for %s — five schema-required inputs are "
-        "constant NaN in this prediction, response marked degraded",
-        reason or "reason not reported", ticker,
+        "USD/IDR macro data unavailable for %s - %s; the prediction is still "
+        "served and this response is marked degraded", ticker, reason,
     )
     return degraded
+
 
 @app.get("/cache")
 def cache_status():
@@ -980,8 +1094,6 @@ async def predict(request: PredictRequest, background_tasks: BackgroundTasks):
     On cache miss, downloads data + computes features (~5-15s).
     """
     try:
-        global _fundamentals_cache
-
         # 1. Trigger background cache refresh
         background_tasks.add_task(refresh_daily_cache)
 
@@ -1005,9 +1117,20 @@ async def predict(request: PredictRequest, background_tasks: BackgroundTasks):
             # Resolving it here instead of above the branch is also what keeps a
             # *miss* from paying for two ``.info`` calls: the slow path below
             # calls ``get_fundamentals`` once and uses both halves of the result.
-            _values, fundamentals_available, fundamentals_reason = get_fundamentals(
-                request.ticker
-            )
+            #
+            # ``to_thread``, like every other network call in this file: this is
+            # the *hit* path, so it is the documented sub-200ms one — and the
+            # documented hazard is exactly this shape (``build_inference_features``'s
+            # cross-stock comment above).  ``.info`` is several round-trips with
+            # yfinance's 30 s timeout and transient retries, and the hit path is
+            # reachable in routine operation after a restart: the prediction-cache
+            # DB persists across restarts and is keyed by ``date = today``, while
+            # ``_fundamentals_cache`` is in-process and warmup covers only five
+            # tickers — so the other 40 tickers' first request is a *hit* that
+            # would block the event loop for a whole fetch.  The values are still
+            # needed for nothing (the row holds them); only the status is read.
+            _values, fundamentals_available, fundamentals_reason = \
+                await asyncio.to_thread(get_fundamentals, request.ticker)
             # The stored row is keyed by column name and was written for exactly
             # this schema, so the only reconciliation is align_to_schema — the
             # same call the slow path makes.  Nothing here fills a shortfall:
@@ -1035,7 +1158,7 @@ async def predict(request: PredictRequest, background_tasks: BackgroundTasks):
                 drift_warning=False, drift_score=0.0,
                 degraded=_mark_fundamentals(
                     list(overlay["degraded"]), request.ticker,
-                    fundamentals_available, fundamentals_reason,
+                    fundamentals_available, fundamentals_reason, trained_cols,
                 ),
             )
 
@@ -1106,9 +1229,12 @@ async def predict(request: PredictRequest, background_tasks: BackgroundTasks):
             probability_adjusted=overlay["probability_adjusted"],
             signal_adjusted=overlay["signal_adjusted"],
             drift_warning=False, drift_score=0.0,
-            degraded=_mark_fundamentals(
-                list(overlay["degraded"]), request.ticker,
-                fundamentals_available, fundamentals_reason,
+            degraded=_mark_macro(
+                _mark_fundamentals(
+                    list(overlay["degraded"]), request.ticker,
+                    fundamentals_available, fundamentals_reason, trained_cols,
+                ),
+                request.ticker,
             ),
         )
 
@@ -1174,9 +1300,12 @@ async def predict_batch(request: BatchPredictRequest, background_tasks: Backgrou
                 probability_adjusted=overlay["probability_adjusted"],
                 signal_adjusted=overlay["signal_adjusted"],
                 drift_warning=False, drift_score=0.0,
-                degraded=_mark_fundamentals(
-                    list(overlay["degraded"]), ticker,
-                    fundamentals_available, fundamentals_reason,
+                degraded=_mark_macro(
+                    _mark_fundamentals(
+                        list(overlay["degraded"]), ticker,
+                        fundamentals_available, fundamentals_reason, trained_cols,
+                    ),
+                    ticker,
                 ),
             )
         except HTTPException:

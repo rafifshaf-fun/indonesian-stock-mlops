@@ -100,6 +100,21 @@ def inject_macro_features(df: pd.DataFrame, fundamentals: dict,
         df["usdidr_rate"] = df["usdidr_rate"].ffill().bfill()
         df["usdidr_return"] = df["usdidr_return"].ffill().bfill().fillna(0)
     else:
+        # No usable USD/IDR frame — the fetch failed or came back empty.  The
+        # rate is NaN (nobody measured it) while the *return* is 0.0, which for
+        # an FX series reads as "the rupiah did not move today".  That is a
+        # fabrication of the same family as the old ``dividend_yield ... or 0.0``,
+        # and it is deliberately kept for now (Task 2.4, R2): the committed
+        # training artefact carries *real* ``usdidr_return`` values, so writing
+        # ``NaN`` at serving time would introduce a fresh train/serve value skew
+        # in a column in 45/45 persisted schemas.  The change needs a feature
+        # rebuild plus retrain and belongs to the same Phase 4 experiment as the
+        # deferred ICT fix.  Until then the failure is made *visible* rather than
+        # silent: the serving paths report it in ``PredictResponse.degraded``
+        # under ``"macro"`` with a ``warning`` (``src/serve.py::_mark_macro``), so
+        # no caller can read this 0.0 as a measurement without also seeing that
+        # the source was down.  The neighbouring success branch fills a hole in a
+        # real series with 0 (line above), which is a different, measured case.
         df["usdidr_rate"] = np.nan
         df["usdidr_return"] = 0.0
 
