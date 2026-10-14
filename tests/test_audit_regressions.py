@@ -39,10 +39,14 @@ F3/F5  ``test_no_all_nan_model_feature``
     Two measured sets come out of it, both pinned exactly in this module: 15
     tickers carry a schema column their own training rows are all-NaN for
     (``TRAINING_ALL_NAN_BY_TICKER`` — the fields yfinance does not publish for
-    them, plus ADMR's ``sector_*``), and 4 tickers are served an all-NaN
+    them, plus ADMR's ``sector_*``), and 5 tickers are served an all-NaN
     ``ob_nearest_bearish_distance`` that training *did* populate
-    (``WINDOW_ALL_NAN_BY_TICKER`` — a 250-row request window with no bearish
-    order block inside it).  A third set is the mirror skew, also pinned:
+    (``WINDOW_ALL_NAN_BY_TICKER`` — the served request window, ``period="250d"``
+    of *calendar* days, with no bearish order block inside it).  The window is
+    measured on the calendar extent the request uses, not on 250 rows: the two
+    differ by a factor of ~1.5, and the row-count version omitted CTRA.JK, whose
+    only bearish block in the last 248 rows sits 233 rows back.  A third set is
+    the mirror skew, also pinned:
     ``REVIVED_BY_SERVING`` — three ADMR sector columns serving supplies for a
     model fitted on them as constant NaN.
 
@@ -229,25 +233,46 @@ TRAINING_ALL_NAN_BY_TICKER = {
 #: close`` (``src/features/ict.py:136``).  The ``ffill`` carries the most recent
 #: bearish order-block level forward across a gap of any length, so the column is
 #: populated in 72–99 % of each of these tickers' committed rows.  A request,
-#: though, carries ``yf.download(period="250d")`` rows (``src/serve.py:1057``)
-#: and the ICT family is recomputed on *that* frame, so when the window holds no
-#: bearish order block there is no level to carry and the served value is NaN.
-#: Measured, per ticker (the block must also clear the detector's own ATR(14)
-#: warm-up inside the window, which is why ``tail(260)`` still finds nothing for
-#: GOTO while ``tail(275)`` does):
+#: though, carries ``yf.download(period="250d")`` rows — the latest block cited
+#: is ``src/serve.py:1057``; ``src/serve.py:122`` and ``src/serve.py:964`` issue
+#: the same call on the warm-up and single-ticker paths — and the ICT family is
+#: recomputed on *that* frame, so when the window holds no bearish order block
+#: there is no level to carry and the served value is NaN.
 #:
-#: | ticker  | last bearish block before the final row | tail(250) | window that finds it | value there |
-#: |---------|----------------------------------------:|----------:|---------------------:|------------:|
-#: | ADMR.JK | 297 rows                                 | NaN       | tail(350)            | 0.5521      |
-#: | AMRT.JK | 368 rows                                 | NaN       | tail(400)            | -1.2020     |
-#: | GOTO.JK | 256 rows                                 | NaN       | tail(275)            | -0.64       |
-#: | MAPA.JK | 279 rows                                 | NaN       | tail(300)            | -0.0938     |
+#: ``period="250d"`` is **calendar** days, not rows.  The committed universe
+#: snapshot ends ``2026-06-15``, so the served window opens 250 calendar days
+#: earlier at ``2025-10-08``; that span holds **164** of the snapshot's 1,553
+#: dated rows (the ~90 that fall out are weekends and IDX holidays).  Then
+#: ``ta.utils.dropna`` (``src/serve.py:578``), which the universe loader applies
+#: per ticker, drops the four zero-volume rows inside that span, so the frame
+#: ``build_inference_features`` is actually handed holds **160** rows for every
+#: ticker in this snapshot.  Measured on the window production uses — the frame
+#: ``load_universe_context`` yields, cut at ``2025-10-08``:
+#:
+#: | ticker  | tail(250) rows | served window | last bearish block before the final row | first tail(n) that finds it | value there |
+#: |---------|---------------:|--------------:|----------------------------------------:|----------------------------:|------------:|
+#: | ADMR.JK | NaN            | NaN           | 297 rows                                | tail(350)                   | 0.5521      |
+#: | AMRT.JK | NaN            | NaN           | 368 rows                                | tail(400)                   | -1.2020     |
+#: | CTRA.JK | -0.5651        | NaN           | 248 rows                                | tail(248)                   | -0.5651     |
+#: | GOTO.JK | NaN            | NaN           | 256 rows                                | tail(275)                   | -0.64       |
+#: | MAPA.JK | NaN            | NaN           | 279 rows                                | tail(300)                   | -0.0938     |
+#:
+#: The two windows are kept apart deliberately.  ``tail(250)`` is the previous,
+#: wrong measurement: it is *deeper* than production's 160 rows, yet it is
+#: shallower than a 250-trading-day history, and for CTRA it lands on the far
+#: side of the block at lag 233 — which is why CTRA was missing from the map
+#: while ADMR, AMRT, GOTO and MAPA were not.  CTRA is the one ticker whose
+#: verdict *flips* between the two windows, and it flips in the direction that
+#: matters: the deeper, wrong window hid a served NaN.  It is the sharpest
+#: demonstration in this file that the window definition is load-bearing.
 #:
 #: Verdict, and why this is a pinned exception rather than a widened assertion:
 #:
 #: * it is **not an absent column** — training populated it for 72–99 % of these
-#:   tickers' rows, and the same value reappears as soon as the window is deep
-#:   enough, so the served NaN is a property of the request window;
+#:   tickers' rows (CTRA 1498/1545, ADMR 808/1051, AMRT 1530/1548, GOTO
+#:   713/989, MAPA 1525/1539), and the same value reappears as soon as the
+#:   window is deep enough, so the served NaN is a property of the request
+#:   window;
 #: * it is **not** the deferred index-alignment bug at
 #:   ``src/features/ict.py:117-129``.  That bug reindexes ``ms_mss_*`` and
 #:   ``pd_*`` — RangeIndex-ed ``pd.Series`` — onto the DatetimeIndex and makes
@@ -262,12 +287,21 @@ TRAINING_ALL_NAN_BY_TICKER = {
 #:   deliberately not made: the controller deferred every ``ict.py`` change so it
 #:   cannot confound the Phase 3 measurement, and this task may not touch source.
 #:
-#: The map is asserted to name **exactly** these four tickers and one column
+#: The map is asserted to name **exactly** these five tickers and one column
 #: each, each column alive in that ticker's own training rows, so it cannot be
-#: widened into a blanket exemption for a genuinely dead column.
+#: widened into a blanket exemption for a genuinely dead column.  The count is
+#: stated because it moved: the first measured version named **4** tickers x 1
+#: column = 4 pairs over 4 tickers, and the corrected window names **5** x 1 =
+#: 5 pairs over 5 tickers.  CTRA.JK is the entire growth, and its justification
+#: is the same measured one its four neighbours carry: a schema column, alive in
+#: its own training rows, all-NaN in the frame the request actually builds, and
+#: alive again the moment the window is deepened one row past the block.
+#: The list grew because the *measurement* was corrected, not to fit an
+#: observation — which is why the guards below still have to pass for it.
 WINDOW_ALL_NAN_BY_TICKER = {
     "ADMR.JK": ("ob_nearest_bearish_distance",),
     "AMRT.JK": ("ob_nearest_bearish_distance",),
+    "CTRA.JK": ("ob_nearest_bearish_distance",),
     "GOTO.JK": ("ob_nearest_bearish_distance",),
     "MAPA.JK": ("ob_nearest_bearish_distance",),
 }
@@ -738,17 +772,18 @@ def test_no_all_nan_model_feature(features_history, mapped_models, monkeypatch):
       pre-existing gaps in the training *data* (fields yfinance does not publish
       for those tickers), not serving defects.
     * **Direction 2 — the frame the serving builder actually produces**, one row
-      per ticker from the last 250 real rows of the on-disk universe snapshot,
-      with each ticker's *own* fundamentals (a single constant dict fills in the
-      columns ``fetch_fundamentals`` leaves ``NaN``, which would make the
-      measurement easier than production).  ``align_to_schema`` raising
+      per ticker from the window the request itself uses — the calendar-day
+      extent of ``period="250d"``, not the last 250 rows — with each ticker's
+      *own* fundamentals (a single constant dict fills in the columns
+      ``fetch_fundamentals`` leaves ``NaN``, which would make the measurement
+      easier than production).  ``align_to_schema`` raising
       ``FeatureSchemaError`` for an absent column is the F5 half, and the model
       predicts on the aligned row, so it is a real model input.
 
     Both directions together are the finding, and it fits in one line: for every
     ticker, the schema columns all-NaN at inference are exactly the columns its
     own training rows are all-NaN for plus the window-truncated
-    ``ob_nearest_bearish_distance`` of four tickers, minus the three ADMR sector
+    ``ob_nearest_bearish_distance`` of five tickers, minus the three ADMR sector
     columns serving revives.  All three sets are pinned, with their evidence, in
     ``TRAINING_ALL_NAN_BY_TICKER``, ``WINDOW_ALL_NAN_BY_TICKER`` and
     ``REVIVED_BY_SERVING``; the assertion is the accounting, per ticker, over the
@@ -850,6 +885,62 @@ def test_no_all_nan_model_feature(features_history, mapped_models, monkeypatch):
         f"so Direction 2 cannot measure the fleet"
     )
 
+    # ── The served window ────────────────────────────────────────────────────
+    # A request downloads ``yf.download(ticker, period="250d")`` — **calendar**
+    # days, not rows (``src/serve.py:122``, ``:964``, ``:1057``) — so the frame
+    # the builder is handed is the calendar extent of ``250d``, which in the
+    # committed snapshot is a fraction of 250 rows.  Deriving it from the last
+    # N rows instead is not a smaller version of the same measurement: for
+    # CTRA.JK the two windows land on opposite sides of a bearish order block
+    # 233 rows back, and the row-count window hides a served NaN.  So the window
+    # is located by date and the row count is measured, never assumed.
+    #
+    # ``SERVED_LOOKBACK_DAYS`` is transcribed from the three ``period="250d"``
+    # call sites and cross-checked against them below, so a change there fails
+    # here rather than silently re-scoping the map.
+    serve_text = SERVE_SOURCE.read_text(encoding="utf-8")
+    periods = re.findall(r'period="(\d+)d"', serve_text)
+    assert periods == ["250"] * 3, (
+        f"src/serve.py's download periods are now {periods}, not three "
+        f"period=\"250d\" call sites; the served window this test measures — and "
+        f"so WINDOW_ALL_NAN_BY_TICKER, which was measured on it — is defined by "
+        f"them. Re-derive the map from the new window, then update this pin."
+    )
+    SERVED_LOOKBACK_DAYS = int(periods[0])
+
+    benchmark = all_ticker_data["BBCA.JK"].index
+    served_cutoff = benchmark[-1] - pd.Timedelta(days=SERVED_LOOKBACK_DAYS)
+    # The raw panel still carries every dated row — including the zero-volume
+    # ones ``ta.utils.dropna`` removes — so this is the calendar extent a
+    # ``period="250d"`` download returns before the loader touches it.  It is
+    # the number a reader reaches for first, and the one the previous version of
+    # this test assumed the *served* frame to be.
+    raw_window_rows = int((_raw.index >= served_cutoff).sum())
+    assert raw_window_rows > 0, "the snapshot ends before the served window opens"
+
+    # ``load_universe_context`` runs ``ta.utils.dropna`` per ticker, which drops
+    # zero-volume rows as well as NaN ones, so the frame the builder receives is
+    # this many rows.  Measured, and bounded rather than pinned to an exact
+    # number: the count is a property of the IDX calendar inside the span, so a
+    # committed snapshot a few days fresher can move it by a row or two without
+    # anything being wrong.  The bound is what makes "250 calendar days" mean
+    # something here — a byte-identical check would break on the next ingest and
+    # teach the reader to edit the constant.
+    served_window_rows = int((benchmark >= served_cutoff).sum())
+    assert 156 <= served_window_rows <= 172, (
+        f"the served window (last {SERVED_LOOKBACK_DAYS} calendar days of the "
+        f"committed snapshot, ending {benchmark[-1].date()}) holds "
+        f"{served_window_rows} rows, outside the measured 156-172 band. Either "
+        f"the snapshot changed length or the request window changed: re-derive "
+        f"WINDOW_ALL_NAN_BY_TICKER before touching this bound."
+    )
+    print(
+        f"\nF3 served window: {SERVED_LOOKBACK_DAYS} calendar days "
+        f"({served_cutoff.date()} .. {benchmark[-1].date()}) = {raw_window_rows} "
+        f"dated rows in the snapshot, {served_window_rows} after the loader's "
+        f"dropna — the frame build_inference_features is handed"
+    )
+
     inference_all_nan: dict[str, tuple[str, ...]] = {}
     revived_by_serving: dict[str, tuple[str, ...]] = {}
     built_widths: set[int] = set()
@@ -859,8 +950,18 @@ def test_no_all_nan_model_feature(features_history, mapped_models, monkeypatch):
     for ticker in mapped_models:
         rows = features_history[features_history["ticker"] == ticker]
         model, columns = load_model_for(ticker)
-        price_history = all_ticker_data[ticker].tail(250).copy()
+        # The window a request builds: the ticker's own rows — the loader has
+        # already applied ``dropna`` — cut at the calendar cutoff the request
+        # uses.  Not ``tail(250)`` and not ``tail(served_window_rows)``: those
+        # are the same length but different dates.
+        price_history = all_ticker_data[ticker]
+        price_history = price_history[price_history.index >= served_cutoff].copy()
         price_history.columns = [str(c) for c in price_history.columns]
+        assert len(price_history) == served_window_rows, (
+            f"{ticker} carries {len(price_history)} rows in the served window, "
+            f"not the {served_window_rows} every other ticker carries — the "
+            f"snapshot is ragged and the window is not the request's"
+        )
 
         frame = serve.build_inference_features(
             price_history, ticker, _fundamentals_for(rows, ticker)
@@ -890,6 +991,13 @@ def test_no_all_nan_model_feature(features_history, mapped_models, monkeypatch):
         # widened into a blanket exemption for a genuinely dead column — and the
         # contradiction with TRAINING_ALL_NAN_BY_TICKER is what would catch a
         # reader who "simplified" the two maps into one.
+        #
+        # The ``live > 0`` guard is the one addition that a genuinely
+        # unjustified entry cannot reach: every column that is dead in a
+        # ticker's own rows is already in TRAINING_ALL_NAN_BY_TICKER, so an
+        # entry claiming one is rejected by the contradiction check first.  It
+        # is kept as the belt to that braces — it is the assertion that states
+        # the definition ("training had the column") in the map's own terms.
         for column in WINDOW_ALL_NAN_BY_TICKER.get(ticker, ()):
             assert column in columns, (
                 f"WINDOW_ALL_NAN_BY_TICKER names {column!r} for {ticker}, which "
@@ -908,10 +1016,11 @@ def test_no_all_nan_model_feature(features_history, mapped_models, monkeypatch):
                 f"fleet never had — the audit's F3 class"
             )
             print(
-                f"\nF3 {ticker}: {column} is all-NaN in the 250-row request window "
-                f"but live in {live}/{len(rows)} of that ticker's own training "
-                f"rows — the window truncation pinned in "
-                f"WINDOW_ALL_NAN_BY_TICKER"
+                f"\nF3 {ticker}: {column} is all-NaN in the "
+                f"{served_window_rows}-row served window "
+                f"({served_cutoff.date()}, period=\"{SERVED_LOOKBACK_DAYS}d\") but "
+                f"live in {live}/{len(rows)} of that ticker's own training rows — "
+                f"the window truncation pinned in WINDOW_ALL_NAN_BY_TICKER"
             )
 
         # And the row is genuinely predictable: an all-NaN frame would raise
@@ -927,7 +1036,8 @@ def test_no_all_nan_model_feature(features_history, mapped_models, monkeypatch):
         f"schema column; {_pair_count(TRAINING_ALL_NAN_BY_TICKER)} ticker/column "
         f"pairs all-NaN in training over {len(TRAINING_ALL_NAN_BY_TICKER)} "
         f"tickers; {_pair_count(WINDOW_ALL_NAN_BY_TICKER)} window-truncated over "
-        f"{len(WINDOW_ALL_NAN_BY_TICKER)}; "
+        f"{len(WINDOW_ALL_NAN_BY_TICKER)} (window: "
+        f"{SERVED_LOOKBACK_DAYS} calendar days = {served_window_rows} rows); "
         f"{_pair_count(REVIVED_BY_SERVING)} revived by serving over "
         f"{len(REVIVED_BY_SERVING)}; built column counts {sorted(built_widths)}"
     )
