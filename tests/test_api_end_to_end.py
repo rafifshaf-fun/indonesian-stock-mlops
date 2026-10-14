@@ -31,6 +31,19 @@ real:
   fetch, or ``yf.Ticker(...).info`` for fundamentals — is **refused and
   recorded**, never fabricated.  ``requests.get``/``post`` are refused the same
   way, which is what the BI-rate scrape and (with a key set) NewsAPI reach.
+* ``features.fetchers.fetch_fred_macro`` is a fifth seam, and the one whose
+  absence used to make this file's "offline" claim untrue whenever
+  ``FRED_API_KEY`` was exported: ``refresh_daily_cache`` really runs here (the
+  fixture sets ``_cache_date = None``) and reaches FRED through ``fredapi``,
+  which leaves by ``urllib``.  Neither the ``requests`` patches nor a patch of
+  ``urllib.request.urlopen`` can close that route — ``fredapi`` binds
+  ``urlopen`` into its own module namespace at import
+  (``fredapi/fred.py:16``) — so the seam is installed where the call resolves.
+  It records the attempt and answers with an *empty frame*, which is the value
+  the real function returns for every failure mode it swallows internally, so the
+  daily refresh still completes; refusing it changes no served number, because no
+  FRED series is in the 60-name contract and the one macro-derived column in it,
+  ``usdidr_stress``, comes from the USD/IDR frame rather than from FRED.
 * ``TestClient(serve.app)`` is constructed directly, never used as a context
   manager: Starlette runs startup hooks only from ``__enter__``, and
   ``startup_load_index`` launches ``_warmup_model_cache`` and
@@ -38,7 +51,9 @@ real:
   Yahoo.  Skipping them is *why* this file can stay offline, and
   ``test_no_startup_warmup_touched_the_network`` pins that they did not run —
   not by reading a flag, but by asserting no download was recorded for the four
-  warmup tickers this file never asks about.  Nothing is lost by skipping
+  warmup tickers this file never asks about.  That test is a tripwire on this
+  fixture rather than a behavioural proof: nothing reachable from this file can
+  start the hooks (see its docstring).  Nothing is lost by skipping
   startup: the request path resolves a ticker through ``model_store``, which
   reads ``model_index.json`` off disk on each uncached request and never consults
   the ``_model_index`` startup fills in.
@@ -57,10 +72,12 @@ at all, which is the one thing a hit is allowed to promise.
 
 Assertions are about the contract's *meaning* (R3), not only its shape:
 ``prediction`` and ``signal`` must agree, ``degraded`` must name only known
-components and must name one exactly when the condition it names is true, and
-``probability_up`` must be the model's own pre-adjustment probability — compared
-against the model loaded straight from the store, and pinned unchanged when the
-sentiment overlay is fed a non-zero score.
+components and each name it carries must match the condition it names (offline
+every condition is true, so the half these assertions can falsify is a *missing*
+name, not a spurious one — see the contract test), and ``probability_up`` must be
+the model's own pre-adjustment probability — compared against the model loaded
+straight from the store, and pinned unchanged when the sentiment overlay is fed a
+non-zero score.
 
 ``serve`` imports mlflow → opentelemetry, whose runtime-context loader still
 calls the removed ``importlib.metadata`` dict interface on Python 3.11, and
@@ -216,8 +233,15 @@ def _yfinance_single_ticker(frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
 def _is_loopback(address) -> bool:
     """Whether a ``connect`` target is this host.
 
-    The guard below is deliberately loopback-scoped.  A blanket refusal breaks the
-    event loop the test client runs on: ``asyncio``'s Proactor self-pipe is a
+    The guard below is deliberately loopback-scoped, so what it promises is
+    "no *non-loopback* connect", not "no egress": a route configured to reach
+    the internet through a **proxy on loopback** connects to ``127.0.0.1`` and is
+    therefore neither refused nor recorded here.  Nothing in this file sets a
+    proxy, and the boundary fakes stop every known route before a socket is
+    opened, but the guard cannot be quoted against that case.
+
+    The allowance itself is not optional.  A blanket refusal breaks the event
+    loop the test client runs on: ``asyncio``'s Proactor self-pipe is a
     ``socket.socketpair``, which on Windows is emulated by connecting to a
     listener on ``127.0.0.1``.  Blocking that would fail the harness, not the
     network.
@@ -231,11 +255,16 @@ def _is_loopback(address) -> bool:
 class _Boundary:
     """The only network boundary this file allows — and its record.
 
-    Every method here stands where a real client would: ``yf.download``,
-    ``yf.Ticker``, ``requests.get``, ``requests.post``.  A call the committed
-    ``data/raw/stocks.csv`` can answer is served from it; every other call is
-    recorded and refused, so a code path that wants live data fails loudly
-    instead of being handed a fabricated frame.
+    Every method here stands where a real client would — the five seams through
+    which this process can leave: ``yf.download``, ``yf.Ticker``,
+    ``requests.get``, ``requests.post`` and ``fetch_fred_macro``.  A call the
+    committed ``data/raw/stocks.csv`` can answer is served from it; every other
+    call is recorded and refused, so a code path that wants live data gets nothing
+    it could mistake for a measurement.  For the four request-shaped seams that
+    means raising; ``fetch_fred_macro`` instead returns the empty frame its own
+    outage path returns (see :meth:`fred`), because its caller treats an
+    exception differently from an empty frame and no model column is built from
+    either.
     """
 
     def __init__(self, universe: pd.DataFrame):
@@ -291,6 +320,42 @@ class _Boundary:
         self.refused.append(("requests.post", str(url)))
         raise ConnectionError(f"no HTTP egress in this file: POST {url}")
 
+    # ── FRED ──────────────────────────────────────────────────────────────────
+
+    def fred(self, start, end):
+        """``fetch_fred_macro`` — the route the ``requests`` patches cannot see.
+
+        ``refresh_daily_cache`` calls this on every ``/predict`` (it is scheduled
+        as a FastAPI background task) and it really runs here, so with
+        ``FRED_API_KEY`` exported a real ``fredapi`` client was constructed and
+        eight series were fetched over ``urllib`` — through the socket guard, which
+        recorded the connections and failed the teardown only *after* they had
+        been made.
+
+        Patched at the function rather than at ``urllib.request.urlopen`` for a
+        reason worth keeping: ``fredapi/fred.py:16`` does
+        ``urlopen = url_request.urlopen`` at import time, so a later patch of the
+        ``urllib.request`` attribute rebinds nothing the client calls.  This seam
+        is the one ``refresh_daily_cache`` actually resolves.
+
+        Refused, and for the record: no request is made, no value is fabricated,
+        and the attempt is named in ``refused``.  The *return* is the empty frame
+        the real function returns for every one of its own failure modes — a
+        missing key, a rejected key, a dead endpoint — because it swallows each of
+        them internally and never raises.  Raising here instead would be the one
+        unfaithful thing this fake could do: ``refresh_daily_cache`` catches it
+        before stamping ``_cache_date``, so the day's macro refresh would be
+        retried on every request and the hit path would fetch ``IDR=X`` again
+        (measured: that broke the "a hit costs no network" pin below).  Nothing is
+        served from the empty frame in any case: no FRED series name is among the
+        model's 60 columns, and the one macro-derived column in it,
+        ``usdidr_stress``, is computed from the ``usdidr_rate``/``usdidr_return``
+        pair that ``fetch_usdidr``'s own frame supplies
+        (``features/market.py:71-78``).
+        """
+        self.refused.append(("fetch_fred_macro", f"{start}..{end}"))
+        return pd.DataFrame()
+
     # ── evidence ──────────────────────────────────────────────────────────────
 
     def downloaded(self) -> list[str]:
@@ -338,17 +403,29 @@ class _Api:
 def api(tmp_path, monkeypatch):
     """The real app behind a ``TestClient``, with every egress faked and recorded.
 
-    Two layers keep the file offline.  The first is the boundary above: the four
-    functions through which this application can leave the process are replaced,
-    so a call either comes back with committed rows or raises.  That is the layer
-    that actually binds, and it has to be: yfinance 1.4.1 talks HTTPS through
-    ``curl_cffi``, whose connection is made inside libcurl and is invisible to any
-    Python-level socket patch, so patching ``yf.download``/``yf.Ticker`` is the
-    only reliable way to stop it.  The second layer is a socket guard that refuses
-    any non-loopback ``connect`` and records the attempt: it catches the other
-    route out — ``requests``/``urllib3``, which is what the BI-rate scrape, the
-    FRED client and NewsAPI use — and it turns "there is no other egress" from an
-    assumption into an assertion at the end of every test in this file.
+    Two layers keep the file offline, and neither alone is enough.  The first is
+    the boundary above: the five seams through which this application can leave
+    the process are replaced — ``yf.download``, ``yf.Ticker``, ``requests.get``,
+    ``requests.post`` and ``fetch_fred_macro`` — so a call either comes back with
+    committed rows or is refused (the four request-shaped seams raise; FRED
+    returns the empty frame its own outage path returns).  That is the layer that
+    actually binds, and it has
+    to be: yfinance 1.4.1 talks HTTPS through ``curl_cffi``, whose connection is
+    made inside libcurl and is invisible to any Python-level socket patch, so
+    patching ``yf.download``/``yf.Ticker`` is the only reliable way to stop it.
+    ``fetch_fred_macro`` is patched for the same kind of reason, and at the
+    function rather than at ``urllib``: ``fredapi`` captures ``urlopen`` into its
+    own namespace when it is first imported (``fredapi/fred.py:16``), so a later
+    patch of ``urllib.request.urlopen`` rebinds nothing it calls.  The second
+    layer is a socket guard that refuses any **non-loopback** ``connect`` and
+    records the attempt: it catches the ``requests``/``urllib3`` routes — the
+    BI-rate scrape and NewsAPI — and any other bare Python socket, and it turns
+    "there is no other egress" from an assumption into an assertion at the end of
+    every test in this file.  Two routes it cannot see are named rather than
+    implied: ``curl_cffi``'s libcurl connect (above, which is why the fakes and
+    not the guard are what bind) and an egress routed through a proxy on
+    loopback, which connects to this host and is therefore invisible to it
+    (``_is_loopback``).
 
     Module state is replaced rather than cleared (``monkeypatch`` restores the
     original, contents and all): ``model_cache`` and ``_fundamentals_cache`` key
@@ -356,11 +433,21 @@ def api(tmp_path, monkeypatch):
     with an earlier test's fetch, and ``_macro_outcomes`` is written by
     ``refresh_daily_cache``, which really runs here — it is a background task on
     every ``/predict`` — so a leftover ``MACRO_NO_FRAME`` from a previous module
-    would attach itself to a later test that asserts something else.
+    would attach itself to a later test that asserts something else.  The FRED
+    seam returns the empty frame the real function returns on an outage rather
+    than raising, so ``refresh_daily_cache`` completes and stamps ``_cache_date``
+    exactly as it does with no key set.  The outcome recorded is therefore the
+    same ``MACRO_NO_FRAME`` — and the same body served — under both configurations
+    this file is run in, ``FRED_API_KEY`` unset and set to a dummy.  ``_cache_date``
+    is forced to ``None`` anyway, so the request under test always pays a real
+    refresh rather than inheriting one from the previous test.
     """
     import requests
     import serve
     import yfinance as yf
+    import features
+    import features.fetchers as fetchers
+    import features.pipeline as pipeline
 
     boundary = _Boundary(_committed_universe())
 
@@ -368,6 +455,18 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setattr(yf, "Ticker", boundary.ticker)
     monkeypatch.setattr(requests, "get", boundary.get)
     monkeypatch.setattr(requests, "post", boundary.post)
+
+    # FRED last, and at *every* module that holds the name rather than at its
+    # definition site alone.  ``features/__init__.py``, ``features.pipeline`` and
+    # ``serve`` each do ``from features.fetchers import fetch_fred_macro``, so
+    # replacing ``fetchers.fetch_fred_macro`` rebinds nothing any of their callers
+    # resolves — and ``serve``'s binding is the one ``refresh_daily_cache``
+    # actually calls.  Leaving it out is what
+    # ``FRED_API_KEY=<dummy> pytest tests/test_api_end_to_end.py`` exposed: 6
+    # failed, 2 passed, 6 errors, with eight real connections to FRED's host
+    # recorded by the socket guard before it could fail the teardown.
+    for module in (fetchers, features, pipeline, serve):
+        monkeypatch.setattr(module, "fetch_fred_macro", boundary.fred)
 
     real_connect = socket.socket.connect
 
@@ -445,21 +544,39 @@ def test_predict_contract_on_a_real_model(api):
     The request is a genuine cache miss: the database is empty, so the app
     downloads (through the boundary), builds the 60-column feature row with the
     builder training uses, aligns it to the model's persisted contract, predicts,
-    caches the row and answers.  Four things are asserted beyond key presence:
+    caches the row and answers.  Five things are asserted beyond key presence:
 
     * ``prediction`` and ``signal`` agree — 1 is BUY and 0 is SELL, and a body
       whose two halves disagree is exactly the "signal-shaped payload" that must
       not be readable as a prediction;
     * ``degraded`` names only known components, without duplicates, and each name
-      tracks the condition it names — the news seam's own ``available`` flag for
-      ``"sentiment"`` and ``"fundamentals"``, and the served row's ``usdidr_rate``
-      for ``"macro"`` — rather than being present or absent by accident;
+      is present exactly when the condition it names holds — the news seam's own
+      ``available`` flag for ``"sentiment"``, the fundamentals status seam's for
+      ``"fundamentals"``, the built row's ``usdidr_rate`` for ``"macro"``.  What
+      that shows offline is one-directional, and the docstring says so rather than
+      implying more: every condition is true in this process, so each ``==``
+      falsifies a *missing* name (the silent fallback F8 was about) and cannot
+      falsify a spurious one — a ``serve`` that appended these names
+      unconditionally would pass this test.  The other direction has real teeth
+      one test over
+      (``test_probability_up_is_pre_adjustment_not_sentiment_adjusted`` feeds the
+      sentiment seam a measurement and requires the name to be gone);
     * ``probability_up`` is the model's own output: the model is loaded from the
       store here and applied to the feature row this request built, and the two
       probabilities must be the same number;
-    * the features came from the committed universe: the frame the request built
-      from is asserted equal, row for row, to the committed
-      ``data/raw/stocks.csv`` window for this ticker.
+    * the frame the request built from is the committed universe, row for row.
+      Stated precisely, that pins the *fixture's* window — the last 250 calendar
+      days of ``data/raw/stocks.csv``, ending on its own last row — and the
+      row-preserving transforms the request path applies to it (``serve``'s
+      ``droplevel(1)`` on yfinance's column ``MultiIndex``, and
+      ``ta.utils.dropna``), and it deliberately pins no more than that: both sides
+      of the comparison are built from the same committed rows, so it would pass
+      even if the features *served* were flat.  The values the model really read
+      are the ones the ``probability_up`` assertion recomputes from that frame;
+    * the FRED route was **reached by this request and refused by the boundary**
+      (``refresh_daily_cache`` runs as a background task on it), so the file's
+      offline property rests on the seam rather than on ``FRED_API_KEY`` being
+      absent from the environment.
     """
     api.fresh_cache("miss.db")
     body = api.body()
@@ -542,6 +659,22 @@ def test_predict_contract_on_a_real_model(api):
         frame, committed.loc[frame.index, list(OHLCV_FIELDS)], check_dtype=False
     )
     assert ("yf.download", TICKER) in api.boundary.served, api.boundary.served
+
+    # ── the FRED route was reached, and the boundary is what stopped it ──────
+    #
+    # ``refresh_daily_cache`` is a background task on this same request and it
+    # calls ``fetch_fred_macro`` unconditionally — the ``FRED_API_KEY`` check
+    # lives *inside* the real function — so this record is produced whether or not
+    # a key is exported.  That is what makes it a pin on the boundary instead of
+    # on the environment: remove the FRED seam and the call goes to ``fredapi`` →
+    # ``urllib`` instead, leaving this list empty and failing this assertion, with
+    # the socket guard's teardown failing only *after* the connections are already
+    # made — both were measured with the seam removed and a dummy key exported.
+    print(f"refused and recorded for this request: {api.boundary.refused}")
+    assert any(entry[0] == "fetch_fred_macro" for entry in api.boundary.refused), (
+        "the request never reached the FRED seam, so the boundary does not cover "
+        f"the route it takes: {api.boundary.refused}"
+    )
 
 
 def test_cache_hit_serves_exactly_the_miss_body(api):
@@ -735,16 +868,22 @@ def test_unknown_ticker_is_an_error_not_a_guess(api):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def test_no_startup_warmup_touched_the_network(api):
-    """``TestClient(serve.app)`` skips the startup hooks — and that is the point.
+    """``TestClient(serve.app)`` skips the startup hooks — a fixture tripwire.
 
     Starlette runs ``on_startup`` handlers only from ``__enter__``.  Entering the
     context manager here would run ``startup_load_index``, which schedules
     ``_warmup_prediction_cache``: five tickers downloaded from Yahoo, one of them
-    the ticker this file requests, at a moment the test does not control.  The
-    proof is not a flag read off the module — it is that **no download was
-    recorded for the four warmup tickers this file never asks about**, while the
-    one it does ask about was downloaded through the boundary.  A warmup that had
-    run would appear here as a name nothing requested.
+    the ticker this file requests, at a moment the test does not control.
+
+    What this test asserts is a counterfactual, and it says so rather than
+    claiming a behavioural proof: the fixture constructs the client directly, so
+    no code path reachable from this file can run a startup hook, and the
+    assertion cannot fail as the file stands.  It is kept as a tripwire on the
+    fixture — the day someone enters the client as a context manager, or the
+    warmups are scheduled from somewhere else, a name nothing requested appears in
+    the record and this is the test that names it.  The half it observes today is
+    that **no download was recorded for the four warmup tickers this file never
+    asks about**, while ``BBCA.JK`` was downloaded through the boundary.
     """
     api.fresh_cache("warmup.db")
     body = api.body()
@@ -765,10 +904,14 @@ def test_the_socket_guard_refuses_off_host_and_allows_loopback(api):
     """The second net under the boundary fakes, tested in both directions.
 
     A guard that never fires proves nothing, so the refusal is demonstrated on
-    the real ``socket`` module — and so is its scope: loopback must still work,
-    because the test client's event loop builds a self-pipe out of a
-    ``socketpair``, which on Windows is a connection to ``127.0.0.1``.  A guard
-    that blocked that would fail the harness rather than the network.
+    the real ``socket`` module — and so is its scope: it refuses **non-loopback**
+    connects, and loopback must still work, because the test client's event loop
+    builds a self-pipe out of a ``socketpair``, which on Windows is a connection
+    to ``127.0.0.1``.  A guard that blocked that would fail the harness rather
+    than the network.  Those are the only two cases here: an egress routed through
+    a proxy on loopback connects to this host, so the guard neither refuses nor
+    records it (``_is_loopback``), and this test must not be read as covering
+    that.
     """
     probe = socket.socket()
     try:
