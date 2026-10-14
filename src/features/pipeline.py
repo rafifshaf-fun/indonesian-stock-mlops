@@ -113,8 +113,14 @@ def inject_macro_features(df: pd.DataFrame, fundamentals: dict,
         # silent: the serving paths report it in ``PredictResponse.degraded``
         # under ``"macro"`` with a ``warning`` (``src/serve.py::_mark_macro``), so
         # no caller can read this 0.0 as a measurement without also seeing that
-        # the source was down.  The neighbouring success branch fills a hole in a
-        # real series with 0 (line above), which is a different, measured case.
+        # the source was down.  That covers every state this branch is reached in
+        # — a failed fetch, a fetch that has not run yet in this process (the cold
+        # start, which is the state ``_warmup_prediction_cache`` builds its rows
+        # in), and a cached row built from either.  The last is why the check
+        # reads the served row's own ``usdidr_rate``: it is NaN exactly when this
+        # branch ran, so the row carries the evidence after the live cache has
+        # moved on.  The neighbouring success branch fills a hole in a real series
+        # with 0 (line above), which is a different, measured case.
         df["usdidr_rate"] = np.nan
         df["usdidr_return"] = 0.0
 

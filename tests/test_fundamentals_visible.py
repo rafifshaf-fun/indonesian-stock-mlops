@@ -28,6 +28,14 @@ failure mode, so the serving path reads a status instead of catching an
 exception the real code never raises.  ``degraded`` names ``"fundamentals"``
 and the reason is logged at ``warning``.
 
+The macro half of the same family (§2D and §2F) is the third instance:
+``inject_macro_features`` writes ``usdidr_return = 0.0`` when the USD/IDR frame
+is absent, and the cache behind that frame is **cold until a background task has
+run** — so the state a fresh process serves in, and the state the startup
+pre-warm caches the day's busiest rows in, is the one the fabrication is certain
+in.  §2F pins that cold start, the pre-warmed row served from the cache-hit
+path, and the two directions of the availability predicate.
+
 Every test here is offline and drives the **real** fetcher: only the transport is
 stood in for, never ``fetch_fundamentals`` or the seam itself.  A stub that
 replaces the fetcher could return whatever shape the test liked, which is
@@ -49,6 +57,7 @@ TestClient import raises a third.  All three are upstream of this repository, so
 the filters below are scoped to their exact text and to this module only,
 exactly as ``tests/test_degradation_visible.py`` does.
 """
+import asyncio
 import json
 import logging
 import types
@@ -520,6 +529,17 @@ def _client_for(tmp_path, monkeypatch, schema, frame=None):
     # at teardown.
     monkeypatch.setattr(serve, "model_cache", {})
     monkeypatch.setattr(serve, "_fundamentals_cache", {})
+    # ``_macro_outcomes`` is written by ``refresh_daily_cache``, which is a
+    # *background* task that really runs in these tests — ``_cache_date`` is
+    # pinned to 1970 above, so it cannot return early.  That write is a fact about
+    # this test's fetch, not about the next test's, and it is currently benign
+    # only because the stubbed download yields a usable frame and hence a healthy
+    # outcome.  A stub that made ``fetch_usdidr`` return an empty frame would
+    # otherwise attach ``MACRO_NO_FRAME`` to every later test in the session —
+    # including the ones that assert ``degraded == []``.  Replacing the dict gives
+    # this test its own (empty, i.e. "no fetch has run yet") record and restores
+    # the original, contents and all, at teardown.
+    monkeypatch.setattr(serve, "_macro_outcomes", {})
     return TestClient(serve.app)
 
 
@@ -1042,3 +1062,267 @@ def test_usdidr_return_fallback_fabricates_a_zero():
 
     assert pd.isna(out["usdidr_rate"].iloc[-1]), out["usdidr_rate"]
     assert out["usdidr_return"].iloc[-1] == 0.0, out["usdidr_return"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2F — the state that occurs first: the day's fetch has not run yet
+# ═══════════════════════════════════════════════════════════════════════════════
+# ``serve._usdidr_cache`` starts as ``None``, and its only writer is
+# ``refresh_daily_cache``, whose only callers are background tasks that run
+# *after* the response.  A cold process therefore builds its first frame from the
+# fallback (``usdidr_return = 0.0``, ``usdidr_rate = NaN``), and the startup
+# pre-warm caches exactly such rows — keyed by ``date = today``, for the five
+# busiest tickers.  Reading "no outcome recorded for today" as "no news" left all
+# of that silent, and it is the one state in which the fabrication is *certain*
+# rather than merely possible.
+#
+# Nothing is added to the cache's stored format to answer the cached-row half.
+# The row carries its own witness: ``inject_macro_features`` writes a real
+# ``usdidr_rate`` on the success branch (``ffill().bfill()``) and a constant
+# ``NaN`` on the fallback branch, and ``usdidr_rate`` is in all 45 persisted
+# contracts beside ``usdidr_return`` (measured).  That is what lets the *hit*
+# path name the fabrication even after the day's fetch has succeeded — a
+# live-state check could not, and a pre-warmed fallback row would look clean for
+# the rest of the day.
+
+#: The cold cache's reason, pinned as a literal substring so a rename fails here.
+COLD_CACHE_REASON = "no USD/IDR fetch has produced a frame in this process yet"
+#: The cached row's reason, likewise.
+CACHED_FALLBACK_REASON = (
+    "this cached row was built while the USD/IDR fetch had produced no frame"
+)
+
+
+def _warm_usdidr_frame() -> pd.DataFrame:
+    """A USD/IDR frame with a *real* rate: what a successful fetch leaves behind.
+
+    On the same business-day index as ``_price_frame``, so the join inside
+    ``inject_macro_features`` overlaps and ``usdidr_rate`` is a measurement rather
+    than NaN — the difference the cached row's own witness reads.
+    """
+    index = pd.bdate_range("2024-01-01", periods=60)
+    return pd.DataFrame(
+        {
+            "usdidr_rate": np.linspace(15_000.0, 15_600.0, len(index)),
+            "usdidr_return": np.full(len(index), 0.0004),
+        },
+        index=index,
+    )
+
+
+def test_a_cold_macro_cache_is_named_and_the_zero_is_kept(
+        tmp_path, monkeypatch, caplog, healthy_news):
+    """A frame built before the day's fetch reports ``"macro"``, and keeps ``0.0``.
+
+    The cold start is *the* case the visibility contract exists for — the frame
+    takes ``pipeline.py``'s fallback deterministically — so silence here is not
+    "no news", it is the fabrication going unnamed on the day's first prediction.
+    The value half is unchanged, as ruled: the model input still carries the
+    fabricated ``0.0``, and it is the *response* that says so.
+    """
+    import serve
+
+    client = _client_for(tmp_path, monkeypatch, ["usdidr_rate", "usdidr_return"])
+    _info_ticker(monkeypatch, HEALTHY_INFO)
+    # The cold start, stated rather than inherited from whatever the session left
+    # on the module: no fetch has produced a frame in this process, and no outcome
+    # is recorded for today.
+    monkeypatch.setattr(serve, "_usdidr_cache", None)
+    monkeypatch.setattr(serve, "_macro_outcomes", {})
+    seen = _capture_model_input(monkeypatch, serve)
+
+    with caplog.at_level(logging.WARNING):
+        caplog.clear()
+        response = client.post("/predict", json={"ticker": "BBCA.JK"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # Sentiment and fundamentals are driven healthy, so macro is the only
+    # degradation and the entry can be asserted exactly.
+    assert body["degraded"] == ["macro"], body
+
+    # The value half of the ruling: still the fabricated 0.0, at the model input.
+    assert "usdidr_return" in seen, seen
+    assert seen["usdidr_return"] == 0.0, seen
+    assert pd.isna(seen["usdidr_rate"]), seen
+
+    lines = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(COLD_CACHE_REASON in line and "0.0" in line for line in lines), lines
+    # Its own named reason: this is not the recorded-outage mode, and an operator
+    # must not be told a fetch failed when no fetch has run.
+    assert not any(serve.MACRO_NO_FRAME in line for line in lines), lines
+
+
+def test_a_row_cached_by_the_pre_warm_names_the_macro_fallback(
+        tmp_path, monkeypatch, caplog, healthy_news):
+    """A pre-warmed fallback row is not clean — not even after the fetch succeeds.
+
+    ``_warmup_prediction_cache`` runs at startup, before any request and hence
+    before ``refresh_daily_cache`` has ever run, and caches one row per priority
+    ticker under ``date = today``.  Those rows hold the fabricated ``0.0`` for the
+    rest of the day, and the hit path is what serves them.  Two states are driven
+    on the *same* row:
+
+    * the cold one it was built in, which is also the one its first hit is served
+      in;
+    * the **healthy** one that follows it.  The row's macro input was fixed when
+      the row was built, so a fetch that later succeeds cannot turn it into a
+      measurement — which is why the hit path reads the row and not today's cache.
+    """
+    import serve
+    from datetime import date as _date
+
+    client = _client_for(tmp_path, monkeypatch, ["usdidr_rate", "usdidr_return"])
+    _info_ticker(monkeypatch, HEALTHY_INFO)
+    monkeypatch.setattr(serve, "_usdidr_cache", None)
+    monkeypatch.setattr(serve, "_macro_outcomes", {})
+
+    # The real pre-warm, on a cold cache and an empty cache database.
+    asyncio.run(serve._warmup_prediction_cache())
+    schema = ["usdidr_rate", "usdidr_return"]
+    assert serve._cache_get("BBCA.JK", schema) is not None, (
+        "the pre-warm cached nothing, so this test would be measuring a miss"
+    )
+
+    seen = _capture_model_input(monkeypatch, serve)
+    with caplog.at_level(logging.WARNING):
+        caplog.clear()
+        cold_hit = client.post("/predict", json={"ticker": "BBCA.JK"})
+
+    assert cold_hit.status_code == 200, cold_hit.text
+    assert cold_hit.json()["degraded"] == ["macro"], cold_hit.json()
+    # The row the hit served is the fabricated one, so the assertion above is
+    # about the prediction's own input rather than about the process's state.
+    assert "usdidr_return" in seen, seen
+    assert seen["usdidr_return"] == 0.0, seen
+    assert pd.isna(seen["usdidr_rate"]), seen
+
+    lines = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(CACHED_FALLBACK_REASON in line for line in lines), lines
+
+    # The day's fetch now succeeds; the row is not rebuilt and still holds the
+    # fallback.  A caller must still be able to tell.
+    monkeypatch.setattr(serve, "_macro_outcomes", {str(_date.today()): None})
+    monkeypatch.setattr(serve, "_usdidr_cache", _warm_usdidr_frame())
+
+    later_hit = client.post("/predict", json={"ticker": "BBCA.JK"})
+
+    assert later_hit.status_code == 200, later_hit.text
+    assert later_hit.json()["degraded"] == ["macro"], later_hit.json()
+
+
+def test_a_row_built_from_a_real_series_is_not_degraded_on_a_hit(
+        tmp_path, monkeypatch, healthy_news):
+    """The witness's negative control: a row with a real rate stays clean.
+
+    Both paths are driven on the same contract — the slow path caches a row built
+    from a real ``usdidr_rate``, and the hit path reads that row — so a witness
+    that fired on any row (or on any row with a ``NaN`` anywhere) fails here.
+    ``_macro_outcomes`` states the day's healthy outcome explicitly rather than
+    relying on the session's, which is what makes ``degraded == []`` a statement
+    about this request.
+    """
+    import serve
+    from datetime import date as _date
+
+    client = _client_for(tmp_path, monkeypatch, ["usdidr_rate", "usdidr_return"])
+    _info_ticker(monkeypatch, HEALTHY_INFO)
+    monkeypatch.setattr(serve, "_usdidr_cache", _warm_usdidr_frame())
+    monkeypatch.setattr(serve, "_macro_outcomes", {str(_date.today()): None})
+
+    miss = client.post("/predict", json={"ticker": "BBCA.JK"})
+    assert miss.status_code == 200, miss.text
+    assert miss.json()["degraded"] == [], miss.json()
+
+    hit = client.post("/predict", json={"ticker": "BBCA.JK"})
+    assert hit.status_code == 200, hit.text
+    assert hit.json()["degraded"] == [], hit.json()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2G — the availability predicate reads *values*, not key presence
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_a_body_of_present_nulls_is_not_a_measurement(monkeypatch):
+    """Eight fields, all *present*, all ``None``: nothing was published.
+
+    Defensive rather than reachable: yfinance drops ``None`` values from the
+    flattened body (``yfinance/scrapers/quote.py:650``), so a body that spells
+    every field out as ``None`` is not one this version produces — which is
+    exactly why it went unnoticed.  ``any(field in info ...)`` read it as a
+    measurement and returned ``available=True`` with all eight values NaN, the
+    original defect one key-shape away; reading the *values* closes it.  The
+    partially-populated tests below pin the other direction, so this cannot be
+    "fixed" by requiring all eight.
+    """
+    import features.fetchers as fetchers
+
+    body = {field: None for field in HEALTHY_INFO}
+    assert sorted(body) == sorted(HEALTHY_INFO), body  # anti-vacuity
+    _info_ticker(monkeypatch, body)
+
+    values, available, reason = fetchers.fetch_fundamentals_status("BBCA.JK")
+
+    assert available is False, values
+    assert list(values) == list(FUNDAMENTAL_KEYS), values
+    assert all(pd.isna(v) for v in values.values()), values
+    assert reason is not None and EMPTY_RESPONSE_REASON in reason, reason
+
+
+def test_a_lone_present_null_is_not_a_measurement(monkeypatch):
+    """One field present as ``None`` and nothing else is the no-data mode.
+
+    The single-field spelling of the body above: a ``None`` is not an answer, so
+    it must not be the one key that makes a fundamentals-free body look healthy.
+    """
+    import features.fetchers as fetchers
+
+    _info_ticker(monkeypatch, {"trailingPE": None})
+
+    values, available, reason = fetchers.fetch_fundamentals_status("BBCA.JK")
+
+    assert available is False, values
+    assert all(pd.isna(v) for v in values.values()), values
+    assert reason is not None and EMPTY_RESPONSE_REASON in reason, reason
+
+
+def test_a_partially_populated_body_is_still_a_measurement(monkeypatch):
+    """Two of the eight fields published is a healthy fetch, not an outage.
+
+    The blast-radius pin for the hardening: a body carrying a *value* for any
+    field is an answer, so an implementation that required all eight would fail
+    here — a partially-populated healthy response must not become a false
+    negative.
+    """
+    import features.fetchers as fetchers
+
+    _info_ticker(monkeypatch, {"trailingPE": 18.4, "marketCap": 1.15e12})
+
+    values, available, reason = fetchers.fetch_fundamentals_status("BBCA.JK")
+
+    assert available is True, reason
+    assert reason is None
+    assert values["pe_ratio"] == 18.4, values
+    assert values["market_cap"] == 1.15e12, values
+    assert all(
+        pd.isna(values[key]) for key in FUNDAMENTAL_KEYS
+        if key not in ("pe_ratio", "market_cap")
+    ), values
+
+
+def test_a_published_zero_is_a_value_not_an_absence(monkeypatch):
+    """``0.0`` published by Yahoo is a measurement, so the predicate is not truthy.
+
+    ``is not None`` rather than a truthiness test: ``dividendYield: 0.0`` is the
+    one value the old ``or 0.0`` fallback could not distinguish from its own
+    default, and a predicate that asked ``if not info.get(field)`` would
+    re-introduce that family one layer up.
+    """
+    import features.fetchers as fetchers
+
+    _info_ticker(monkeypatch, {"dividendYield": 0.0})
+
+    values, available, reason = fetchers.fetch_fundamentals_status("BBCA.JK")
+
+    assert available is True, reason
+    assert values["dividend_yield"] == 0.0, values

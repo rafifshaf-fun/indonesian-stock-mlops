@@ -55,6 +55,30 @@ MACRO = "macro"
 #: answered with nothing" are the same state here and are named the same way.
 MACRO_NO_FRAME = "the USD/IDR fetch returned no usable frame"
 
+#: The state that occurs *first*, and the one a cold process is always in: no
+#: fetch has produced a frame yet, so the frame being built now takes the
+#: fallback.  This is not "an unknown, so stay quiet" — it is the deterministic
+#: state in which ``usdidr_return`` is the fabricated ``0.0``, and it is the state
+#: ``_warmup_prediction_cache`` builds the day's most-requested rows in.  Its own
+#: name, because a fetch that has not run is not a failed one and an operator sent
+#: looking for an outage that never happened has lost the time the label was
+#: supposed to save.
+MACRO_NO_FETCH_YET = (
+    "no USD/IDR fetch has produced a frame in this process yet, so this frame "
+    "was built with the fallback"
+)
+
+#: The same fabrication, seen one request later: a *cached row* whose
+#: ``usdidr_rate`` is NaN was built from the fallback, and the ``usdidr_return``
+#: beside it is the ``0.0`` that branch writes.  The row carries its own witness,
+#: which is what lets the cache-hit path name this *after* the day's fetch has
+#: succeeded — a live-state check could not, and a row pre-warmed from a fallback
+#: would look clean for the rest of the day.
+MACRO_CACHED_FALLBACK = (
+    "this cached row was built while the USD/IDR fetch had produced no frame, so "
+    "its usdidr_return is the fallback"
+)
+
 # ── Dynamic path resolution ──
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # The model store's path lives in model_store.model_dir() alone; this module
@@ -482,12 +506,47 @@ _fundamentals_cache = {}
 #: ``str(date)`` -> ``Optional[str]``: the outcome of that day's USD/IDR macro
 #: fetch — ``None`` when it produced a usable frame, the reason when it did not.
 #: Written only by :func:`refresh_daily_cache`, and read by
-#: :func:`macro_degradation`, because the *outcome* is a fact about the fetch
-#: while ``_usdidr_cache is None`` merely means "the refresh has not run in this
-#: process" (an un-warmed, freshly started process) — and a fetch that has not
-#: happened is not an outage.  Keyed by day so yesterday's outcome cannot answer
-#: for today.
+#: :func:`macro_degradation`, because the *outcome* is a fact about the fetch.
+#: Keyed by day so yesterday's outcome cannot answer for today, and an **absent**
+#: key is a state of its own rather than "no news": the refresh has not run in
+#: this process, so the frame being built now takes the fallback
+#: (``MACRO_NO_FETCH_YET``).  That is also why a recorded healthy outcome must be
+#: distinguishable from an absent one — hence ``in``, not ``.get``.
 _macro_outcomes: dict[str, Optional[str]] = {}
+
+
+def _usdidr_frame_usable(frame) -> bool:
+    """Whether ``frame`` is a USD/IDR frame ``inject_macro_features`` can join on.
+
+    The three conditions :func:`refresh_daily_cache` records an outcome from —
+    not ``None``, not empty, carrying ``usdidr_return`` — kept in one place so the
+    recorded outcome and :func:`macro_degradation`'s live check cannot disagree
+    about what "usable" means.
+    """
+    return (frame is not None and not frame.empty
+            and "usdidr_return" in frame.columns)
+
+
+def _row_is_macro_fallback(row) -> bool:
+    """Whether a cached feature row was built from the USD/IDR fallback.
+
+    The witness is ``usdidr_rate``, and the row is the aligned one, so this reads
+    the same value the model does.  ``pipeline.inject_macro_features`` writes a
+    real rate on the success branch (``ffill().bfill()`` of the joined series) and
+    a constant ``NaN`` on the fallback branch — so a NaN rate in a row means the
+    row was built without a frame, and the ``usdidr_return`` beside it is then the
+    ``0.0`` that branch wrote.  ``usdidr_rate`` is in all 45 persisted contracts,
+    beside ``usdidr_return`` (measured), which is why the cache's stored format
+    needs nothing added: the row already carries the evidence.
+
+    A row whose contract carries no ``usdidr_rate`` cannot answer — and does not
+    need to: no macro input the model reads was fabricated for it, so this returns
+    ``False`` rather than reporting an outage the prediction never used.
+    """
+    rate = getattr(row, "get", lambda _name: None)("usdidr_rate")
+    if rate is None:
+        return False
+    return bool(pd.isna(rate))
 
 
 def get_fundamentals(ticker: str) -> tuple[dict, bool, Optional[str]]:
@@ -534,15 +593,16 @@ def refresh_daily_cache():
         _fred_cache = fetch_fred_macro(start_date, end_date)
         _bi_cache = fetch_bi_rate(start_date, end_date)
         _cache_date = today
-        if _usdidr_cache is None or _usdidr_cache.empty \
-                or "usdidr_return" not in _usdidr_cache.columns:
+        if not _usdidr_frame_usable(_usdidr_cache):
             # The call itself is wrapped in ``try/except`` inside
             # ``fetch_usdidr`` and returns an *empty frame* on failure, so an
             # outage is a 200-shaped empty frame and reaches here rather than the
             # ``except`` below.  The outcome is recorded so the serving path can
             # name it in ``degraded`` (R2): the value stays the fabricated 0.0 it
             # has always been, but it can no longer be mistaken for a
-            # measurement.
+            # measurement.  ``_usdidr_frame_usable`` is the same test
+            # ``macro_degradation`` falls back to when no outcome is recorded, so
+            # the two cannot disagree about what counts as a usable frame.
             _macro_outcomes[today] = MACRO_NO_FRAME
             logger.warning(
                 "USD/IDR fetch for %s..%s returned no usable frame — "
@@ -1010,8 +1070,8 @@ def _mark_fundamentals(degraded: list[str], ticker: str, available: bool,
     return degraded
 
 
-def macro_degradation() -> Optional[str]:
-    """Why the *current* serving frame was built without usable USD/IDR data.
+def macro_degradation(row=None) -> Optional[str]:
+    """Why the USD/IDR input behind a prediction is not a measurement.
 
     ``pipeline.inject_macro_features`` writes ``usdidr_return = 0.0`` when the
     USD/IDR frame is absent, and that column is in all 45 persisted schemas — so
@@ -1020,34 +1080,66 @@ def macro_degradation() -> Optional[str]:
     training artefact carries real values, so substituting ``NaN`` at serving
     time would create a fresh train/serve skew in a column the fleet consumes;
     changing it needs a feature rebuild and retrain) and makes the failure
-    *visible* instead: this returns the audit string, or ``None`` when the frame
-    is usable.
+    *visible* instead: this returns the audit string, or ``None`` when the input
+    is a measurement.
 
-    Reads the recorded outcome rather than the cache variable.  ``None`` means
-    the day's fetch has not run in this process — an un-warmed process, which is
-    not an outage — so a fresh start stays quiet; once
-    :func:`refresh_daily_cache` has run, the outcome is a fact and is reported
-    for the rest of the day.
+    There are two shapes of evidence, because a prediction is built in two
+    places:
+
+    * ``row`` given — the **cache-hit path**, which predicts on a row built
+      earlier and reads no macro cache at all.  The evidence is the row itself
+      (:func:`_row_is_macro_fallback`): a pre-warmed row built while the cache was
+      cold holds the fabricated ``0.0`` for the rest of the day, and reporting
+      *today's* state for it would be reporting the wrong day's fetch — it would
+      say "clean" as soon as a fetch succeeded, on a row no fetch produced.
+    * ``row`` is ``None`` — a frame being built **now** (the ``/predict`` slow
+      path and ``/predict/batch``), where the live state is the one the frame was
+      built from.  Three states, and each is named:
+
+      - an outcome **recorded for today**: the fetch's own fact, reported for the
+        rest of the day (``None`` when it succeeded, in which case the frame is
+        clean);
+      - **no outcome for today and no usable frame**: the fetch has not produced
+        one in this process yet.  This is the state that occurs *first* — a cold
+        start — and it is the deterministic case in which the frame being built
+        takes the fallback, so it is its own named reason rather than silence.
+        A fetch that has not happened is not an outage, but it *is* the
+        fabrication, and a caller cannot tell the two apart from the value;
+      - no outcome for today and a usable frame: the refresh produced a frame
+        before it wrote the outcome (or a caller installed one), so the frame
+        being built joins a measurement rather than the fallback.
     """
-    outcome = _macro_outcomes.get(str(date.today()))
+    today = str(date.today())
+    if row is not None:
+        outcome = MACRO_CACHED_FALLBACK if _row_is_macro_fallback(row) else None
+    elif today in _macro_outcomes:
+        outcome = _macro_outcomes[today]
+    elif not _usdidr_frame_usable(_usdidr_cache):
+        outcome = MACRO_NO_FETCH_YET
+    else:
+        outcome = None
+
     if outcome is None:
         return None
     return f"{outcome} - usdidr_return is the fabricated 0.0, usdidr_rate is NaN"
 
 
-def _mark_macro(degraded: list[str], ticker: str) -> list[str]:
-    """Name a macro outage in ``degraded``, and log why.
+def _mark_macro(degraded: list[str], ticker: str, row=None) -> list[str]:
+    """Name a macro fallback in ``degraded``, and log why.
 
-    Called on the paths that *build* a frame (the ``/predict`` slow path and
-    ``/predict/batch``): a cache hit does not rebuild features, so no macro value
-    in that response is affected by today's fetch and naming an outage there
-    would be noise about a request that did not use the frame.
+    Called on all three response paths.  The two that *build* a frame pass no
+    ``row`` and report the live state; the cache-hit path passes the row it is
+    about to predict on, because that row — not today's cache — is the macro
+    input this prediction consumes, and a row built from the fallback must not
+    look clean (`macro_degradation`).  A hit therefore reports a macro state when
+    the row it served carries the fabrication, and nothing when the row's contract
+    names no macro column at all.
 
     Extracted rather than inlined because this remains an *interim* mechanism:
     when the ``0.0`` itself is replaced (Phase 4, with the ICT fix), this entry
     and the ``warning`` go with it.
     """
-    reason = macro_degradation()
+    reason = macro_degradation(row)
     if reason is None:
         return degraded
     degraded.append(MACRO)
@@ -1156,9 +1248,19 @@ async def predict(request: PredictRequest, background_tasks: BackgroundTasks):
                 probability_adjusted=overlay["probability_adjusted"],
                 signal_adjusted=overlay["signal_adjusted"],
                 drift_warning=False, drift_score=0.0,
-                degraded=_mark_fundamentals(
-                    list(overlay["degraded"]), request.ticker,
-                    fundamentals_available, fundamentals_reason, trained_cols,
+                # ``cached_row``, not the live state: this prediction is computed
+                # from the row, so the row is the macro input it consumed.  A
+                # pre-warmed row built while ``_usdidr_cache`` was cold holds the
+                # fabricated ``usdidr_return = 0.0`` for the rest of the day, and
+                # the live cache cannot say so once its fetch has succeeded — the
+                # row's own ``usdidr_rate`` can, and does, on every later request
+                # (see ``macro_degradation``).
+                degraded=_mark_macro(
+                    _mark_fundamentals(
+                        list(overlay["degraded"]), request.ticker,
+                        fundamentals_available, fundamentals_reason, trained_cols,
+                    ),
+                    request.ticker, cached_row,
                 ),
             )
 

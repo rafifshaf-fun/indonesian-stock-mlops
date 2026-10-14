@@ -167,7 +167,7 @@ def fetch_fundamentals_status(ticker: str) -> tuple[dict, bool, Optional[str]]:
         rather than a class, mirroring
         :func:`fetch_news_sentiment_status`.
 
-    The "no data" test is on the **fetched fields**, not on the dict:
+    The "no data" test is on the **fetched fields' values**:
 
     * ``not info`` — what stood here — is not a detector for this mode.  The real
       ``Quote.info`` property (``yfinance/scrapers/quote.py:502-508``) runs
@@ -179,22 +179,31 @@ def fetch_fundamentals_status(ticker: str) -> tuple[dict, bool, Optional[str]]:
       inferred.  The predicate returned ``available=True`` with all eight fields
       ``NaN``, five of them schema-required: exactly the invisible outage this
       seam exists to remove, surviving on the one shape the brief names.
-    * ``any(field in info ...)`` asks the question the caller actually has — *was
-      any fundamental field published?* — and it is a question about the eight
-      fields rather than about yfinance's bookkeeping, so it holds whatever else
-      the library decides to append to the body.
+    * ``field in info`` — what replaced it — is a detector for key *presence*, and
+      a body can carry all eight keys with ``None`` in each.  That is eight
+      public fields nobody published a number for, and it read as
+      ``available=True`` with all eight values ``NaN``.  This yfinance drops
+      ``None`` values from the flattened body (``yfinance/scrapers/quote.py:650``),
+      so the shape is defensive rather than reachable today — but "the key is
+      there" and "a value is there" are different questions, and only the second
+      is the caller's.
+    * ``info.get(field) is not None`` asks it: *did any of the eight carry a
+      value?*  An identity test rather than a truthiness one, because a published
+      ``0.0`` is a measurement of zero — ``not info.get(field)`` would
+      re-introduce the ``or 0.0`` fabrication one layer up.
 
-    A field that is *present* but ``None`` counts as an answer to that question:
-    yfinance publishing ``dividendYield: None`` is a measurement attempt that
-    returned nothing, not a failed fetch, so this does not conflate "field
-    unpublished" with "the source is down".
+    The distinction this preserves is the one the serving path depends on: a field
+    that is absent **or** null means "Yahoo does not publish this", which is not
+    "the source is down".  A body with a value for even one of the eight is a
+    healthy fetch — the partially-populated case — so nothing here requires all
+    eight.
     """
     try:
         info = yf.Ticker(ticker).info
     except Exception as e:
         return {k: np.nan for k in FUNDAMENTAL_KEYS}, False, _fundamentals_failure_reason(e)
 
-    if not any(field in info for field in _FUNDAMENTAL_FIELDS.values()):
+    if not any(info.get(field) is not None for field in _FUNDAMENTAL_FIELDS.values()):
         return {k: np.nan for k in FUNDAMENTAL_KEYS}, False, NO_FUNDAMENTAL_FIELDS
 
     return _fundamental_values(info), True, None
