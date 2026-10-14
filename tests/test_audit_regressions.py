@@ -13,8 +13,12 @@ F1  ``test_not_all_sell_on_history``
     (``total_buys > 0`` *and* ``total_sells > 0``).  A floor on BUY alone is not
     enough: the mirror defect — an all-BUY fleet — is produced for real by an
     all-zeros feature frame (7,735/7,735 BUY), so the gate must exclude both
-    degenerate constants.  The per-ticker and total rates are printed so the
-    evidence survives in the test log; the assertion is the gate.
+    degenerate constants.  The same pure function is applied to **each ticker's
+    own** tallies as well as to the pooled ones, because five independently
+    trained models are pooled here: one model collapsing to a single outcome
+    while the other four stay mixed is invisible to a pooled count.  The
+    per-ticker and total rates are printed so the evidence survives in the test
+    log; the assertion is the gate.
 
 F2  ``test_distinct_tickers_use_distinct_models``
     Two tickers resolve to **different** model folders, load genuinely
@@ -23,11 +27,24 @@ F2  ``test_distinct_tickers_use_distinct_models``
     all 45 persisted schemas are identical by design.
 
 F3/F5  ``test_no_all_nan_model_feature``
-    Every column of every real model's persisted schema is present in the
-    committed training frame and none is all-NaN there; and the frame the
-    **serving builder actually produces** from the on-disk universe satisfies
-    the same contract for the measured tickers, so the model's input is real at
-    inference rather than NaN-padded.
+    Measured over **every mapped ticker** — all 45 models, in both directions.
+    The previous version looped over three tickers while its name, its brief and
+    its report claimed the fleet, and that gap hid a real finding, so the whole
+    fleet is now paid for deliberately (~45 s).  Each model's persisted schema
+    is checked against *that ticker's own* rows of the committed training frame
+    — a fleet-wide column check cannot see a column that is alive for 38
+    tickers and all-NaN for the seven banks — and against the frame the
+    **serving builder actually produces** for that ticker from the on-disk
+    universe, so the model's input is real at inference rather than NaN-padded.
+    Two measured sets come out of it, both pinned exactly in this module: 15
+    tickers carry a schema column their own training rows are all-NaN for
+    (``TRAINING_ALL_NAN_BY_TICKER`` — the fields yfinance does not publish for
+    them, plus ADMR's ``sector_*``), and 4 tickers are served an all-NaN
+    ``ob_nearest_bearish_distance`` that training *did* populate
+    (``WINDOW_ALL_NAN_BY_TICKER`` — a 250-row request window with no bearish
+    order block inside it).  A third set is the mirror skew, also pinned:
+    ``REVIVED_BY_SERVING`` — three ADMR sector columns serving supplies for a
+    model fitted on them as constant NaN.
 
 F6/F7  ``test_cache_by_name``
     A real round-trip through ``_cache_put``/``_cache_get`` keyed by column name
@@ -52,9 +69,11 @@ F12 ``test_batch_failure_is_error``
     ``/predict/batch`` answers a ticker it cannot predict with an HTTP error
     carrying no signal-shaped payload (``prediction``, ``signal``,
     ``probability_up``).  The feature-build failure — the branch the audit
-    measured — is a **502**; it used to answer ``prediction: 0`` (SELL) under
-    200.  An unmapped ticker is a 404, which it arguably already was, and is
-    pinned here as *unanswerable* rather than substituted from another ticker.
+    measured — is exactly a **502**; it used to answer ``prediction: 0`` (SELL)
+    under 200.  An unmapped ticker is exactly a **404** — the handler re-raises
+    ``HTTPException`` before its generic handler — and is pinned here as
+    *unanswerable* rather than substituted from another ticker.  Neither status
+    is tolerated as the other's alternative.
 
 Everything here is offline: no test touches the network, and the autouse
 ``offline`` fixture turns any attempt into a loud failure rather than a silent
@@ -74,11 +93,11 @@ from __future__ import annotations
 
 import ast
 import json
-import logging
 import os
 import pathlib
 import re
 import sys
+import time
 import types
 import warnings
 
@@ -136,21 +155,158 @@ SERVE_SOURCE = _REPO_ROOT / "src" / "serve.py"
 #: in one sector so the sector-relative columns are computable.
 HISTORY_TICKERS = ("BBCA.JK", "BBRI.JK", "BMRI.JK", "TLKM.JK", "ASII.JK")
 
-#: The three tickers the serving-builder measurement (F3) uses.  One sector, so
-#: ``compute_cross_stock_features`` has real peers to compute against.
-SERVED_TICKERS = ("BBCA.JK", "BBRI.JK", "BMRI.JK")
+#: ``fetch_fundamentals``'s eight keys — the fields the builder injects as
+#: columns (``inject_macro_features`` assigns each from a scalar) and therefore
+#: the fields yfinance can leave unpublished for a whole ticker.  Direction 2 of
+#: F3 feeds each ticker *its own* values from the committed artefact rather than
+#: one constant dict for all 45: see :func:`_fundamentals_for`.
+FUNDAMENTAL_FIELDS = (
+    "pe_ratio",
+    "pb_ratio",
+    "dividend_yield",
+    "market_cap",
+    "debt_to_equity",
+    "return_on_equity",
+    "revenue_growth",
+    "profit_margins",
+)
 
-#: ``fetch_fundamentals``'s eight keys, as ``tests/conftest.py`` supplies them.
-FUNDAMENTAL_FIELDS = {
-    "pe_ratio": 18.4,
-    "pb_ratio": 3.1,
-    "dividend_yield": 0.027,
-    "market_cap": 1.15e12,
-    "debt_to_equity": 0.62,
-    "return_on_equity": 0.21,
-    "revenue_growth": 0.083,
-    "profit_margins": 0.34,
+#: Measured: schema columns that are all-NaN across a ticker's **own** rows of
+#: the committed training frame.  This is the per-ticker fact that a fleet-wide
+#: column check cannot see — ``debt_to_equity`` is alive for 38 tickers and
+#: all-NaN for the seven banks — and the first version of F3's Direction 1
+#: checked only the global column, so it reported none of this.
+#:
+#: Every entry is the same shape: yfinance publishes no value for the field, so
+#: training had none, and the column reaches the model as a constant NaN.  The
+#: groups behind the map:
+#:
+#: * ``debt_to_equity`` — the seven banks (BBCA, BBRI, BMRI, BBNI, BBTN, BRIS,
+#:   ARTO);  ``totalDebt/equity`` is not published for them.
+#: * ``dividend_yield`` — the seven non-payers (AMMN, ARTO, BREN, BRPT, GOTO,
+#:   MBMA, MDKA).
+#: * ``pe_ratio`` — the three tickers with no trailing P/E (EXCL, GOTO, MDKA).
+#: * ``sector_relative_strength`` / ``sector_return_1d`` /
+#:   ``sector_volume_ratio`` — ADMR.JK.  ``compute_cross_stock_features`` only
+#:   computes the sector family when the ticker's sector has more than one member
+#:   (``src/features/market.py:149``); ADMR's rows carry none of the three, so
+#:   its model was fitted with them constant-NaN while serving now computes them
+#:   (ADMR sits in ``energy_mining`` with twelve peers today).
+#:
+#: A column listed here is a **dead feature for that model** — it is in the
+#: schema but was constant-NaN across every row the model was fitted on, so the
+#: model can only have learned a default branch for it.  That is a real quality
+#: finding, but it is not the audit's F3 class (a feature the model expects that
+#: is populated in training and absent at inference, which is
+#: :data:`WINDOW_ALL_NAN_BY_TICKER`).  Pinned exactly, so the corrected
+#: per-ticker check cannot quietly stop reporting it, and so the map cannot be
+#: widened to excuse a *new* dead column.
+TRAINING_ALL_NAN_BY_TICKER = {
+    "ADMR.JK": ("sector_relative_strength", "sector_return_1d", "sector_volume_ratio"),
+    "AMMN.JK": ("dividend_yield",),
+    "ARTO.JK": ("debt_to_equity", "dividend_yield"),
+    "BBCA.JK": ("debt_to_equity",),
+    "BBNI.JK": ("debt_to_equity",),
+    "BBRI.JK": ("debt_to_equity",),
+    "BBTN.JK": ("debt_to_equity",),
+    "BMRI.JK": ("debt_to_equity",),
+    "BREN.JK": ("dividend_yield",),
+    "BRIS.JK": ("debt_to_equity",),
+    "BRPT.JK": ("dividend_yield",),
+    "EXCL.JK": ("pe_ratio",),
+    "GOTO.JK": ("dividend_yield", "pe_ratio"),
+    "MBMA.JK": ("dividend_yield",),
+    "MDKA.JK": ("dividend_yield", "pe_ratio"),
 }
+
+#: Measured: the schema column that is all-NaN in the served row while that
+#: ticker's own training rows **do** carry it.  This is the finding the
+#: three-ticker sample hid, and it is the audit's F3 class in the narrow sense
+#: that matters: a feature the model was trained with a real value for, absent at
+#: inference.
+#:
+#: ``ob_nearest_bearish_distance`` is ``(close - ob_bearish_level.ffill()) /
+#: close`` (``src/features/ict.py:136``).  The ``ffill`` carries the most recent
+#: bearish order-block level forward across a gap of any length, so the column is
+#: populated in 72–99 % of each of these tickers' committed rows.  A request,
+#: though, carries ``yf.download(period="250d")`` rows (``src/serve.py:1057``)
+#: and the ICT family is recomputed on *that* frame, so when the window holds no
+#: bearish order block there is no level to carry and the served value is NaN.
+#: Measured, per ticker (the block must also clear the detector's own ATR(14)
+#: warm-up inside the window, which is why ``tail(260)`` still finds nothing for
+#: GOTO while ``tail(275)`` does):
+#:
+#: | ticker  | last bearish block before the final row | tail(250) | window that finds it | value there |
+#: |---------|----------------------------------------:|----------:|---------------------:|------------:|
+#: | ADMR.JK | 297 rows                                 | NaN       | tail(350)            | 0.5521      |
+#: | AMRT.JK | 368 rows                                 | NaN       | tail(400)            | -1.2020     |
+#: | GOTO.JK | 256 rows                                 | NaN       | tail(275)            | -0.64       |
+#: | MAPA.JK | 279 rows                                 | NaN       | tail(300)            | -0.0938     |
+#:
+#: Verdict, and why this is a pinned exception rather than a widened assertion:
+#:
+#: * it is **not an absent column** — training populated it for 72–99 % of these
+#:   tickers' rows, and the same value reappears as soon as the window is deep
+#:   enough, so the served NaN is a property of the request window;
+#: * it is **not** the deferred index-alignment bug at
+#:   ``src/features/ict.py:117-129``.  That bug reindexes ``ms_mss_*`` and
+#:   ``pd_*`` — RangeIndex-ed ``pd.Series`` — onto the DatetimeIndex and makes
+#:   *those* columns all-NaN everywhere; ``ob_bearish_level`` is a numpy array,
+#:   position-aligned, and the column is alive in training.  Same module, same
+#:   ``ob_*`` family, **different cause**;
+#: * it *is* a genuine, narrow train/serve skew: training handed the model a
+#:   number for this feature on this row and serving hands it NaN, which XGBoost
+#:   reads as its default branch.  The production fix — seed the order-block level
+#:   from history deeper than the request window, or compute the ICT family on the
+#:   ticker's full available history — is a change to ``src/features/ict.py``,
+#:   deliberately not made: the controller deferred every ``ict.py`` change so it
+#:   cannot confound the Phase 3 measurement, and this task may not touch source.
+#:
+#: The map is asserted to name **exactly** these four tickers and one column
+#: each, each column alive in that ticker's own training rows, so it cannot be
+#: widened into a blanket exemption for a genuinely dead column.
+WINDOW_ALL_NAN_BY_TICKER = {
+    "ADMR.JK": ("ob_nearest_bearish_distance",),
+    "AMRT.JK": ("ob_nearest_bearish_distance",),
+    "GOTO.JK": ("ob_nearest_bearish_distance",),
+    "MAPA.JK": ("ob_nearest_bearish_distance",),
+}
+
+#: Measured: schema columns that are all-NaN across a ticker's own training rows
+#: and **alive in the served row** — the third case, and the mirror of
+#: :data:`WINDOW_ALL_NAN_BY_TICKER`.  A column serving cannot supply is a
+#: finding; so is a column serving *invents* for a model that was never fitted on
+#: it.
+#:
+#: ``ADMR.JK``'s three sector columns, and the evidence is in the repository:
+#:
+#: * the committed training artefact (``data/processed/features.parquet``) has
+#:   ADMR's rows with no sector family at all, while all twelve of its sector
+#:   peers carry live values in the same artefact — ADMR is the only ticker in
+#:   the fleet with an all-NaN ``sector_return_1d``;
+#: * ``4bf00db`` (2026-10-13) added ``ADMR.JK`` to
+#:   ``SECTORS["energy_mining"]``.  Before that commit ADMR was in ``TICKERS``
+#:   and in the name map but in **no** sector, so
+#:   ``compute_cross_stock_features`` found ``sector is None`` for it and never
+#:   computed the family (``src/features/market.py:147-149``);
+#: * the artefact predates it, and the retrain that produced the current fleet
+#:   (``433765f``, 2026-10-14) was fitted on that artefact, so ADMR's model saw
+#:   these three columns as constant NaN.  Serving reads today's ``SECTORS``,
+#:   finds twelve peers, and computes real values for them.
+#:
+#: This is the project rule "``TICKERS`` and ``SECTORS`` must stay in sync"
+#: arriving as a train/serve skew.  The remedy is a rebuild of the training
+#: artefact — a data-side fix, not a source change — so it is reported rather
+#: than papered over.  Pinned so a *new* revival cannot pass unnoticed.
+REVIVED_BY_SERVING = {
+    "ADMR.JK": ("sector_relative_strength", "sector_return_1d", "sector_volume_ratio"),
+}
+
+
+def _pair_count(mapping: dict[str, tuple[str, ...]]) -> int:
+    """How many ticker/column pairs a documented map of this module names."""
+    return sum(len(columns) for columns in mapping.values())
+
 
 #: The six ICT columns the audit deferred, all-NaN in the training parquet
 #: because of the index-alignment bug at ``src/features/ict.py``.  They are named
@@ -253,6 +409,41 @@ def _aligned_history(history: pd.DataFrame, ticker: str, columns: list[str]):
     return align_to_schema(rows, columns)
 
 
+def _fundamentals_for(rows: pd.DataFrame, ticker: str) -> dict:
+    """``ticker``'s own fundamentals, as the committed training frame recorded them.
+
+    ``rows`` is that ticker's slice of ``data/processed/features.parquet``.
+    ``inject_macro_features`` assigns each field with ``df[col] = val`` from a
+    scalar, so a fundamental column is constant across a ticker's rows *by
+    construction* — asserted here rather than assumed, because if it ever stopped
+    being constant then "the value training used" would no longer be one value.
+    The value that matters for F3's Direction 2 is that ticker's own, and it is
+    ``NaN`` for the fields yfinance does not publish for it (every bank's
+    ``debt_to_equity``, every non-payer's ``dividend_yield``).
+
+    Passing one constant dict for all 45 tickers — what the first draft did —
+    makes the served measurement *easier* than production for exactly those
+    tickers: it fills in the columns ``fetch_fundamentals`` leaves ``NaN``, so a
+    per-ticker all-NaN fundamental column could never be seen at inference even
+    though a real request would produce it.
+    """
+    fundamentals: dict[str, float] = {}
+    for field in FUNDAMENTAL_FIELDS:
+        assert field in rows.columns, (
+            f"the committed training frame carries no {field!r} column, so a "
+            f"request's fundamentals cannot be modelled from it"
+        )
+        distinct = rows[field].dropna().unique()
+        assert len(distinct) <= 1, (
+            f"{field!r} takes {len(distinct)} distinct values across "
+            f"{ticker}'s committed rows ({distinct[:5]}) — the training builder "
+            f"writes it from a scalar, so fundamentals are no longer constant "
+            f"per ticker and 'the value training used' is not one value"
+        )
+        fundamentals[field] = rows[field].iloc[-1]
+    return fundamentals
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # F1 — the served path is no longer all-SELL on history
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -309,10 +500,13 @@ def test_not_all_sell_on_history(features_history, mapped_models):
     models, not a threshold to lower.  A floor on BUY alone would pass the
     audit's defect mirrored — a degenerate all-BUY fleet, which an all-zeros
     feature frame produces for real — so both degenerate constants are excluded
-    here.  The measured rates are printed because the number a human needs is
-    not "greater than zero" but "how far from either extreme", and a collapse
-    back toward the audit's 0.0 (or toward its mirror) would be visible in the
-    log long before it reached the gate.
+    here.  The gate is applied **per ticker as well as pooled**: these five
+    models were trained independently, so one of them collapsing to a single
+    outcome while the other four stay mixed would hide inside a pooled count.
+    The measured rates are printed because the number a human needs is not
+    "greater than zero" but "how far from either extreme", and a collapse back
+    toward the audit's 0.0 (or toward its mirror) would be visible in the log
+    long before it reached the gate.
     """
     from model_store import load_model_for
 
@@ -358,6 +552,26 @@ def test_not_all_sell_on_history(features_history, mapped_models):
     assert _degenerate_outcome(0, total_rows, total_rows) is not None
     assert _degenerate_outcome(4, 6, 10) is None
 
+    # Per ticker as well as pooled.  The pooled count above cannot see one
+    # collapsed model among four mixed ones, and the per-ticker tallies are
+    # already in hand, so the same pure function is applied to each of them.
+    per_ticker_degeneracy = {
+        ticker: _degenerate_outcome(buys, rows - buys, rows)
+        for ticker, (buys, rows) in per_ticker.items()
+    }
+    collapsed = {
+        ticker: message
+        for ticker, message in per_ticker_degeneracy.items()
+        if message is not None
+    }
+    assert not collapsed, (
+        f"per-ticker degeneracy: {collapsed}. Tallies: {per_ticker}. A model "
+        f"that answers only one way on every one of its own historical rows has "
+        f"collapsed to a constant, so the audit's F1 defect is back for that "
+        f"ticker — or its mirror — even though the pooled "
+        f"{total_buys}/{total_rows} count looks mixed."
+    )
+
     degeneracy = _degenerate_outcome(total_buys, total_sells, total_rows)
     assert degeneracy is None, (
         f"{degeneracy}: {per_ticker}. The served path has collapsed to a single "
@@ -371,7 +585,7 @@ def test_not_all_sell_on_history(features_history, mapped_models):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def test_distinct_tickers_use_distinct_models(
-        features_history, mapped_models, monkeypatch, tmp_path):
+        features_history, mapped_models, monkeypatch):
     """F2: distinct tickers resolve to distinct folders and distinct artefacts.
 
     The audit's substitution — ``sorted(os.listdir(models_dir))[0]`` answering
@@ -386,7 +600,8 @@ def test_distinct_tickers_use_distinct_models(
     3. the serialised booster bytes differ, so they are different trained
        models and not two loads of one;
     4. the loader is handed exactly the two artifact directories the index names,
-       in order — so neither ticker is answered from the other's folder.
+       in order, and the loads it performs through the **real** loader return two
+       distinct objects — so neither ticker is answered from the other's folder.
 
     The 45 persisted schemas are identical by design (Task 1.4 froze one column
     contract for the whole fleet), so schema equality is asserted here only to
@@ -429,12 +644,16 @@ def test_distinct_tickers_use_distinct_models(
 
     # Each load opens the artifact directory *its own ticker* names — pinned by
     # recording what ``model_store`` hands the loader, not merely that the two
-    # folder names differ.
+    # folder names differ.  The recorder **delegates to the real loader**: an
+    # earlier version returned ``model_a``/``model_b`` from the stub, which made
+    # the ``model_c is not model_d`` assertion below a tautology about the stub's
+    # own two return values rather than a fact about two real loads.
     opened: list[pathlib.Path] = []
+    real_load = model_store._load_xgboost_model
 
     def recording_load(artifact_dir):
         opened.append(pathlib.Path(artifact_dir))
-        return model_a if len(opened) == 1 else model_b
+        return real_load(artifact_dir)
 
     monkeypatch.setattr(model_store, "_load_xgboost_model", recording_load)
     model_c, columns_c = load_model_for(first)
@@ -444,7 +663,10 @@ def test_distinct_tickers_use_distinct_models(
         f"the loader was handed {opened}, not the folders the index names for "
         f"{first} and {second} ({[artifacts_a, artifacts_b]})"
     )
-    assert model_c is not model_d
+    assert model_c is not model_d, (
+        f"two loads from {artifacts_a} and {artifacts_b} returned the same "
+        f"object — the two directories hold one model"
+    )
     assert list(columns_c) == list(columns_a)
     assert list(columns_d) == list(columns_b)
 
@@ -496,46 +718,100 @@ def hashlib_sha256(artifacts: pathlib.Path) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def test_no_all_nan_model_feature(features_history, mapped_models, monkeypatch):
-    """F3/F5: the serving builder produces every schema column, none all-NaN.
+    """F3/F5: no schema column is all-NaN for a ticker — over the whole fleet.
 
-    Measured on the real artefacts: the on-disk universe snapshot
-    (``data/raw/stocks.csv`` + ``data/raw/ihsg.csv``) goes through the *real*
-    ``serve.build_inference_features`` — the same builder a request uses — and
-    its output is aligned to a real model's persisted schema.  The frame is
-    built once per ticker from the last 250 real rows.
+    The scope is **every mapped ticker** (all 45 models), in both directions.
+    The first version of this test looped over three tickers while its name, the
+    brief's requirement ("no feature the model expects is all-NaN at inference")
+    and the report's §4 claimed the fleet; that gap is exactly what hid the
+    finding below, so the fleet is measured in full even though it costs ~45 s.
+    A documented sample would have to be believed; this does not.
 
-    What was found, stated plainly because the finding *is* the evidence:
+    Measured on the real artefacts:
 
-    * the contract excludes ``vp_*`` (19), ``idn_*`` (10) and ``google_trend``
-      (1) — serving cannot produce them;
-    * the six deferred ICT columns (``ms_mss_*``, ``pd_*``) are all-NaN in the
-      committed parquet, and the **global SHAP selection retained none of
-      them** — so the strict assertion below is the honest one and no column is
-      pinned as an accepted exception.  The same is true of every other all-NaN
-      parquet column.
+    * **Direction 1 — the training frame, *that ticker's own* rows.**  Checking
+      a column fleet-wide is not enough: ``debt_to_equity`` is alive for 38
+      tickers and all-NaN for the seven banks, and ``sector_*`` are all-NaN for
+      ADMR.JK, so the global column is alive while the rows one model was
+      actually fitted on carry nothing.  15 of the 45 tickers carry such a
+      column; they are pinned exactly in ``TRAINING_ALL_NAN_BY_TICKER`` and are
+      pre-existing gaps in the training *data* (fields yfinance does not publish
+      for those tickers), not serving defects.
+    * **Direction 2 — the frame the serving builder actually produces**, one row
+      per ticker from the last 250 real rows of the on-disk universe snapshot,
+      with each ticker's *own* fundamentals (a single constant dict fills in the
+      columns ``fetch_fundamentals`` leaves ``NaN``, which would make the
+      measurement easier than production).  ``align_to_schema`` raising
+      ``FeatureSchemaError`` for an absent column is the F5 half, and the model
+      predicts on the aligned row, so it is a real model input.
+
+    Both directions together are the finding, and it fits in one line: for every
+    ticker, the schema columns all-NaN at inference are exactly the columns its
+    own training rows are all-NaN for plus the window-truncated
+    ``ob_nearest_bearish_distance`` of four tickers, minus the three ADMR sector
+    columns serving revives.  All three sets are pinned, with their evidence, in
+    ``TRAINING_ALL_NAN_BY_TICKER``, ``WINDOW_ALL_NAN_BY_TICKER`` and
+    ``REVIVED_BY_SERVING``; the assertion is the accounting, per ticker, over the
+    whole fleet.
     """
     import serve
     from features.schema import align_to_schema
     from model_store import load_model_for
 
-    # ── Direction 1: the training artefact, across every mapped model ────────
-    all_nan_in_training: dict[str, list[str]] = {}
+    # ── Direction 1: the training artefact, each ticker's own rows ───────────
+    training_all_nan: dict[str, tuple[str, ...]] = {}
+    retained_deferred: dict[str, list[str]] = {}
     for ticker in mapped_models:
+        rows = features_history[features_history["ticker"] == ticker]
+        assert not rows.empty, f"the committed parquet carries no rows for {ticker}"
         _, columns = load_model_for(ticker)
         missing = [c for c in columns if c not in features_history.columns]
         assert not missing, (
             f"{ticker}'s persisted schema names {len(missing)} column(s) the "
             f"committed training artefact does not carry: {missing}"
         )
-        empty = [c for c in columns if features_history[c].isna().all()]
+        empty = tuple(sorted(c for c in columns if rows[c].isna().all()))
         if empty:
-            all_nan_in_training[ticker] = empty
+            training_all_nan[ticker] = empty
+        deferred = sorted(set(DEFERRED_ICT_COLUMNS) & set(columns))
+        if deferred:
+            retained_deferred[ticker] = deferred
 
-    assert not all_nan_in_training, (
-        "the global SHAP selection retained all-NaN training column(s) in a "
-        f"schema: {all_nan_in_training}. The deferred ICT finding "
-        f"({sorted(DEFERRED_ICT_COLUMNS)}) is no longer confined to the "
-        f"deferred columns."
+    # That the check is *per ticker* is the point, demonstrated rather than
+    # claimed: the fleet-wide column is alive while the seven banks' own rows are
+    # not, so a global all-NaN test (what this direction used to be) reports
+    # nothing at all.
+    assert not features_history["debt_to_equity"].isna().all(), (
+        "debt_to_equity is now all-NaN for every ticker, so the per-ticker "
+        "demonstration below no longer distinguishes the two checks"
+    )
+    assert features_history.loc[
+        features_history["ticker"] == "BBCA.JK", "debt_to_equity"
+    ].isna().all(), (
+        "BBCA.JK's own rows now carry debt_to_equity — re-measure "
+        "TRAINING_ALL_NAN_BY_TICKER"
+    )
+
+    assert training_all_nan == TRAINING_ALL_NAN_BY_TICKER, (
+        f"the per-ticker all-NaN training columns changed: measured "
+        f"{training_all_nan}, documented {TRAINING_ALL_NAN_BY_TICKER}. This is a "
+        f"measured fact about the committed fleet, not a contract: re-measure it "
+        f"and update the constant deliberately. A column that is all-NaN across a "
+        f"ticker's own rows is a dead feature for that model — it is in the "
+        f"schema but every row the model was fitted on carried NaN."
+    )
+
+    # The other half of this finding, which the file previously only claimed in
+    # prose: the six ICT columns whose index alignment is the *deferred* bug are
+    # all-NaN in the training artefact, and the global SHAP selection retained
+    # none of them.  That is why no exception is needed for them, so it is
+    # asserted rather than assumed.
+    assert not retained_deferred, (
+        f"a persisted schema retains a deferred ICT column: {retained_deferred}. "
+        f"Those six columns ({sorted(DEFERRED_ICT_COLUMNS)}) are all-NaN in the "
+        f"committed training artefact because of the index-alignment bug at "
+        f"src/features/ict.py:117-129 (deliberately deferred), so a model whose "
+        f"schema names one is fed a permanently absent feature."
     )
 
     # ── Direction 2: the frame the serving builder actually produces ─────────
@@ -551,9 +827,13 @@ def test_no_all_nan_model_feature(features_history, mapped_models, monkeypatch):
     ].first()
     bi_rate = pd.Series(6.0, index=usdidr.index, name="bi_rate_official").ffill()
 
+    # ``monkeypatch``, not assignment: the universe context is cached on the
+    # module and a bare ``serve._universe_context = None`` would leak into every
+    # later test in the session.
     monkeypatch.setattr(serve, "_usdidr_cache", usdidr)
     monkeypatch.setattr(serve, "_fred_cache", pd.DataFrame())
     monkeypatch.setattr(serve, "_bi_cache", bi_rate)
+    monkeypatch.setattr(serve, "_universe_context", None)
     # Sentiment is stubbed to the value the real fetcher returns with no
     # ``NEWSAPI_KEY`` — and stubbing it keeps the real module from writing its
     # ``data/sentiment/`` cache into the repository during a test run.
@@ -563,40 +843,134 @@ def test_no_all_nan_model_feature(features_history, mapped_models, monkeypatch):
 
     # The *real* universe loader, reading the on-disk snapshots, so the frame
     # judged below is the frame a request would compute.
-    serve._universe_context = None
     _raw, _ihsg, all_ticker_data = serve.load_universe_context()
-    missing_tickers = [t for t in SERVED_TICKERS if t not in all_ticker_data]
+    missing_tickers = [t for t in mapped_models if t not in all_ticker_data]
     assert not missing_tickers, (
-        f"the committed universe snapshot carries no OHLCV for {missing_tickers}"
+        f"the committed universe snapshot carries no OHLCV for {missing_tickers}, "
+        f"so Direction 2 cannot measure the fleet"
     )
 
-    for ticker in SERVED_TICKERS:
+    inference_all_nan: dict[str, tuple[str, ...]] = {}
+    revived_by_serving: dict[str, tuple[str, ...]] = {}
+    built_widths: set[int] = set()
+    checked: set[str] = set()
+    started = time.perf_counter()
+
+    for ticker in mapped_models:
+        rows = features_history[features_history["ticker"] == ticker]
         model, columns = load_model_for(ticker)
         price_history = all_ticker_data[ticker].tail(250).copy()
         price_history.columns = [str(c) for c in price_history.columns]
 
         frame = serve.build_inference_features(
-            price_history, ticker, dict(FUNDAMENTAL_FIELDS)
+            price_history, ticker, _fundamentals_for(rows, ticker)
         )
         assert not frame.empty, f"the serving builder produced no frame for {ticker}"
+        built_widths.add(int(frame.shape[1]))
 
         # ``align_to_schema`` raises ``FeatureSchemaError`` naming every absent
         # column, which is the F5 half of this finding.
         aligned = align_to_schema(frame, columns)
 
-        empty = sorted(c for c in columns if aligned[c].isna().all())
-        print(f"\nF3 {ticker}: {len(columns)} schema columns, "
-              f"{frame.shape[1]} built columns, all-NaN schema columns: {empty}")
-        assert not empty, (
-            f"the serving builder produced all-NaN values for {ticker}'s "
-            f"schema column(s) {empty} — the model would predict on a feature "
-            f"that is absent at inference"
-        )
+        empty = tuple(sorted(c for c in columns if aligned[c].isna().all()))
+        if empty:
+            inference_all_nan[ticker] = empty
+
+        # The mirror case: a column that is all-NaN across this ticker's training
+        # rows and *populated* in the served row.  Collected so it is pinned too —
+        # a value serving supplies for a model that never saw one is the same
+        # class of skew as a value training supplied and serving cannot.
+        revived = tuple(sorted(set(training_all_nan.get(ticker, ())) - set(empty)))
+        if revived:
+            revived_by_serving[ticker] = revived
+
+        # A window exception is a *truncation of a real series*, never a column
+        # the fleet did not have: it must be in this model's schema and alive in
+        # this ticker's own training rows.  Asserted here so the map can never be
+        # widened into a blanket exemption for a genuinely dead column — and the
+        # contradiction with TRAINING_ALL_NAN_BY_TICKER is what would catch a
+        # reader who "simplified" the two maps into one.
+        for column in WINDOW_ALL_NAN_BY_TICKER.get(ticker, ()):
+            assert column in columns, (
+                f"WINDOW_ALL_NAN_BY_TICKER names {column!r} for {ticker}, which "
+                f"is not in that model's schema"
+            )
+            assert column not in TRAINING_ALL_NAN_BY_TICKER.get(ticker, ()), (
+                f"{column!r} is listed as a window exception for {ticker} *and* "
+                f"as all-NaN in its training rows — the two are different "
+                f"findings and the window case is defined by training having the "
+                f"column"
+            )
+            live = int(rows[column].notna().sum())
+            assert live > 0, (
+                f"{ticker}'s training rows carry no value for the window-excepted "
+                f"{column!r}, so it is not a window truncation but a column the "
+                f"fleet never had — the audit's F3 class"
+            )
+            print(
+                f"\nF3 {ticker}: {column} is all-NaN in the 250-row request window "
+                f"but live in {live}/{len(rows)} of that ticker's own training "
+                f"rows — the window truncation pinned in "
+                f"WINDOW_ALL_NAN_BY_TICKER"
+            )
 
         # And the row is genuinely predictable: an all-NaN frame would raise
         # here rather than pass an empty-looking assertion.
         prediction = np.asarray(model.predict(aligned))
-        assert prediction.shape == (1,), prediction.shape
+        assert prediction.shape == (1,), (ticker, prediction.shape)
+        checked.add(ticker)
+
+    elapsed = time.perf_counter() - started
+    print(
+        f"\nF3 direction 2 (the whole fleet): {len(checked)} tickers in "
+        f"{elapsed:.1f}s — {len(checked) - len(inference_all_nan)} with no all-NaN "
+        f"schema column; {_pair_count(TRAINING_ALL_NAN_BY_TICKER)} ticker/column "
+        f"pairs all-NaN in training over {len(TRAINING_ALL_NAN_BY_TICKER)} "
+        f"tickers; {_pair_count(WINDOW_ALL_NAN_BY_TICKER)} window-truncated over "
+        f"{len(WINDOW_ALL_NAN_BY_TICKER)}; "
+        f"{_pair_count(REVIVED_BY_SERVING)} revived by serving over "
+        f"{len(REVIVED_BY_SERVING)}; built column counts {sorted(built_widths)}"
+    )
+    assert checked == set(mapped_models), (
+        f"Direction 2 measured {sorted(checked)}, not the whole fleet "
+        f"{sorted(mapped_models)}"
+    )
+
+    # The three documented maps together are the assertion: for every ticker, the
+    # columns all-NaN at inference are exactly the columns its own training rows
+    # are all-NaN for, plus the documented window truncations, minus the columns
+    # serving revives.  Anything outside that accounting — a column training
+    # populated and serving cannot, for a ticker not in the window map — is the
+    # audit's F3 class and fails here.
+    expected_inference_all_nan: dict[str, tuple[str, ...]] = {}
+    for ticker in (set(TRAINING_ALL_NAN_BY_TICKER)
+                   | set(WINDOW_ALL_NAN_BY_TICKER)
+                   | set(REVIVED_BY_SERVING)):
+        columns = tuple(sorted(
+            (set(TRAINING_ALL_NAN_BY_TICKER.get(ticker, ()))
+             | set(WINDOW_ALL_NAN_BY_TICKER.get(ticker, ())))
+            - set(REVIVED_BY_SERVING.get(ticker, ()))
+        ))
+        if columns:
+            expected_inference_all_nan[ticker] = columns
+
+    assert inference_all_nan == expected_inference_all_nan, (
+        f"the fleet's inference-time all-NaN columns changed: measured "
+        f"{inference_all_nan}, documented {expected_inference_all_nan}. A schema "
+        f"column that is all-NaN at inference and alive in the ticker's own "
+        f"training rows is exactly the audit's F3 class: measure it, report it, "
+        f"and if it is a real window effect add it to WINDOW_ALL_NAN_BY_TICKER "
+        f"with its evidence — do not widen the assertion for the fleet."
+    )
+
+    assert revived_by_serving == REVIVED_BY_SERVING, (
+        f"the columns the serving builder supplies for a ticker whose own training "
+        f"rows are all-NaN changed: measured {revived_by_serving}, documented "
+        f"{REVIVED_BY_SERVING}. This is the mirror of the audit's F3 class: the "
+        f"model was fitted with the column constant-NaN and is now served real "
+        f"values it was never trained on. Measure it, report it, and change the "
+        f"map only with that evidence."
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -824,7 +1198,12 @@ def _serving_client(tmp_path, monkeypatch):
     # the daily-cache date to today makes that task return immediately instead of
     # reaching for Yahoo Finance and bi.go.id after the response.
     monkeypatch.setattr(serve, "_cache_date", str(_date.today()))
-    serve.model_cache.clear()
+    # ``monkeypatch`` rather than ``serve.model_cache.clear()``: clearing the
+    # module-level dict mutates shared state that no fixture restores, so an
+    # empty cache would leak into every later test in the session.  Replacing the
+    # object starts this test clean and restores the original dict — contents and
+    # all — at teardown.
+    monkeypatch.setattr(serve, "model_cache", {})
     serve._cache_put("BBCA.JK", pd.Series({"rsi": 0.5}), SCHEMA,
                      serve.CACHE_WINDOW_DEFAULT)
     return TestClient(serve.app)
@@ -1031,7 +1410,7 @@ def _imported_top_level_names(sources: list[pathlib.Path]) -> dict[str, set[str]
     return imported
 
 
-def test_all_imports_declared(capsys):
+def test_all_imports_declared():
     """F11: the repository imports nothing a requirements file does not declare.
 
     The scan is structural (AST over every ``*.py`` the repository owns, with
@@ -1045,9 +1424,20 @@ def test_all_imports_declared(capsys):
     otherwise adding a new dependency would quietly leave the scan unable to
     judge it, which is the "passes CI and proves nothing" shape this whole task
     exists to remove.
+
+    The scan's *own* scope is pinned before anything is concluded from it:
+    widening :data:`SCAN_EXCLUDED_DIRS` is a one-line edit to this file that
+    would otherwise leave every assertion below green while the scan judged
+    nothing.
     """
     sources = _iter_repo_sources()
     assert sources, "the scan found no source files — it is not judging anything"
+    for known in ("src/serve.py", "src/features/ict.py",
+                  "tests/test_audit_regressions.py"):
+        assert _REPO_ROOT / known in sources, (
+            f"{known} is not in the F11 scan scope — the scan's exclusions were "
+            f"widened and it is no longer judging the repository it claims to"
+        )
 
     imported = _imported_top_level_names(sources)
     stdlib = set(sys.stdlib_module_names)
@@ -1145,29 +1535,42 @@ def _stub_batch_io(monkeypatch):
     monkeypatch.setattr(serve, "fetch_fundamentals", lambda ticker: {})
 
 
-def test_batch_failure_is_error(tmp_path, monkeypatch, capsys):
+def test_batch_failure_is_error(tmp_path, monkeypatch):
     """F12: a ticker that cannot be predicted is an error with no signal in it.
 
     Two failure modes are driven, because the defect was about the *shape of the
     failure response* rather than about one cause:
 
-    * an **unmapped** ticker — ``load_best_model`` raises ``ModelNotFound``.  A
-      client error stays a 404 (the pre-fix handler re-raised ``HTTPException``
-      too), but pre-fix the *model substitution* meant a ticker with no model was
-      quietly answered by another ticker's; the pin here is that it cannot be
-      answered at all, and that the body carries no tradable field;
+    * an **unmapped** ticker — ``load_best_model`` raises ``ModelNotFound``,
+      which the handler re-raises as **exactly a 404** (``src/serve.py:1103``
+      re-raises ``HTTPException``, so ``src/serve.py:511``'s status reaches the
+      client unchanged; the pre-fix handler re-raised it too).  Pre-fix the
+      *model substitution* meant a ticker with no model was quietly answered by
+      another ticker's; the pins here are that it cannot be answered at all,
+      that the status is 404 and not a tolerated 502, and that the body carries
+      no tradable field;
     * a ticker whose **feature build fails** — the cause the audit measured, and
       the branch that used to answer ``prediction: 0`` (SELL),
       ``probability_up: 0.0`` and the error text stuffed into ``signal``, all
-      under HTTP 200.
+      under HTTP 200.  That one is **exactly a 502** (``src/serve.py:1113``),
+      and the two statuses are asserted separately because they are separate
+      causes: accepting either for either is weaker than this docstring.
 
     The final block constructs the deleted shape — the exact ``PredictResponse``
     the old handler returned — and shows it *does* carry the signal fields the
-    live responses do not, so the absence assertions are not vacuous.
+    live responses do not, so the absence assertions are not vacuous; the field
+    list they loop over is itself pinned, so emptying it cannot disable them.
     """
     import serve
     from datetime import date as _date
     from model_store import ModelNotFound, resolve_model_folder
+
+    # Anti-vacuity: the absence assertions below are loops over this constant, so
+    # an emptied or shortened constant would silently disable them.
+    assert len(SIGNAL_SHAPED_FIELDS) == 3, SIGNAL_SHAPED_FIELDS
+    assert set(SIGNAL_SHAPED_FIELDS) == {"prediction", "signal", "probability_up"}, (
+        SIGNAL_SHAPED_FIELDS
+    )
 
     # ``/predict/batch`` schedules ``refresh_daily_cache``; pinning the date to
     # today makes it return immediately rather than reach for bi.go.id.
@@ -1182,8 +1585,9 @@ def test_batch_failure_is_error(tmp_path, monkeypatch, capsys):
     _stub_batch_io(monkeypatch)
     response = client.post("/predict/batch", json={"tickers": [unmapped]})
 
-    # Both right: 404 = unmapped ticker re-raised as a client error; 502 = build failed.
-    assert response.status_code in (404, 502), response.text
+    # Exact, not tolerant: the handler is deterministic here, so 404 is the only
+    # correct status for a client error and 502 belongs to Failure 2 alone.
+    assert response.status_code == 404, response.text
     body = response.json()
     assert "detail" in body, body
     assert unmapped in body["detail"], body
@@ -1196,6 +1600,8 @@ def test_batch_failure_is_error(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(serve, "build_inference_features", explode)
     broken = client.post("/predict/batch", json={"tickers": ["BROKEN.JK"]})
 
+    # The other cause, and its own exact status — 502 is not an alternative to
+    # the 404 above, it is what a server-side build failure answers.
     assert broken.status_code == 502, broken.text
     broken_body = broken.json()
     assert "detail" in broken_body, broken_body
