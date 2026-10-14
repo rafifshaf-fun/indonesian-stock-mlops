@@ -9,9 +9,12 @@ F1  ``test_not_all_sell_on_history``
     standardisation were fed raw features.  This drives the **real** retrained
     models over the **real** committed ``data/processed/features.parquet``,
     each frame aligned through ``features.schema.align_to_schema`` to the
-    ticker's own persisted contract, and asserts the BUY count is above zero.
-    The per-ticker and total rates are printed so the evidence survives in the
-    test log; the assertion is the gate.
+    ticker's own persisted contract, and asserts that **both** outcomes occur
+    (``total_buys > 0`` *and* ``total_sells > 0``).  A floor on BUY alone is not
+    enough: the mirror defect — an all-BUY fleet — is produced for real by an
+    all-zeros feature frame (7,735/7,735 BUY), so the gate must exclude both
+    degenerate constants.  The per-ticker and total rates are printed so the
+    evidence survives in the test log; the assertion is the gate.
 
 F2  ``test_distinct_tickers_use_distinct_models``
     Two tickers resolve to **different** model folders, load genuinely
@@ -254,8 +257,44 @@ def _aligned_history(history: pd.DataFrame, ticker: str, columns: list[str]):
 # F1 — the served path is no longer all-SELL on history
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _degenerate_outcome(total_buys: int, total_sells: int,
+                        total_rows: int) -> str | None:
+    """F1's gate: a fleet that answers only one way is degenerate, either way.
+
+    The audit's defect was an all-SELL fleet — 0 BUY across its 1,500 rows.  Its
+    mirror image, an all-BUY fleet, is the *same* class of defect and is not
+    hypothetical: replacing every feature with ``0`` and predicting over these
+    same rows returns 7,735/7,735 BUY.  A floor on BUY alone therefore passes
+    that frame, which is why the gate is "both outcomes occur" rather than
+    "BUY occurs".
+
+    No percentage band is asserted.  "Both outcomes occur" is the honest,
+    non-arbitrary statement of non-degeneracy, and how far the fleet sits from
+    the extremes is what the printed rates are for; a band around whatever the
+    data happens to give would be a threshold to tune rather than a fact to
+    state.
+
+    Returns ``None`` when both outcomes occur, otherwise a message naming the
+    degeneracy.  It is a pure function of the tallies so both directions can be
+    shown falsifiable without a second prediction pass.
+    """
+    if total_rows <= 0:
+        return "the measurement covered no historical rows"
+    if total_buys == 0:
+        return (
+            f"0 BUY across {total_rows} historical rows — the audit's degenerate "
+            f"all-SELL fleet"
+        )
+    if total_sells == 0:
+        return (
+            f"0 SELL across {total_rows} historical rows — a degenerate all-BUY "
+            f"fleet, the mirror of the audit's defect"
+        )
+    return None
+
+
 def test_not_all_sell_on_history(features_history, mapped_models):
-    """F1: the real models produce BUYs on the real historical rows.
+    """F1: the real models produce both outcomes on the real historical rows.
 
     The audit's headline finding was ``0 BUY across 1,500 historical rows``:
     models fitted on a standardisation that was lost between training and
@@ -264,11 +303,16 @@ def test_not_all_sell_on_history(features_history, mapped_models):
     the retrained fleet, with each frame aligned to that ticker's persisted
     ``feature_schema.json`` exactly as serving aligns it.
 
-    The assertion is deliberately minimal (``total_buys > 0``) and is not tuned
-    to the data: a rate of zero is a finding about the models, not a threshold to
-    lower.  The measured rates are printed because the number a human needs is
-    not "greater than zero" but "how far from zero", and a collapse back toward
-    the audit's 0.0 would be visible in the log long before it reached the gate.
+    The assertion is that the model produces **both** outcomes across the sample
+    (``total_buys > 0 and total_sells > 0``), not a floor on one side, and is
+    not tuned to the data: a count of zero on either side is a finding about the
+    models, not a threshold to lower.  A floor on BUY alone would pass the
+    audit's defect mirrored — a degenerate all-BUY fleet, which an all-zeros
+    feature frame produces for real — so both degenerate constants are excluded
+    here.  The measured rates are printed because the number a human needs is
+    not "greater than zero" but "how far from either extreme", and a collapse
+    back toward the audit's 0.0 (or toward its mirror) would be visible in the
+    log long before it reached the gate.
     """
     from model_store import load_model_for
 
@@ -292,6 +336,8 @@ def test_not_all_sell_on_history(features_history, mapped_models):
         total_buys += buys
         total_rows += len(aligned)
 
+    total_sells = total_rows - total_buys
+
     report = " | ".join(
         f"{ticker}: {buys}/{rows} = {buys / rows:.4f}"
         for ticker, (buys, rows) in per_ticker.items()
@@ -299,13 +345,24 @@ def test_not_all_sell_on_history(features_history, mapped_models):
     print(
         f"\nF1 BUY rate per ticker: {report}\n"
         f"F1 BUY rate in total:   {total_buys}/{total_rows} = "
-        f"{total_buys / total_rows:.4f}"
+        f"{total_buys / total_rows:.4f}\n"
+        f"F1 SELL rate in total:  {total_sells}/{total_rows} = "
+        f"{total_sells / total_rows:.4f}"
     )
 
-    assert total_rows > 0
-    assert total_buys > 0, (
-        f"the served path produced {total_buys} BUY across {total_rows} "
-        f"historical rows: {per_ticker}. The audit's 0-BUY defect is back."
+    # The gate is falsifiable in both directions, demonstrated here rather than
+    # only claimed: an all-BUY and an all-SELL sample are each rejected while a
+    # mixed one is accepted.  (The counts are arbitrary — only the shape
+    # matters — so this is not a rate threshold smuggled in as a demo.)
+    assert _degenerate_outcome(total_rows, 0, total_rows) is not None
+    assert _degenerate_outcome(0, total_rows, total_rows) is not None
+    assert _degenerate_outcome(4, 6, 10) is None
+
+    degeneracy = _degenerate_outcome(total_buys, total_sells, total_rows)
+    assert degeneracy is None, (
+        f"{degeneracy}: {per_ticker}. The served path has collapsed to a single "
+        f"constant outcome, so the audit's F1 defect is back — or its mirror "
+        f"image, which the old ``buys > 0`` floor could not see."
     )
 
 
@@ -1125,6 +1182,7 @@ def test_batch_failure_is_error(tmp_path, monkeypatch, capsys):
     _stub_batch_io(monkeypatch)
     response = client.post("/predict/batch", json={"tickers": [unmapped]})
 
+    # Both right: 404 = unmapped ticker re-raised as a client error; 502 = build failed.
     assert response.status_code in (404, 502), response.text
     body = response.json()
     assert "detail" in body, body
