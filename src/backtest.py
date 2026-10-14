@@ -8,6 +8,7 @@ Usage:
     python src/backtest.py                         # All tickers
     python src/backtest.py --ticker BBCA.JK        # Single ticker
     python src/backtest.py --threshold 0.65        # Min confidence to trade
+    python src/backtest.py --slippage-bps 10       # 10 bps slippage per side
     python src/backtest.py --plot                   # Generate equity curve plots
 
 Output: Results logged to MLflow experiment "backtest"
@@ -49,7 +50,42 @@ _model_cache = {}  # ticker -> (model, feature_columns)
 DEFAULT_CONFIDENCE_THRESHOLD = 0.5   # Only trade if prob > this
 DEFAULT_INITIAL_CAPITAL = 1_000_000   # Starting virtual capital (IDR)
 DEFAULT_TRADE_SIZE = 0.25            # Fraction of capital per trade
-DEFAULT_COST_PER_TRADE = 0.0015      # 0.15% trading cost (broker fee)
+
+# ── Transaction costs ─────────────────────────────────────────────────────────
+# IDX is not symmetric.  Brokerage is paid on both legs, and the sell leg also
+# carries the 0.1% final sales tax, so a round trip costs strictly more on the
+# way out than on the way in.  A single flat fee charged at all three sites
+# understated the exit by 0.1% of the notional; on a strategy that trades often
+# that gap decides whether the strategy is viable at all (Phase 3).
+DEFAULT_BUY_COST = 0.0015            # Brokerage on the buy leg
+DEFAULT_SELL_COST = 0.0025           # Brokerage + 0.1% final sales tax on the sell leg
+
+
+def costs_for(value: float, side: str, slippage_bps: int = 0) -> float:
+    """Transaction cost in IDR for trading ``value`` IDR on one side.
+
+    Args:
+        value: Notional traded on this leg.  The buy site passes
+            ``shares * price``, the two sell sites pass ``proceeds``.
+        side: ``"buy"`` or ``"sell"`` — the sell leg carries the 0.1% tax.
+        slippage_bps: Slippage in basis points, applied per side: 10 bps adds
+            0.1% to the cost of this leg, and a round trip therefore pays it
+            twice.  One basis point is one hundredth of a percent.
+
+    Returns:
+        The cost as a positive IDR amount.
+
+    Raises:
+        ValueError: If ``side`` is neither ``"buy"`` nor ``"sell"``.  A typo
+            would otherwise be charged the buy rate silently.
+    """
+    if side == "buy":
+        rate = DEFAULT_BUY_COST
+    elif side == "sell":
+        rate = DEFAULT_SELL_COST
+    else:
+        raise ValueError(f"side must be 'buy' or 'sell', got {side!r}")
+    return value * (rate + slippage_bps / 10_000)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CORE: BACKTEST A SINGLE TICKER
@@ -58,7 +94,7 @@ DEFAULT_COST_PER_TRADE = 0.0015      # 0.15% trading cost (broker fee)
 def backtest_ticker(ticker: str, df_features: pd.DataFrame,
                     confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
                     trade_size: float = DEFAULT_TRADE_SIZE,
-                    cost_per_trade: float = DEFAULT_COST_PER_TRADE,
+                    slippage_bps: int = 0,
                     initial_capital: float = DEFAULT_INITIAL_CAPITAL,
                     plot: bool = False) -> dict:
     """Walk-forward backtest for a single ticker.
@@ -71,7 +107,8 @@ def backtest_ticker(ticker: str, df_features: pd.DataFrame,
         df_features: Full feature DataFrame (all tickers)
         confidence_threshold: Minimum confidence to enter a trade
         trade_size: Fraction of capital deployed per trade (0-1)
-        cost_per_trade: Trading cost as fraction (e.g. 0.0015 = 0.15%)
+        slippage_bps: Slippage in basis points, charged per side on top of the
+            side's rate (see :func:`costs_for`)
         initial_capital: Starting virtual capital
         plot: Generate equity curve plot
 
@@ -169,7 +206,9 @@ def backtest_ticker(ticker: str, df_features: pd.DataFrame,
         if predicted_signal == 1 and not in_position:
             invest_amount = current_cash * trade_size
             shares_bought = int(invest_amount / price)
-            cost = shares_bought * price * cost_per_trade
+            # Entry is a buy: brokerage, plus any slippage, against the notional.
+            cost = costs_for(shares_bought * price, side="buy",
+                             slippage_bps=slippage_bps)
             if shares_bought > 0 and invest_amount > cost:
                 current_shares = shares_bought
                 current_cash -= shares_bought * price + cost
@@ -187,7 +226,8 @@ def backtest_ticker(ticker: str, df_features: pd.DataFrame,
         # SELL signal (or exit)
         elif predicted_signal == 0 and in_position:
             proceeds = current_shares * price
-            cost = proceeds * cost_per_trade
+            # Exit is a sell: brokerage plus the final sales tax, and slippage.
+            cost = costs_for(proceeds, side="sell", slippage_bps=slippage_bps)
             pnl = proceeds - current_shares * entry_price - cost
             current_cash += proceeds - cost
             in_position = False
@@ -211,7 +251,9 @@ def backtest_ticker(ticker: str, df_features: pd.DataFrame,
     if in_position and n > 0:
         price = prices[-1]
         proceeds = current_shares * price
-        cost = proceeds * cost_per_trade
+        # The forced close is a sell, and pays the sell side's costs like any
+        # other exit — including the final sales tax it had been spared.
+        cost = costs_for(proceeds, side="sell", slippage_bps=slippage_bps)
         pnl = proceeds - current_shares * entry_price - cost
         current_cash += proceeds - cost
         in_position = False
@@ -298,6 +340,10 @@ def backtest_ticker(ticker: str, df_features: pd.DataFrame,
         "avg_loss": round(avg_loss, 2),
         "confidence_threshold": confidence_threshold,
         "trade_size": trade_size,
+        "slippage_bps": slippage_bps,
+        # Every leg's cost, so a run can be compared across slippage levels by
+        # what it actually paid rather than by the return alone.
+        "total_costs": round(sum(t["cost"] for t in trades_taken), 2),
     }
 
     logger.info(
@@ -314,13 +360,15 @@ def backtest_ticker(ticker: str, df_features: pd.DataFrame,
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run_backtest(tickers: list = None, confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
-                 trade_size: float = DEFAULT_TRADE_SIZE, plot: bool = False) -> pd.DataFrame:
+                 trade_size: float = DEFAULT_TRADE_SIZE, slippage_bps: int = 0,
+                 plot: bool = False) -> pd.DataFrame:
     """Run backtest on multiple tickers and log results to MLflow.
 
     Args:
         tickers: List of tickers (default: all TICKERS)
         confidence_threshold: Minimum confidence to trade
         trade_size: Fraction of capital per trade
+        slippage_bps: Slippage in basis points, charged per side
         plot: Generate equity curve plots
 
     Returns:
@@ -340,6 +388,7 @@ def run_backtest(tickers: list = None, confidence_threshold: float = DEFAULT_CON
             ticker, df,
             confidence_threshold=confidence_threshold,
             trade_size=trade_size,
+            slippage_bps=slippage_bps,
             plot=plot,
         )
         if result is None:
@@ -356,6 +405,7 @@ def run_backtest(tickers: list = None, confidence_threshold: float = DEFAULT_CON
                 "confidence_threshold": confidence_threshold,
                 "trade_size": trade_size,
                 "initial_capital": DEFAULT_INITIAL_CAPITAL,
+                "slippage_bps": slippage_bps,
             })
             mlflow.log_metrics({
                 "total_return": metrics["total_return"],
@@ -365,6 +415,7 @@ def run_backtest(tickers: list = None, confidence_threshold: float = DEFAULT_CON
                 "n_trades": metrics["n_trades"],
                 "avg_win": metrics["avg_win"],
                 "avg_loss": metrics["avg_loss"],
+                "total_costs": metrics["total_costs"],
             })
             # Log trades as artifact
             if trades:
@@ -420,17 +471,20 @@ if __name__ == "__main__":
                         help=f"Min confidence to trade (default: {DEFAULT_CONFIDENCE_THRESHOLD})")
     parser.add_argument("--trade-size", type=float, default=DEFAULT_TRADE_SIZE,
                         help=f"Fraction of capital per trade (default: {DEFAULT_TRADE_SIZE})")
+    parser.add_argument("--slippage-bps", type=int, default=0,
+                        help="Slippage in basis points, charged per side (default: 0)")
     parser.add_argument("--plot", action="store_true", help="Generate equity curve plots")
     args = parser.parse_args()
 
     tickers = [args.ticker] if args.ticker else TICKERS
-    logger.info("Running backtest on %d tickers (threshold=%.2f, trade_size=%.2f)...",
-                len(tickers), args.threshold, args.trade_size)
+    logger.info("Running backtest on %d tickers (threshold=%.2f, trade_size=%.2f, slippage=%d bps)...",
+                len(tickers), args.threshold, args.trade_size, args.slippage_bps)
 
     results = run_backtest(
         tickers=tickers,
         confidence_threshold=args.threshold,
         trade_size=args.trade_size,
+        slippage_bps=args.slippage_bps,
         plot=args.plot,
     )
 
