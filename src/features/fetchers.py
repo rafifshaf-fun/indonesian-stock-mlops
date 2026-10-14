@@ -1,6 +1,7 @@
 """
 Data fetchers: fundamentals, USD/IDR, FRED macro, BI Rate, Google Trends.
 """
+import json
 import os
 import time
 from typing import Optional
@@ -39,21 +40,142 @@ except ImportError:
     logger.warning("pytrends not installed — run: pip install pytrends")
 
 
-def fetch_fundamentals(ticker: str) -> dict:
+#: ``fetch_fundamentals``'s eight keys, in the order the model contract has
+#: always seen them.  Module-level so the value-only fetcher, the status seam and
+#: every caller agree on the key set from one place: a key added to one of them
+#: and not the other is a column that silently becomes NaN downstream.
+FUNDAMENTAL_KEYS = (
+    "pe_ratio", "pb_ratio", "dividend_yield", "market_cap",
+    "debt_to_equity", "return_on_equity", "revenue_growth", "profit_margins",
+)
+
+#: yfinance field name per returned key.
+_FUNDAMENTAL_FIELDS = {
+    "pe_ratio": "trailingPE",
+    "pb_ratio": "priceToBook",
+    "dividend_yield": "dividendYield",
+    "market_cap": "marketCap",
+    "debt_to_equity": "debtToEquity",
+    "return_on_equity": "returnOnEquity",
+    "revenue_growth": "revenueGrowth",
+    "profit_margins": "profitMargins",
+}
+
+#: Why an empty ``.info`` is reported as its own failure mode rather than as
+#: "no fundamentals".  Yahoo answers 200 with an empty body for a delisted or
+#: unknown symbol, and it raises for none of the cases here — which is what makes
+#: an ``except``-based detector structurally insufficient.
+NO_FUNDAMENTALS = "Yahoo returned an empty response for .info — no fundamental data published"
+
+
+def _published(value):
+    """One field's value, with yfinance's ``None`` read as an absent measurement.
+
+    ``None`` cannot be passed through to the frame: ``inject_macro_features``
+    assigns each field with ``df[col] = val``, and assigning ``None`` **deletes
+    the column**.  A schema-required fundamental would then be *absent* rather
+    than NaN, and ``align_to_schema`` raises ``FeatureSchemaError`` on an absent
+    column — so the request would answer a 500 where it used to answer a silent
+    200.  Both are wrong; ``NaN`` is the honest one, and it is the value a field
+    yfinance never published has always reached the fleet as.
+    """
+    return np.nan if value is None else value
+
+
+def _fundamental_values(info: dict) -> dict:
+    """The eight feature values from a Yahoo ``.info`` body.
+
+    ``dividend_yield`` is passed through **as published**, with no truthiness
+    fallback.  ``info.get("dividendYield", np.nan) or 0.0`` — what stood here —
+    could not tell an unpublished yield from a real zero: ``None`` is falsy, so
+    the fallback fired on it and turned "yfinance does not know" into a
+    ``0.0`` in a column all 45 models consume.  XGBoost reads ``0.0`` (this
+    ticker pays nothing) differently from ``NaN`` (nobody measured this), so the
+    fabrication was not a lost value but an invented one.
+
+    The reachable spelling is ``None``.  yfinance drops unknown fields entirely
+    rather than publishing a null (``yfinance/scrapers/quote.py:650``), so a
+    *missing key* already reached ``np.nan`` through the ``get`` default and was
+    never affected; ``None`` is a value in the dict, which is why the fallback
+    had to be removed rather than the default changed.  A published ``0.0`` is
+    left as published: it is a measurement, and the one honest reading of it is
+    the one Yahoo sent.
+
+    The coercion itself — why ``None`` must become ``NaN`` rather than travel
+    through to the frame — belongs to :func:`_published`.
+    """
+    return {
+        key: _published(info.get(field))
+        for key, field in _FUNDAMENTAL_FIELDS.items()
+    }
+
+
+def _fundamentals_failure_reason(exc: BaseException) -> str:
+    """One distinct reason string per production failure mode of ``.info``.
+
+    The modes are those the Yahoo client actually produces: an
+    ``HTTPError`` carrying a status (429 is a rate limit; 401/403 is a dead or
+    rejected credential and is *not* the same fault), a refused connection, a
+    body that is not JSON — Yahoo serves an HTML error page under load — and
+    anything else, named by its own type so an unrecognised failure still travels
+    as text.  A rate limit reported as a dead key sends an operator to the wrong
+    place, which is the reason Task 1.9 gave each sentiment failure its own
+    string.
+    """
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        if exc.response.status_code == 429:
+            return "Yahoo Finance rate limit reached (HTTP 429)"
+        return f"Yahoo Finance returned HTTP {exc.response.status_code}"
+    if isinstance(exc, json.JSONDecodeError):
+        return "Yahoo Finance returned a body that is not JSON"
+    if isinstance(exc, requests.RequestException):
+        return f"Yahoo Finance request failed ({type(exc).__name__}: {exc})"
+    return f"Yahoo Finance .info fetch failed ({type(exc).__name__}: {exc})"
+
+
+def fetch_fundamentals_status(ticker: str) -> tuple[dict, bool, Optional[str]]:
+    """Get the eight fundamental values *and* whether they are a measurement.
+
+    ``fetch_fundamentals`` returns a bare dict, and every production failure mode
+    of the fundamentals path — a rate limit, a rejected key, a dead endpoint, an
+    HTML error page, and an empty 200 — arrives as the same eight ``NaN`` values
+    that a healthy ``.info`` produces for a field Yahoo does not publish.  Task
+    2.3's retrain made five of those eight schema-required for all 45 models, so
+    an outage became five constant-NaN inputs to a real prediction with nothing in
+    the response saying so.  This is the seam the serving path reads instead: it
+    reports the failure as data rather than expecting an exception that the real
+    code does not always raise (the empty-200 mode raises nothing at all).
+
+    Returns:
+        ``(values, available, reason)``.  ``values`` always carries all eight
+        keys; ``available`` is ``False`` when they are the fallback rather than a
+        measurement, and ``reason`` then names the failure.  A plain 3-tuple
+        rather than a class, mirroring
+        :func:`fetch_news_sentiment_status`.
+    """
     try:
         info = yf.Ticker(ticker).info
-        return {
-            "pe_ratio": info.get("trailingPE", np.nan),
-            "pb_ratio": info.get("priceToBook", np.nan),
-            "dividend_yield": info.get("dividendYield", np.nan) or 0.0,
-            "market_cap": info.get("marketCap", np.nan),
-            "debt_to_equity": info.get("debtToEquity", np.nan),
-            "return_on_equity": info.get("returnOnEquity", np.nan),
-            "revenue_growth": info.get("revenueGrowth", np.nan),
-            "profit_margins": info.get("profitMargins", np.nan),
-        }
-    except Exception:
-        return {k: np.nan for k in ["pe_ratio", "pb_ratio", "dividend_yield", "market_cap", "debt_to_equity", "return_on_equity", "revenue_growth", "profit_margins"]}
+    except Exception as e:
+        return {k: np.nan for k in FUNDAMENTAL_KEYS}, False, _fundamentals_failure_reason(e)
+
+    if not info:
+        return {k: np.nan for k in FUNDAMENTAL_KEYS}, False, NO_FUNDAMENTALS
+
+    return _fundamental_values(info), True, None
+
+
+def fetch_fundamentals(ticker: str) -> dict:
+    """Get fundamental metrics for a ticker.
+
+    Never raises: an unavailable source degrades to ``{key: np.nan}`` for all
+    eight keys, which is the safe default the project's convention requires.
+    That default is indistinguishable from a healthy fetch of a ticker whose
+    fields Yahoo does not publish, so a caller that must tell them apart wants
+    :func:`fetch_fundamentals_status` — the value-only view of it, the way
+    ``fetch_news_sentiment`` is the value-only view of its own status companion.
+    """
+    values, _available, _reason = fetch_fundamentals_status(ticker)
+    return values
 
 
 def fetch_usdidr(start: str, end: str) -> pd.Series:

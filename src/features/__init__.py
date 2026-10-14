@@ -25,6 +25,7 @@ if _parent not in _sys.path:
 # ── Re-export data fetchers ───────────────────────────────────────────────────
 from .fetchers import (
     fetch_fundamentals,
+    fetch_fundamentals_status,
     fetch_usdidr,
     fetch_fred_macro,
     fetch_bi_rate,
@@ -73,7 +74,8 @@ from .pipeline import (
 )
 
 __all__ = [
-    "fetch_fundamentals", "fetch_usdidr", "fetch_fred_macro", "fetch_bi_rate",
+    "fetch_fundamentals", "fetch_fundamentals_status", "fetch_usdidr",
+    "fetch_fred_macro", "fetch_bi_rate",
     "fetch_google_trends", "fetch_news_sentiment", "fetch_idx_fundamentals",
     "compute_ta_features", "compute_custom_features",
     "compute_enhanced_mas", "compute_ict_features",

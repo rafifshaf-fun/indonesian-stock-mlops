@@ -1304,6 +1304,15 @@ def _serving_client(tmp_path, monkeypatch):
     monkeypatch.setattr(
         serve, "load_best_model", lambda ticker: (_StubModel(), list(SCHEMA))
     )
+    # Task 2.4: ``/predict`` resolves fundamentals before the cache is consulted
+    # (the status has to travel with the values, or a later request would report
+    # a failed fetch as healthy), and this suite's network guard makes
+    # ``yf.Ticker`` *raise* — so without a stand-in here the request would
+    # legitimately report ``degraded: ["fundamentals"]`` and this test's healthy
+    # direction would be measuring the guard rather than the sentiment seam.  No
+    # values are needed: ``SCHEMA`` is ``["rsi"]``, so no fundamental column is in
+    # this model's contract.
+    monkeypatch.setattr(serve, "get_fundamentals", lambda ticker: ({}, True, None))
     # ``/predict`` adds ``refresh_daily_cache`` as a background task.  Pinning
     # the daily-cache date to today makes that task return immediately instead of
     # reaching for Yahoo Finance and bi.go.id after the response.
@@ -1642,7 +1651,13 @@ def _stub_batch_io(monkeypatch):
     )
     monkeypatch.setattr(serve.asyncio, "to_thread", inline)
     monkeypatch.setattr(serve.yf, "download", lambda *a, **k: price_frame.copy())
-    monkeypatch.setattr(serve, "fetch_fundamentals", lambda ticker: {})
+    # Task 2.4: the serving path reads ``serve.get_fundamentals`` — the status
+    # seam, because the eight values cannot say whether they are a measurement —
+    # so the stub is on that seam rather than on the value-only fetcher, which
+    # the serving path no longer calls.  The stand-in is exactly what the old
+    # ``fetch_fundamentals`` stub produced (no values) plus the availability it
+    # silently implied.
+    monkeypatch.setattr(serve, "get_fundamentals", lambda ticker: ({}, True, None))
 
 
 def test_batch_failure_is_error(tmp_path, monkeypatch):

@@ -10,7 +10,7 @@ import numpy as np
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
-from typing import Any, List
+from typing import Any, List, Optional
 import uvicorn
 from prometheus_fastapi_instrumentator import Instrumentator
 from prometheus_client import Counter, Histogram
@@ -23,7 +23,7 @@ from config import (
     TICKERS, MLFLOW_EXPERIMENT, FEATURE_FLAGS, get_logger,
 )
 from features import (
-    fetch_fundamentals, fetch_usdidr, fetch_fred_macro, fetch_bi_rate,
+    fetch_fundamentals_status, fetch_usdidr, fetch_fred_macro, fetch_bi_rate,
     load_data, load_ihsg_data, compute_cross_stock_features,
 )
 # The one builder both paths share (Task 1.2).  Imported from its own module
@@ -127,7 +127,9 @@ async def _warmup_prediction_cache():
                 df.columns = df.columns.droplevel(1)
             df = dropna(df)
 
-            fundamentals = await asyncio.to_thread(fetch_fundamentals, ticker)
+            fundamentals, _f_available, _f_reason = await asyncio.to_thread(
+                get_fundamentals, ticker
+            )
             latest = build_inference_features(df, ticker, fundamentals)
 
             # The model's own contract decides the column set and its order —
@@ -454,7 +456,39 @@ _cache_date = None
 _usdidr_cache = None
 _fred_cache = None
 _bi_cache = None
+#: ticker -> ``{"data": dict, "date": str, "available": bool, "reason": str|None}``.
+#: The availability travels with the values, not beside them: the eight numbers
+#: alone cannot say whether they are a measurement, which is the whole defect this
+#: cache would otherwise re-introduce one request later.
 _fundamentals_cache = {}
+
+
+def get_fundamentals(ticker: str) -> tuple[dict, bool, Optional[str]]:
+    """``ticker``'s fundamentals for this process, with their availability.
+
+    Reads :func:`features.fetchers.fetch_fundamentals_status` rather than the
+    value-only fetcher, and caches the *status* per ticker for the day.  A value
+    cache alone would lose it: the eight numbers are identical whether Yahoo
+    answered healthily or not at all (five of them are ``NaN`` either way), so a
+    second request for the same ticker would report ``degraded: []`` for a fetch
+    that failed — the same safe-default-indistinguishable-from-a-value defect,
+    moved one request later.
+
+    Returns:
+        ``(values, available, reason)`` — the seam's own shape, so a caller
+        cannot accidentally take the values without the status.
+    """
+    today = str(date.today())
+    cached = _fundamentals_cache.get(ticker)
+    if cached is not None and cached.get("date") == today:
+        return cached["data"], cached["available"], cached["reason"]
+
+    values, available, reason = fetch_fundamentals_status(ticker)
+    _fundamentals_cache[ticker] = {
+        "data": values, "date": today, "available": available, "reason": reason,
+    }
+    return values, available, reason
+
 
 def refresh_daily_cache():
     """Fetches macro data once per day to ensure fast API responses."""
@@ -878,6 +912,38 @@ def _apply_sentiment_overlay(ticker: str, prob: float, background_tasks=None) ->
         "degraded": degraded,
     }
 
+
+def _mark_fundamentals(degraded: list[str], ticker: str, available: bool,
+                       reason: Optional[str]) -> list[str]:
+    """Name a fundamentals outage in ``degraded``, and log why.
+
+    Five of the eight fundamental fields are required by every model's persisted
+    contract (``pe_ratio``, ``dividend_yield``, ``market_cap``,
+    ``debt_to_equity``, ``return_on_equity``), and an unavailable ``.info``
+    materialises each as a constant-NaN column that ``align_to_schema`` accepts —
+    it checks *presence*, and a column of ``NaN`` is present.  The prediction is
+    therefore still returned, exactly as the sentiment overlay's is, and this
+    function is the only thing that makes it distinguishable from a healthy one
+    (Task 2.4).
+
+    ``available`` is read from the status seam, never inferred from the values:
+    an outage and a healthy fetch of a ticker whose fields Yahoo does not publish
+    produce the same eight NaNs, so there is nothing in the numbers to detect.
+
+    Returns:
+        ``degraded`` with ``"fundamentals"`` appended when the source was
+        unavailable, otherwise ``degraded`` unchanged.
+    """
+    if available:
+        return degraded
+    degraded.append("fundamentals")
+    logger.warning(
+        "Fundamentals unavailable (%s) for %s — five schema-required inputs are "
+        "constant NaN in this prediction, response marked degraded",
+        reason or "reason not reported", ticker,
+    )
+    return degraded
+
 @app.get("/cache")
 def cache_status():
     """Show prediction cache status."""
@@ -928,6 +994,20 @@ async def predict(request: PredictRequest, background_tasks: BackgroundTasks):
 
         if cached_row is not None:
             logger.debug("Cache HIT for %s — sub-200ms prediction", request.ticker)
+            # The status is resolved on this path too, and *here* rather than
+            # before the branch: the hit returns without ever building features,
+            # so this is the only place its response can learn whether the
+            # fundamentals behind the cached row were a measurement.  The row
+            # cannot say — five of the eight fields are NaN for an outage and for
+            # a field Yahoo does not publish alike — so the status is read, never
+            # inferred (Task 2.4).  The values are not needed: the row holds them.
+            #
+            # Resolving it here instead of above the branch is also what keeps a
+            # *miss* from paying for two ``.info`` calls: the slow path below
+            # calls ``get_fundamentals`` once and uses both halves of the result.
+            _values, fundamentals_available, fundamentals_reason = get_fundamentals(
+                request.ticker
+            )
             # The stored row is keyed by column name and was written for exactly
             # this schema, so the only reconciliation is align_to_schema — the
             # same call the slow path makes.  Nothing here fills a shortfall:
@@ -953,7 +1033,10 @@ async def predict(request: PredictRequest, background_tasks: BackgroundTasks):
                 probability_adjusted=overlay["probability_adjusted"],
                 signal_adjusted=overlay["signal_adjusted"],
                 drift_warning=False, drift_score=0.0,
-                degraded=list(overlay["degraded"]),
+                degraded=_mark_fundamentals(
+                    list(overlay["degraded"]), request.ticker,
+                    fundamentals_available, fundamentals_reason,
+                ),
             )
 
         # ── Slow path: full pipeline (download + features + cache) ──────
@@ -974,14 +1057,9 @@ async def predict(request: PredictRequest, background_tasks: BackgroundTasks):
         if len(df) < 50:
             raise HTTPException(status_code=400, detail="Not enough trading days for TA calculation")
 
-        # 3. Fundamentals (async + cached daily)
-        today = str(date.today())
-        if request.ticker not in _fundamentals_cache or \
-           _fundamentals_cache[request.ticker].get("date") != today:
-            fundamentals = await asyncio.to_thread(fetch_fundamentals, request.ticker)
-            _fundamentals_cache[request.ticker] = {"data": fundamentals, "date": today}
-        else:
-            fundamentals = _fundamentals_cache[request.ticker]["data"]
+        # 3. Fundamentals (async + cached daily, with their availability)
+        fundamentals, fundamentals_available, fundamentals_reason = \
+            await asyncio.to_thread(get_fundamentals, request.ticker)
 
         # 4. Build features using shared functions
         latest = build_inference_features(df, request.ticker, fundamentals)
@@ -1028,7 +1106,10 @@ async def predict(request: PredictRequest, background_tasks: BackgroundTasks):
             probability_adjusted=overlay["probability_adjusted"],
             signal_adjusted=overlay["signal_adjusted"],
             drift_warning=False, drift_score=0.0,
-            degraded=list(overlay["degraded"]),
+            degraded=_mark_fundamentals(
+                list(overlay["degraded"]), request.ticker,
+                fundamentals_available, fundamentals_reason,
+            ),
         )
 
     except HTTPException:
@@ -1066,13 +1147,8 @@ async def predict_batch(request: BatchPredictRequest, background_tasks: Backgrou
             if len(df) < 50:
                 raise ValueError(f"Not enough data for {ticker}")
 
-            fundamentals_today = str(date.today())
-            if ticker not in _fundamentals_cache or \
-               _fundamentals_cache[ticker].get("date") != fundamentals_today:
-                fundamentals = await asyncio.to_thread(fetch_fundamentals, ticker)
-                _fundamentals_cache[ticker] = {"data": fundamentals, "date": fundamentals_today}
-            else:
-                fundamentals = _fundamentals_cache[ticker]["data"]
+            fundamentals, fundamentals_available, fundamentals_reason = \
+                await asyncio.to_thread(get_fundamentals, ticker)
 
             latest = build_inference_features(df, ticker, fundamentals)
             model, trained_cols = load_best_model(ticker)
@@ -1098,7 +1174,10 @@ async def predict_batch(request: BatchPredictRequest, background_tasks: Backgrou
                 probability_adjusted=overlay["probability_adjusted"],
                 signal_adjusted=overlay["signal_adjusted"],
                 drift_warning=False, drift_score=0.0,
-                degraded=list(overlay["degraded"]),
+                degraded=_mark_fundamentals(
+                    list(overlay["degraded"]), ticker,
+                    fundamentals_available, fundamentals_reason,
+                ),
             )
         except HTTPException:
             raise

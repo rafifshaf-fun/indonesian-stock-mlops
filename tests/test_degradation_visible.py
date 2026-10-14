@@ -330,6 +330,23 @@ class _StubModel:
         return np.array([[0.4, 0.6]])
 
 
+def _stub_fundamentals(monkeypatch):
+    """Fundamentals as "unconfigured": no values, no fetch, no degradation.
+
+    Task 2.4 moved the serving path onto ``serve.get_fundamentals`` — the status
+    seam, because ``serve.fetch_fundamentals``' bare dict cannot say whether its
+    eight numbers are a measurement — so the four stubs that replaced the
+    value-only fetcher would now be dead code and the serving path would reach
+    for the real Yahoo endpoint inside an offline test.  The stand-in is the
+    *seam*, returning exactly what those stubs produced (an empty dict) plus the
+    availability they were silently implying.
+    """
+    import serve
+
+    monkeypatch.setattr(serve, "get_fundamentals",
+                        lambda ticker: ({}, True, None))
+
+
 def _stub_download(monkeypatch):
     """A 60-row price frame for the ticker being predicted, offline."""
     import serve
@@ -525,11 +542,18 @@ def client(tmp_path, monkeypatch):
     its fast path.  That is deliberate: these tests are about what the response
     says, and the fast path is the one that exercises the overlay without a
     download.
+
+    Fundamentals are stubbed *healthy* (Task 2.4 moved the serving path onto
+    ``serve.get_fundamentals``, the status seam).  Not stubbing them would make
+    every one of these tests reach the real Yahoo endpoint, and — because these
+    tests assert the exact contents of ``degraded`` — a genuine second
+    degradation would show up as an extra entry rather than as a network error.
     """
     import serve
 
     monkeypatch.setattr(serve, "PRED_CACHE_DB", str(tmp_path / "cache.db"))
     monkeypatch.setattr(serve, "load_best_model", lambda ticker: (_StubModel(), list(SCHEMA)))
+    _stub_fundamentals(monkeypatch)
     serve._cache_put("BBCA.JK", pd.Series({"rsi": 0.5}), SCHEMA, serve.CACHE_WINDOW_DEFAULT)
     serve.model_cache.clear()
     return TestClient(serve.app)
@@ -696,7 +720,7 @@ def test_a_downstream_feature_failure_is_never_a_signal(client, monkeypatch):
 
     monkeypatch.setattr(serve, "build_inference_features", explode)
     _stub_download(monkeypatch)
-    monkeypatch.setattr(serve, "fetch_fundamentals", lambda ticker: {})
+    _stub_fundamentals(monkeypatch)
 
     response = client.post("/predict", json={"ticker": "BBRI.JK"})
 
@@ -723,7 +747,7 @@ def _stub_batch_io(monkeypatch):
     )
     monkeypatch.setattr(serve.asyncio, "to_thread", inline)
     monkeypatch.setattr(serve.yf, "download", lambda *a, **k: price_frame.copy())
-    monkeypatch.setattr(serve, "fetch_fundamentals", lambda ticker: {})
+    _stub_fundamentals(monkeypatch)
 
 
 def test_a_failing_batch_ticker_is_502_not_a_sell(monkeypatch):
@@ -973,7 +997,7 @@ def test_a_healthy_serving_request_logs_no_omission_warning(
     # ``_cache_date`` to today makes the background refresh return immediately
     # rather than reach for the network after the response.
     monkeypatch.setattr(serve, "_cache_date", str(_date.today()))
-    monkeypatch.setattr(serve, "fetch_fundamentals", lambda ticker: {})
+    _stub_fundamentals(monkeypatch)
     monkeypatch.setattr(serve.yf, "download",
                         lambda *a, **k: raw_ohlcv["BBCA.JK"].dropna().copy())
 
