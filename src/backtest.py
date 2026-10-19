@@ -5,12 +5,14 @@ Simulates trading on historical data using trained models.
 Tracks P&L, Sharpe ratio, max drawdown, win rate, and more.
 
 Usage:
-    python src/backtest.py                         # All tickers
+    python src/backtest.py                         # All tickers, production fleet
     python src/backtest.py --ticker BBCA.JK        # Single ticker
     python src/backtest.py --ticker BBCA.JK --ticker BBRI.JK   # Two tickers
     python src/backtest.py --threshold 0.65        # Min confidence to trade
     python src/backtest.py --slippage-bps 10       # 10 bps slippage per side
     python src/backtest.py --start 2024-01-01 --end 2024-12-31   # Bounded window
+    python src/backtest.py --model-root mlruns/holdout-2025-06-12/models \
+        --start 2025-06-16 --end 2026-06-12        # Out-of-sample holdout fleet
     python src/backtest.py --plot                   # Generate equity curve plots
 
 The run reads ``data/processed/features.parquet`` — the full-mode artefact
@@ -20,8 +22,18 @@ models' persisted contracts.  Each ticker is aligned to its model's own
 ``feature_schema.json`` with no re-pruning: the contract is the model's, not the
 backtest's.
 
-The figure this prints is **in-sample** — every row it predicts on is a row the
-model was fitted on — so it is a computability check, not evidence of return.
+**Which fleet is measured decides whether the number is evidence.**  With no
+``--model-root`` the run reads the production fleet at ``mlruns/1/models``,
+which was fitted on the full history up to the end of the artefact — so every
+row it predicts on is a row the model saw in training and the figure is
+**in-sample**: a computability check, not evidence of return.  ``--model-root``
+points the run at a fleet trained by ``train.py --as-of <cutoff>``, and an
+evaluation window that starts after that cutoff is the out-of-sample
+measurement.  The store the run used is logged with every run.
+
+The run names the universe it measured.  The 100-row minimum is applied to the
+*evaluated* rows, so a narrow window can drop a ticker; every skip is reported
+with its reason and the aggregate is stated to be over the tickers that ran.
 
 Output: Results logged to MLflow experiment "backtest"
 """
@@ -44,7 +56,10 @@ from config import (
     MLFLOW_DB, TRAINING_CONFIG, get_logger,
 )
 from features.schema import FeatureSchemaError, align_to_schema
-from model_store import ModelNotFound, load_model_for
+from model_store import (
+    ModelNotFound, index_path, load_model_for, load_model_index, model_dir,
+    set_model_root,
+)
 from train import load_features, prepare_xy
 
 warnings.filterwarnings("ignore")
@@ -221,11 +236,12 @@ def backtest_ticker(ticker: str, df_features: pd.DataFrame,
                     trade_size: float = DEFAULT_TRADE_SIZE,
                     slippage_bps: int = 0,
                     initial_capital: float = DEFAULT_INITIAL_CAPITAL,
-                    plot: bool = False) -> dict:
+                    plot: bool = False,
+                    skip_reasons: dict | None = None) -> dict | None:
     """Walk-forward backtest for a single ticker.
 
-    Simulates trading through the entire feature history, using the
-    trained model to predict on each day and trade accordingly.
+    Simulates trading through every row of the (already bounded) feature frame,
+    using the trained model to predict on each day and trade accordingly.
 
     Args:
         ticker: Stock ticker
@@ -236,23 +252,41 @@ def backtest_ticker(ticker: str, df_features: pd.DataFrame,
             side's rate (see :func:`costs_for`)
         initial_capital: Starting virtual capital
         plot: Generate equity curve plot
+        skip_reasons: Optional mapping the caller passes so a skipped ticker is
+            named in the run's report with its reason.  ``None`` means the
+            reason is only logged.  Every ``return None`` path records one, so
+            the run can tell a shrunken universe from a flat one (R3).
 
     Returns:
-        dict of backtest metrics
+        dict of backtest metrics, or ``None`` when the ticker cannot be
+        measured (no model, too few rows in the window, an unsatisfiable
+        feature contract, or no price) — in which case the reason is logged and,
+        when ``skip_reasons`` is given, recorded in it.
     """
+    reasons = {} if skip_reasons is None else skip_reasons
+
+    def _skip(reason: str):
+        """Record and return ``None``: the one shape of "not measured"."""
+        reasons[ticker] = reason
+        return None
+
     # ── Load the model through the one selector (Task 1.6) ────────────
     # model_store reads the same model_index.json the API reads, so the
     # backtester and the API resolve a ticker to the same folder by
     # construction (F9).  The old scan of sorted(os.listdir(...), reverse=True)
     # is gone: it answered an unmapped ticker with the alphabetically last
     # folder's model, which is not the folder the API would have chosen.
+    #
+    # The store itself is whatever model_store.model_dir() resolves: the
+    # production fleet by default, or a holdout fleet when the run set the
+    # override (Task 3.3).
     global _model_cache
     if ticker not in _model_cache:
         try:
             _model_cache[ticker] = load_model_for(ticker)
         except ModelNotFound as e:
             logger.warning("No model for %s — skipping (%s)", ticker, e)
-            return None
+            return _skip(f"no model is mapped in the model store ({e})")
     model, trained_cols = _model_cache[ticker]
 
     # ── Prepare ticker data ───────────────────────────────────────────────
@@ -261,7 +295,10 @@ def backtest_ticker(ticker: str, df_features: pd.DataFrame,
 
     if len(ticker_df) < TRAINING_CONFIG["min_rows"]:
         logger.warning("Skipping %s — only %d rows", ticker, len(ticker_df))
-        return None
+        return _skip(
+            f"only {len(ticker_df)} row(s) in the evaluation window "
+            f"(minimum {TRAINING_CONFIG['min_rows']})"
+        )
 
     # ── The model's own contract, and nothing else ──────────────────────
     # Training computed pruning ONCE over the whole panel and persisted the
@@ -275,7 +312,7 @@ def backtest_ticker(ticker: str, df_features: pd.DataFrame,
     X, _ = prepare_xy(ticker_df)
 
     if X.shape[0] == 0 or X.shape[1] == 0:
-        return None
+        return _skip("the ticker's frame has no feature columns after alignment")
 
     # Align features to the model's own contract.  align_to_schema raises for a
     # column the model expects and this frame cannot build — the loop that used
@@ -289,7 +326,7 @@ def backtest_ticker(ticker: str, df_features: pd.DataFrame,
     except FeatureSchemaError as e:
         logger.warning("Skipping %s — its model's feature contract cannot be met: %s",
                        ticker, e)
-        return None
+        return _skip(f"its model's feature contract cannot be met: {e}")
 
     # ── Walk-forward simulation ───────────────────────────────────────────
     n = len(X)
@@ -320,7 +357,7 @@ def backtest_ticker(ticker: str, df_features: pd.DataFrame,
                 break
     if close_col is None:
         logger.warning("No Close price column found for %s", ticker)
-        return None
+        return _skip("no Close price column")
 
     prices = ticker_df[close_col].values
 
@@ -424,6 +461,22 @@ def backtest_ticker(ticker: str, df_features: pd.DataFrame,
     avg_win = np.mean([t["pnl"] for t in trades_taken if t.get("pnl", 0) > 0]) if wins else 0.0
     avg_loss = np.mean([t["pnl"] for t in trades_taken if t.get("pnl", 0) < 0]) if n_trades - len(wins) > 0 else 0.0
 
+    # ── Buy-and-hold, over the same window ────────────────────────────────
+    # R4: the summary line used to call ``(total_return > 0).sum()`` "tickers
+    # beating buy-hold", which is a count of profitable tickers, not a
+    # benchmark.  This is the comparison that label claimed to be: the
+    # close-to-close price change of the window, 100% invested and before
+    # costs.  It is deliberately not adjusted for the strategy's 25% position
+    # size — the strategy's return is what it is, and the benchmark is stated.
+    valid_prices = prices[np.isfinite(prices) & (prices > 0)]
+    if len(valid_prices) >= 2:
+        buy_hold_return = float(valid_prices[-1] / valid_prices[0] - 1.0)
+    else:
+        buy_hold_return = float("nan")
+    beats_buy_hold = bool(
+        np.isfinite(buy_hold_return) and total_return > buy_hold_return
+    )
+
     # ── Plot equity curve ─────────────────────────────────────────────────
     img_path = None
     if plot and len(capital) > 1:
@@ -477,6 +530,12 @@ def backtest_ticker(ticker: str, df_features: pd.DataFrame,
         # Every leg's cost, so a run can be compared across slippage levels by
         # what it actually paid rather than by the return alone.
         "total_costs": round(sum(t["cost"] for t in trades_taken), 2),
+        # R4: the benchmark, and whether the strategy beat it — the comparison
+        # the old "tickers beating buy-hold" line only appeared to make.
+        "buy_hold_return_pct": (
+            round(buy_hold_return * 100, 2) if np.isfinite(buy_hold_return) else np.nan
+        ),
+        "beats_buy_hold": beats_buy_hold,
     }
 
     logger.info(
@@ -494,7 +553,8 @@ def backtest_ticker(ticker: str, df_features: pd.DataFrame,
 
 def run_backtest(tickers: list = None, confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
                  trade_size: float = DEFAULT_TRADE_SIZE, slippage_bps: int = 0,
-                 plot: bool = False, start=None, end=None) -> pd.DataFrame:
+                 plot: bool = False, start=None, end=None,
+                 model_root=None) -> pd.DataFrame:
     """Run backtest on multiple tickers and log results to MLflow.
 
     Args:
@@ -506,11 +566,19 @@ def run_backtest(tickers: list = None, confidence_threshold: float = DEFAULT_CON
         start: First date to evaluate, inclusive (``YYYY-MM-DD``).  ``None``
             starts at the beginning of the feature history.
         end: Last date to evaluate, inclusive.
+        model_root: Model store to resolve tickers through.  ``None`` is the
+            production fleet (``mlruns/1/models``) — an in-sample run; a
+            directory produced by ``train.py --as-of`` makes the run
+            out-of-sample.  Selecting it here keeps the choice with the run
+            rather than with a shell variable, and clears the per-process model
+            cache so a second run in one process cannot keep the first fleet's
+            models.
 
     Returns:
-        DataFrame of backtest results per ticker.  Empty when no ticker could
-        be backtested; the summary says how many ran and how many were skipped,
-        so an empty result is never mistaken for a flat one.
+        DataFrame of backtest results per ticker, with the run's provenance in
+        ``.attrs`` (``model_store``, ``eval_window``, ``skipped``).  Empty when
+        no ticker could be backtested; the summary names every skipped ticker
+        and why, so an empty result is never mistaken for a flat one.
 
     Raises:
         ValueError: the requested window contains no rows (see
@@ -519,10 +587,26 @@ def run_backtest(tickers: list = None, confidence_threshold: float = DEFAULT_CON
     if tickers is None:
         tickers = TICKERS
 
+    if model_root is not None:
+        set_model_root(model_root)
+        _model_cache.clear()
+
+    # Which fleet produced this number is part of the result, not an ambient
+    # detail: the same window reads as +X% in-sample and Y% out-of-sample, and a
+    # report that cannot say which store ran is a report that cannot be
+    # trusted.  The mapped-ticker count also catches an override that names an
+    # empty or missing store before any simulation starts.
+    store = model_dir()
+    logger.info(
+        "Model store: %s (%d ticker(s) mapped in %s)",
+        store, len(load_model_index()), index_path(),
+    )
+
     df = load_eval_frame(start=start, end=end)
 
     mlflow.set_experiment(BACKTEST_EXPERIMENT)
     all_results = []
+    reasons: dict[str, str] = {}
 
     for ticker in tickers:
         result = backtest_ticker(
@@ -531,6 +615,7 @@ def run_backtest(tickers: list = None, confidence_threshold: float = DEFAULT_CON
             trade_size=trade_size,
             slippage_bps=slippage_bps,
             plot=plot,
+            skip_reasons=reasons,
         )
         if result is None:
             continue
@@ -551,8 +636,11 @@ def run_backtest(tickers: list = None, confidence_threshold: float = DEFAULT_CON
                 # can be reproduced without guessing which rows it saw.
                 "eval_start": "history" if start is None else str(start),
                 "eval_end": "history" if end is None else str(end),
+                # ... and so is the fleet.  The production store means the
+                # figure is in-sample; a holdout root means it is not.
+                "model_store": str(store),
             })
-            mlflow.log_metrics({
+            to_log = {
                 "total_return": metrics["total_return"],
                 "sharpe_ratio": metrics["sharpe_ratio"],
                 "max_drawdown": metrics["max_drawdown_pct"] / 100,
@@ -561,7 +649,14 @@ def run_backtest(tickers: list = None, confidence_threshold: float = DEFAULT_CON
                 "avg_win": metrics["avg_win"],
                 "avg_loss": metrics["avg_loss"],
                 "total_costs": metrics["total_costs"],
-            })
+            }
+            # A ticker whose prices were all unusable has no benchmark; MLflow
+            # metrics cannot carry a NaN, and a fabricated 0.0 would read as a
+            # flat market.
+            if np.isfinite(metrics["buy_hold_return_pct"]):
+                to_log["buy_hold_return"] = metrics["buy_hold_return_pct"] / 100
+                to_log["beats_buy_hold"] = float(metrics["beats_buy_hold"])
+            mlflow.log_metrics(to_log)
             # Log trades as artifact
             if trades:
                 trades_df = pd.DataFrame(trades)
@@ -576,34 +671,79 @@ def run_backtest(tickers: list = None, confidence_threshold: float = DEFAULT_CON
 
     # Summary
     results_df = pd.DataFrame(all_results)
-    skipped = len(tickers) - len(results_df)
+    measured = set(results_df["ticker"]) if "ticker" in results_df.columns else set()
+    # R3: the row guard applies to the *windowed* rows, so a narrow window can
+    # silently shrink the evaluated universe.  Every skip is named with its
+    # reason, and the aggregate below says which universe it is over.
+    skipped = {ticker: reason for ticker, reason in reasons.items() if ticker not in measured}
+    for ticker in tickers:
+        if ticker not in measured and ticker not in skipped:
+            skipped[ticker] = "skipped without a recorded reason"
+
+    results_df.attrs["model_store"] = str(store)
+    results_df.attrs["eval_window"] = (
+        "history" if start is None else str(start),
+        "history" if end is None else str(end),
+    )
+    results_df.attrs["skipped"] = skipped
+
     if len(results_df) > 0:
         logger.info("\n" + "=" * 70)
         logger.info("BACKTEST SUMMARY")
         logger.info("=" * 70)
+        logger.info("Model store: %s", store)
         # A run and a skip are different answers, and "0 of 45 ran" used to look
         # exactly like "45 ran and the strategy did nothing".  The counts are
         # logged before any average so the number below is read against them.
-        logger.info("Tickers run: %d/%d (%d skipped)", len(results_df), len(tickers), skipped)
+        logger.info("Tickers run: %d/%d (%d skipped)", len(results_df), len(tickers), len(skipped))
+        logger.info(
+            "Measured universe: %d of %d requested ticker(s) — every aggregate "
+            "below is over the tickers that ran, not the whole request",
+            len(results_df), len(tickers),
+        )
+        if skipped:
+            logger.warning(
+                "Evaluation universe shrank: %d of %d requested ticker(s) could "
+                "not be measured — the aggregate below is over %d, not %d",
+                len(skipped), len(tickers), len(results_df), len(tickers),
+            )
+            for ticker, reason in skipped.items():
+                logger.warning("  skipped %s — %s", ticker, reason)
         logger.info("Avg Return: %.2f%% | Avg Sharpe: %.2f | Avg MaxDD: %.2f%% | Avg Win Rate: %.1f%%",
                     results_df["total_return_pct"].mean(),
                     results_df["sharpe_ratio"].mean(),
                     results_df["max_drawdown_pct"].mean(),
                     results_df["win_rate"].mean() * 100)
-        logger.info("Tickers beating buy-hold: %d/%d",
-                    (results_df["total_return"] > 0).sum(), len(results_df))
+        # R4: the old line counted ``(total_return > 0).sum()`` — profitable
+        # tickers, not a benchmark.  This compares each ticker's return to the
+        # close-to-close price change of the same window (100% invested, before
+        # costs), which is what the label says.
+        logger.info(
+            "Tickers beating buy-hold: %d/%d (strategy total return vs "
+            "close-to-close buy-and-hold over the same window, 100%% invested, "
+            "before costs)",
+            int(results_df["beats_buy_hold"].sum()), len(results_df),
+        )
         logger.info("=" * 70)
 
         # Log summary to MLflow
         with mlflow.start_run(run_name="summary"):
-            mlflow.log_metrics({
+            summary = {
                 "avg_return": results_df["total_return"].mean(),
                 "avg_sharpe": results_df["sharpe_ratio"].mean(),
                 "avg_max_drawdown": results_df["max_drawdown_pct"].mean() / 100,
                 "avg_win_rate": results_df["win_rate"].mean(),
                 "total_trades": results_df["n_trades"].sum(),
                 "n_profitable_tickers": (results_df["total_return"] > 0).sum(),
-            })
+                "n_beating_buy_hold": int(results_df["beats_buy_hold"].sum()),
+                "n_measured": len(results_df),
+                "n_requested": len(tickers),
+                "n_skipped": len(skipped),
+            }
+            average_benchmark = results_df["buy_hold_return_pct"].mean()
+            if np.isfinite(average_benchmark):
+                summary["avg_buy_hold_return"] = average_benchmark / 100
+            mlflow.log_metrics(summary)
 
     else:
         # 0 of 45 run is not a flat strategy: it is no measurement at all, and
@@ -611,8 +751,10 @@ def run_backtest(tickers: list = None, confidence_threshold: float = DEFAULT_CON
         logger.warning(
             "No ticker produced a backtest: 0 of %d ran (%d skipped) — no trade "
             "was simulated, so there is no return to report",
-            len(tickers), skipped,
+            len(tickers), len(skipped),
         )
+        for ticker, reason in skipped.items():
+            logger.warning("  skipped %s — %s", ticker, reason)
 
     return results_df
 
@@ -637,14 +779,20 @@ if __name__ == "__main__":
                         help="First date to evaluate, inclusive (default: start of the feature history)")
     parser.add_argument("--end", metavar="YYYY-MM-DD", default=None,
                         help="Last date to evaluate, inclusive (default: end of the feature history)")
+    parser.add_argument("--model-root", metavar="DIR", default=None,
+                        help="Model store to read (default: mlruns/1/models, the "
+                             "production fleet — an in-sample run). Point it at a "
+                             "fleet trained with train.py --as-of and start the "
+                             "window after that cutoff for an out-of-sample run")
     parser.add_argument("--plot", action="store_true", help="Generate equity curve plots")
     args = parser.parse_args()
 
     tickers = args.ticker or TICKERS
     logger.info("Running backtest on %d tickers (threshold=%.2f, trade_size=%.2f, slippage=%d bps, "
-                "window=%s..%s)...",
+                "window=%s..%s, model_root=%s)...",
                 len(tickers), args.threshold, args.trade_size, args.slippage_bps,
-                args.start or "history", args.end or "history")
+                args.start or "history", args.end or "history",
+                args.model_root or "default (production)")
 
     try:
         results = run_backtest(
@@ -655,6 +803,7 @@ if __name__ == "__main__":
             plot=args.plot,
             start=args.start,
             end=args.end,
+            model_root=args.model_root,
         )
     except ValueError as e:
         # A window with no rows is a refused request, not a failed run: say so

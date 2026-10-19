@@ -1,6 +1,8 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
 
+import pathlib
+
 import pandas as pd
 import numpy as np
 import mlflow
@@ -26,10 +28,23 @@ from features.schema import (
     FeatureSchemaError, align_to_schema, candidate_columns, is_unproducible,
     log_feature_schema,
 )
-from model_store import write_model_index
+from model_store import (
+    MLMODEL_FILENAME, index_path, model_dir, set_model_root, write_model_index,
+)
 
 warnings.filterwarnings("ignore")
 logger = get_logger(__name__)
+
+#: Environment variable a fleet run uses to name the MLflow experiment its
+#: workers must log to.
+#:
+#: ``loky`` workers are separate processes that re-import this module, so a
+#: global assigned in the parent does not reach them — but the parent's
+#: environment does.  ``configure_fleet`` sets this variable before any worker
+#: is spawned, and the module-level read below picks it up in each worker.  The
+#: default leaves today's experiment untouched.
+EXPERIMENT_ENV = "IDX_MLFLOW_EXPERIMENT"
+EXPERIMENT_NAME = os.environ.get(EXPERIMENT_ENV, MLFLOW_EXPERIMENT)
 
 # ── MLflow setup ──────────────────────────────────────────────────────────────
 os.environ["MLFLOW_ALLOW_FILE_STORE"] = "true"  # required for MLflow 3.13+
@@ -122,6 +137,59 @@ def prepare_xy(df: pd.DataFrame):
     X = df.drop(columns=existing_drop).select_dtypes(include=[np.number])
     y = df["target"]
     return X, y
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# THE AS-OF CUTOFF — a training set that ends before the evaluation begins
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def filter_as_of(df: pd.DataFrame, as_of=None) -> pd.DataFrame:
+    """Keep only the rows dated at or before ``as_of``.
+
+    This is the train side of the holdout.  ``backtest.py``'s ``--start`` names
+    the first day *evaluated*; this names the last day *trained on*, so a model
+    produced under it has never seen the window it is measured over.
+
+    Args:
+        df: A frame indexed by date — one ticker's rows, or the pooled panel.
+        as_of: Last date to train on, inclusive.  A date, a datetime or a
+            ``Timestamp``; ``None`` leaves the frame untouched.
+
+    Returns:
+        The rows dated at or before ``as_of``, in their original order.  The
+        whole frame is returned unchanged when ``as_of`` is ``None``, so the
+        default path cannot filter anything.
+
+    Raises:
+        ValueError: ``as_of`` cannot be parsed, or it selects **no rows**.  An
+            empty training set is refused rather than trained on: a model
+            fitted on nothing is not a weak model, it is no model, and the
+            ticker would otherwise be skipped with a misleading row count.
+    """
+    if as_of is None:
+        return df
+
+    try:
+        cutoff = pd.Timestamp(as_of)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"as-of must be a date such as 2025-06-12, got {as_of!r}"
+        ) from exc
+
+    mask = df.index <= cutoff
+    bounded = df.loc[mask]
+    if bounded.empty:
+        covered = (
+            "the frame is empty"
+            if len(df) == 0
+            else f"the frame covers {df.index.min()} to {df.index.max()}"
+        )
+        raise ValueError(
+            f"the as-of cutoff ({cutoff.date()}) selects no rows: {covered} "
+            f"({len(df)} row(s)) — refusing to train on nothing"
+        )
+    return bounded
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # VISUALIZATION
@@ -276,12 +344,13 @@ def _select_features_shap(X, y, top_k: int = SHAP_TOP_K) -> pd.DataFrame:
 # result is memoised.  Keyed by (features path, selection mode, top_k): pointing
 # `--features` at another file inside one process must not reuse this file's
 # contract.  At most one entry is kept, because one run has one contract.
-_GLOBAL_SCHEMA_CACHE: dict[tuple[str, bool, int], list[str]] = {}
+_GLOBAL_SCHEMA_CACHE: dict[tuple, list[str]] = {}
 
 
 def select_global_feature_schema(features_path: str | None = None, *,
                                  use_shap: bool = True,
-                                 top_k: int = SHAP_TOP_K) -> list[str]:
+                                 top_k: int = SHAP_TOP_K,
+                                 as_of=None) -> list[str]:
     """The one ordered feature list every ticker in this run is trained on.
 
     The audit found the 45 logged models carrying 45 *different* 60-name lists
@@ -296,15 +365,30 @@ def select_global_feature_schema(features_path: str | None = None, *,
     logs, every ticker on exactly these columns in exactly this order, and
     ``feature_schema.json`` records the list beside each logged model.
 
+    ``as_of`` applies :func:`filter_as_of` to the pooled frame **before** the
+    selection.  Choosing the 60 columns over rows that include the evaluation
+    window would leak the future into the contract even with every fit
+    truncated, so the cutoff covers the selection too.  The cache key includes
+    it: two cutoffs are two different contracts.
+
     Returns the ordered column names; the caller gets a copy, so a schema in the
     cache cannot be mutated in place.
     """
     path = FEATURES_PATH if features_path is None else features_path
-    key = (os.path.abspath(path), bool(use_shap), int(top_k))
+    key = (
+        os.path.abspath(path), bool(use_shap), int(top_k),
+        None if as_of is None else str(as_of),
+    )
     if key in _GLOBAL_SCHEMA_CACHE:
         return list(_GLOBAL_SCHEMA_CACHE[key])
 
     pooled = load_features(path)
+    pooled = filter_as_of(pooled, as_of)
+    if as_of is not None:
+        logger.info(
+            "As-of cutoff %s: %d row(s) available for the shared feature selection",
+            pd.Timestamp(as_of).date(), len(pooled),
+        )
     X_pooled, y_pooled = prepare_xy(pooled)
 
     # The exclusion is applied to the candidate set *before* the selection, and
@@ -353,7 +437,8 @@ def _expanding_cv_splits(X, n_splits=5, gap=10):
 
 def train(ticker: str = "BBCA.JK", tune: bool = False, use_shap: bool = True,
           expand_cv: bool = True, blend_lgbm: bool = True,
-          feature_columns: list[str] | None = None) -> str | None:
+          feature_columns: list[str] | None = None,
+          as_of=None) -> str | None:
     """Train an XGBoost (+ optional LGBM blend) model for a single ticker.
 
     Features: SHAP pruning, expanding walk-forward CV, LGBM soft-vote blending.
@@ -364,6 +449,11 @@ def train(ticker: str = "BBCA.JK", tune: bool = False, use_shap: bool = True,
     is made here, pooled and memoised, so a direct call still produces exactly
     the same contract as a full `--parallel` run.
 
+    ``as_of`` is the holdout cutoff: every row dated after it is removed before
+    the row guard, the CV splits and the final fit, so the logged model has
+    never seen the evaluation window.  ``None`` (the default) trains on the full
+    history, exactly as before.
+
     Returns:
         The store folder of the model this call logged — the model's MLflow id,
         as reported by :func:`_logged_model_folder` — or ``None`` when nothing
@@ -373,9 +463,16 @@ def train(ticker: str = "BBCA.JK", tune: bool = False, use_shap: bool = True,
     """
     df = load_features(FEATURES_PATH)
     df = df[df["ticker"] == ticker].copy().sort_index()
+    # The cutoff is applied *before* the row guard, so a ticker is judged on the
+    # history it would actually train on: AADI.JK has 353 rows in the full
+    # artefact but 114 before the 2025-06-12 cutoff.
+    df = filter_as_of(df, as_of)
 
     if len(df) < MIN_ROWS:
-        return logger.warning("Skipping %s — only %d rows", ticker, len(df))
+        return logger.warning(
+            "Skipping %s — only %d rows%s", ticker, len(df),
+            f" at or before {as_of}" if as_of is not None else "",
+        )
 
     X, y = prepare_xy(df)
     if X.shape[0] == 0 or X.shape[1] == 0 or y.nunique() < 2:
@@ -386,7 +483,7 @@ def train(ticker: str = "BBCA.JK", tune: bool = False, use_shap: bool = True,
     # models 45 different feature lists and left nothing checking the column set
     # a model was fed.
     if feature_columns is None:
-        feature_columns = select_global_feature_schema(use_shap=use_shap)
+        feature_columns = select_global_feature_schema(use_shap=use_shap, as_of=as_of)
     else:
         # A caller-supplied schema is held to the same rule as a derived one: a
         # contract naming a column serving cannot build is the defect this task
@@ -424,7 +521,12 @@ def train(ticker: str = "BBCA.JK", tune: bool = False, use_shap: bool = True,
         params["scale_pos_weight"] = neg_count / pos_count
     params["nthread"] = 2
 
-    mlflow.set_experiment(MLFLOW_EXPERIMENT)
+    # The experiment, not the constant: a holdout fleet is logged to its own
+    # experiment, whose artifact location is the fleet directory.  Calling with
+    # MLFLOW_EXPERIMENT here would put a holdout model into the production
+    # experiment's store — the exact split brain `configure_fleet` exists to
+    # prevent, and the post-run guard below catches.
+    mlflow.set_experiment(EXPERIMENT_NAME)
 
     # The store folder of the model this call logs, or ``None`` when nothing was
     # logged.  Initialised before the run because the early returns below are
@@ -588,12 +690,19 @@ def _train_one(args):
     tuple is the only thing that crosses the process boundary — the workers
     return it and never write the index themselves (F10: one writer, in the
     parent).
+
+    The task tuple is ``(ticker, tune, features_path, feature_columns)`` as it
+    has always been, with an optional trailing ``as_of`` cutoff.  The cutoff
+    must travel here because a loky worker is a fresh interpreter: the parent's
+    module globals do not cross, and a worker that defaulted it would train on
+    the full history while the parent believed it had a holdout.
     """
-    ticker, tune, feats, feature_columns = args
+    ticker, tune, feats, feature_columns, *optional = args
+    as_of = optional[0] if optional else None
     global FEATURES_PATH
     FEATURES_PATH = feats
     try:
-        folder = train(ticker, tune=tune, feature_columns=feature_columns)
+        folder = train(ticker, tune=tune, feature_columns=feature_columns, as_of=as_of)
         return ticker, True, folder
     except Exception as e:
         logger.error("%s failed: %s", ticker, e)
@@ -616,7 +725,8 @@ def _index_entries_from_results(results) -> dict[str, str]:
 
 
 def _train_sequentially(tickers, *, tune: bool, feature_columns: list[str] | None,
-                        use_shap: bool, expand_cv: bool, blend_lgbm: bool) -> dict[str, str]:
+                        use_shap: bool, expand_cv: bool, blend_lgbm: bool,
+                        as_of=None) -> dict[str, str]:
     """Train ``tickers`` one at a time, containing each ticker's failure.
 
     The sequential mirror of ``_train_one`` plus ``_index_entries_from_results``:
@@ -639,13 +749,114 @@ def _train_sequentially(tickers, *, tune: bool, feature_columns: list[str] | Non
     for ticker in tickers:
         try:
             folder = train(ticker, tune=tune, feature_columns=feature_columns,
-                           use_shap=use_shap, expand_cv=expand_cv, blend_lgbm=blend_lgbm)
+                           use_shap=use_shap, expand_cv=expand_cv, blend_lgbm=blend_lgbm,
+                           as_of=as_of)
         except Exception as exc:
             logger.error("%s failed: %s", ticker, exc)
             continue
         if folder:
             entries[ticker] = folder
     return entries
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# THE FLEET ROOT — a holdout fleet beside the production one (Task 3.3)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def configure_fleet(model_root=None, experiment=None) -> None:
+    """Point this run's index and its MLflow experiment at one fleet directory.
+
+    A retrain that is meant to be a *holdout* fleet has to keep the logged
+    models and the ``ticker -> folder`` index in the same directory, and out of
+    the production store.  MLflow decides where a logged model lands from its
+    experiment's artifact location, while ``model_store`` decides where the
+    index lands from :data:`model_store.MODEL_ROOT_ENV`; these are two
+    independent mechanisms, so this is the one place that sets both from one
+    path.
+
+    Args:
+        model_root: The fleet's ``models`` directory — what ``model_store``
+            will resolve after this call.  The experiment's artifact location is
+            its parent, because MLflow logs a model at
+            ``<artifact location>/models/<model_id>``.
+        experiment: The MLflow experiment to log this fleet's runs to.  Created
+            with that artifact location when it does not exist; an existing one
+            is reused, and the post-run check below catches it if it points
+            somewhere else.
+
+    ``None`` for both is the default production retrain and changes nothing.
+
+    Raises:
+        ValueError: exactly one of the two was given.  Either half alone writes
+            a split brain: ``--model-root`` alone logs models into the
+            production experiment while writing the index into the holdout
+            root, and ``--experiment`` alone logs them elsewhere while writing
+            the *production* index.  Both produce an index that names models the
+            store does not have, or a production store quietly grown by an
+            evaluation fleet.
+    """
+    if model_root is None and experiment is None:
+        return
+    if model_root is None or experiment is None:
+        raise ValueError(
+            "a fleet root needs both a --model-root and an --experiment, given "
+            "together: the index is written beside the fleet whose models the run "
+            "logs, and either one alone points the index and the models at "
+            "different directories"
+        )
+
+    set_model_root(model_root)
+    experiment_root = model_dir().parent
+
+    client = mlflow.MlflowClient()
+    existing = client.get_experiment_by_name(str(experiment))
+    if existing is not None and getattr(existing, "lifecycle_stage", "active") == "deleted":
+        # A deleted experiment still occupies its name, so creating it again
+        # fails inside the first worker and the run ends with "no model was
+        # logged" — a misleading message for a name collision.  Say what
+        # happened instead of reusing a store MLflow has retired.
+        raise ValueError(
+            f"MLflow experiment {str(experiment)!r} exists but is deleted; "
+            f"choose a different --experiment name — a deleted experiment "
+            f"cannot be logged to"
+        )
+
+    global EXPERIMENT_NAME
+    EXPERIMENT_NAME = str(experiment)
+    os.environ[EXPERIMENT_ENV] = EXPERIMENT_NAME
+
+    if existing is None:
+        client.create_experiment(
+            EXPERIMENT_NAME, artifact_location=experiment_root.as_uri()
+        )
+        logger.info(
+            "Created MLflow experiment %r with artifact location %s",
+            EXPERIMENT_NAME, experiment_root,
+        )
+    else:
+        logger.info(
+            "Using existing MLflow experiment %r (artifact location %s); the "
+            "fleet root is %s",
+            EXPERIMENT_NAME, getattr(existing, "artifact_location", "unknown"),
+            model_dir(),
+        )
+
+
+def missing_model_folders(entries, root=None) -> list[str]:
+    """Tickers whose logged-model folder is absent from the fleet directory.
+
+    The post-run guard for the split brain :func:`configure_fleet` prevents: an
+    index naming a folder that exists in the *other* fleet would look like a
+    successful 45/45 retrain while every lookup for it fails.  Returns the
+    tickers whose ``<root>/<folder>/artifacts/MLmodel`` is missing; an empty
+    list means the index agrees with the fleet directory.
+    """
+    base = model_dir() if root is None else pathlib.Path(root).resolve()
+    return [
+        ticker
+        for ticker, folder in entries.items()
+        if not (base / str(folder) / "artifacts" / MLMODEL_FILENAME).is_file()
+    ]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -664,7 +875,27 @@ if __name__ == "__main__":
     parser.add_argument("--no-shap", action="store_true")
     parser.add_argument("--no-expand-cv", action="store_true")
     parser.add_argument("--no-blend", action="store_true")
+    parser.add_argument("--as-of", metavar="YYYY-MM-DD", default=None,
+                        help="Train only on rows at or before this date, so the "
+                             "resulting models never see the evaluation window "
+                             "(default: the full history)")
+    parser.add_argument("--model-root", metavar="DIR", default=None,
+                        help="Write this run's model index beside a fleet in DIR "
+                             "instead of mlruns/1/models. Requires --experiment; "
+                             "the production fleet is left untouched")
+    parser.add_argument("--experiment", metavar="NAME", default=None,
+                        help="Log this run's models to the MLflow experiment NAME "
+                             "(created with the fleet directory as its artifact "
+                             "location). Requires --model-root")
     args = parser.parse_args()
+
+    # The fleet root first: it decides where the index is written and which
+    # experiment the workers log to.  A half-specified fleet is refused rather
+    # than resolved to a default, because the default is the production store.
+    try:
+        configure_fleet(args.model_root, args.experiment)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     FEATURES_PATH = args.features
     tickers = [args.ticker] if args.ticker else TICKERS
@@ -673,18 +904,34 @@ if __name__ == "__main__":
 
     use_shap, expand_cv, blend = not args.no_shap, not args.no_expand_cv, not args.no_blend
 
+    if args.as_of is not None:
+        logger.info(
+            "As-of cutoff %s: training on rows at or before it, and selecting "
+            "the shared feature schema from those rows only", args.as_of,
+        )
+    logger.info("Model store: %s (index %s)", model_dir(), index_path())
+
     # One selection for the whole run, over the pooled frame, before any model is
     # trained (Task 1.4).  Computed in this process and handed to every worker so
     # the parallel branch shares one ordered list instead of letting each worker
-    # process make its own selection.
-    feature_columns = select_global_feature_schema(FEATURES_PATH, use_shap=use_shap)
+    # process make its own selection.  The cutoff applies here too (Task 3.3).
+    try:
+        feature_columns = select_global_feature_schema(
+            FEATURES_PATH, use_shap=use_shap, as_of=args.as_of
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     logger.info("Training %d tickers on one shared %d-column schema",
                 len(tickers), len(feature_columns))
 
     if args.parallel and not args.ticker:
         from joblib import Parallel, delayed
         logger.info("Parallel training on %d tickers...", len(tickers))
-        tasks = [(t, args.tune, FEATURES_PATH, feature_columns) for t in tickers]
+        # The cutoff is the optional fifth element: loky workers are fresh
+        # interpreters, so it has to cross the process boundary explicitly.
+        tasks = [
+            (t, args.tune, FEATURES_PATH, feature_columns, args.as_of) for t in tickers
+        ]
         results = Parallel(n_jobs=-1, backend="loky")(delayed(_train_one)(t) for t in tasks)
         ok = sum(1 for _, s, _ in results if s)
         logger.info("Done: %d/%d tickers trained", ok, len(tickers))
@@ -695,7 +942,25 @@ if __name__ == "__main__":
         entries = _train_sequentially(
             tickers, tune=args.tune, feature_columns=feature_columns,
             use_shap=use_shap, expand_cv=expand_cv, blend_lgbm=blend,
+            as_of=args.as_of,
         )
+
+    # The index and the fleet must be the same directory.  Checking before the
+    # write means a misconfigured fleet root leaves the previous index intact
+    # instead of replacing it with one that names models this store does not
+    # have — the state in which every prediction fails while the file looks
+    # valid.
+    if entries:
+        missing = missing_model_folders(entries)
+        if missing:
+            logger.error(
+                "Refusing to write an index that names %d model folder(s) absent "
+                "from %s (%s%s): this run logged its models somewhere else — check "
+                "--model-root and --experiment",
+                len(missing), model_dir(), ", ".join(sorted(missing)[:5]),
+                f", and {len(missing) - 5} more" if len(missing) > 5 else "",
+            )
+            raise SystemExit(1)
 
     # F10 — the index's single writer, in the parent, once, after every ticker
     # has been trained and logged.  No worker writes it: a worker returns its

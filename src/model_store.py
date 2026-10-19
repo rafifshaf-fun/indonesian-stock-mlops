@@ -40,12 +40,22 @@ This module is the single replacement for both.  Its contract:
     expects a column serving cannot build fails with ``FeatureSchemaError``
     instead of being handed a padded ``NaN``.
 
-``model_dir()`` / ``index_path()``
+``model_dir()`` / ``index_path()`` / ``set_model_root()``
     The store's absolute path, resolved from *this file's* location.  Every
     caller — ``src/serve.py``, ``src/backtest.py``, ``cli.py`` and
     ``predict.py`` — routes its model selection through this module, so none of
     them builds the path from its own relative base and the four cannot drift
     apart again.
+
+    ``set_model_root()`` / ``MODEL_ROOT_ENV`` is the one override: it names a
+    different store (a *holdout fleet*, trained up to a cutoff the evaluation
+    window begins after) while the default stays the production fleet.  The
+    override is an environment read resolved exactly like the default — from
+    this file's location, never from the caller's working directory — so a
+    process can point at a holdout fleet without any consumer taking a path
+    argument, and nothing can repoint the production fleet by accident.  An
+    **empty** value is not an override; with the variable absent or blank,
+    ``model_dir()`` returns the pre-override path byte for byte.
 
 ``write_model_index(entries, path=None)``
     The index's **only** writer, beside the reader and through the same
@@ -102,6 +112,14 @@ EXPERIMENT_ID = "1"
 #: The marker file MLflow writes in a logged model's artifact directory.
 MLMODEL_FILENAME = "MLmodel"
 
+#: Environment variable naming a model store other than the production one.
+#:
+#: Set by ``train.py --model-root`` and ``backtest.py --model-root`` (through
+#: :func:`set_model_root`), read by every consumer through :func:`model_dir`.
+#: The value may be absolute or relative; a relative value is resolved from the
+#: repository root, exactly as the default is, so it never depends on the cwd.
+MODEL_ROOT_ENV = "IDX_MODEL_ROOT"
+
 #: How many carried-over tickers a merge warning names before summarising the
 #: rest.  A ``--tune`` run carries dozens; naming them all buries the message.
 REPORTED_TICKERS = 5
@@ -150,8 +168,40 @@ def model_dir() -> pathlib.Path:
     Resolved from this file's own location, so the four call sites and the
     rebuild command cannot drift to different bases (F9) or depend on the
     process's working directory.
+
+    The default is the production fleet, ``mlruns/1/models``, unchanged.  When
+    :data:`MODEL_ROOT_ENV` names another store — a holdout fleet — that path is
+    returned instead; a relative value is resolved from the repository root, not
+    from the cwd, for the same reason the default is.  An empty value is not an
+    override.
     """
+    override = os.environ.get(MODEL_ROOT_ENV)
+    if override:
+        root = pathlib.Path(override).expanduser()
+        if not root.is_absolute():
+            root = _REPO_ROOT / root
+        return root.resolve()
     return (_REPO_ROOT / config.MODEL_DIR / EXPERIMENT_ID / "models").resolve()
+
+
+def set_model_root(root: str | os.PathLike[str] | None) -> None:
+    """Point this process's model selection at ``root``, or back at the default.
+
+    Args:
+        root: A model-store directory (absolute, or relative to the repository
+            root), or ``None`` to clear the override and return to the
+            production fleet.  Passing a directory does not create or check it:
+            a store that does not exist fails loudly at the first lookup, with
+            the index diagnostic naming the path.
+
+    The override is process-wide because every consumer reads
+    :func:`model_dir` on each request; it is the only supported way to evaluate
+    a holdout fleet without displacing the production one.
+    """
+    if root is None:
+        os.environ.pop(MODEL_ROOT_ENV, None)
+    else:
+        os.environ[MODEL_ROOT_ENV] = os.fspath(root)
 
 
 def index_path() -> pathlib.Path:
