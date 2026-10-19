@@ -7,9 +7,21 @@ Tracks P&L, Sharpe ratio, max drawdown, win rate, and more.
 Usage:
     python src/backtest.py                         # All tickers
     python src/backtest.py --ticker BBCA.JK        # Single ticker
+    python src/backtest.py --ticker BBCA.JK --ticker BBRI.JK   # Two tickers
     python src/backtest.py --threshold 0.65        # Min confidence to trade
     python src/backtest.py --slippage-bps 10       # 10 bps slippage per side
+    python src/backtest.py --start 2024-01-01 --end 2024-12-31   # Bounded window
     python src/backtest.py --plot                   # Generate equity curve plots
+
+The run reads ``data/processed/features.parquet`` — the full-mode artefact
+``build_feature_set(mode="full")`` writes and the one the fleet was trained on —
+not the CI-mode CSV, which omits three feature families and cannot satisfy the
+models' persisted contracts.  Each ticker is aligned to its model's own
+``feature_schema.json`` with no re-pruning: the contract is the model's, not the
+backtest's.
+
+The figure this prints is **in-sample** — every row it predicts on is a row the
+model was fitted on — so it is a computability check, not evidence of return.
 
 Output: Results logged to MLflow experiment "backtest"
 """
@@ -28,12 +40,12 @@ import warnings
 from datetime import datetime
 
 from config import (
-    TICKERS, DATA_PROCESSED_CSV_PATH, MLFLOW_EXPERIMENT,
+    TICKERS, DATA_PROCESSED_PATH, MLFLOW_EXPERIMENT,
     MLFLOW_DB, TRAINING_CONFIG, get_logger,
 )
 from features.schema import FeatureSchemaError, align_to_schema
 from model_store import ModelNotFound, load_model_for
-from train import load_features, prepare_xy, prune_features
+from train import load_features, prepare_xy
 
 warnings.filterwarnings("ignore")
 logger = get_logger(__name__)
@@ -88,6 +100,119 @@ def costs_for(value: float, side: str, slippage_bps: int = 0) -> float:
     return value * (rate + slippage_bps / 10_000)
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# BOUNDED EVALUATION WINDOW
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _window_bound(value, option: str):
+    """Parse one ``--start``/``--end`` value into a timestamp, or ``None``.
+
+    ``pd.Timestamp`` accepts a date, a datetime or a ``Timestamp``; anything it
+    cannot parse is re-raised as a ``ValueError`` naming the option, so the
+    refusal says which flag was wrong rather than "could not convert string".
+    """
+    if value is None:
+        return None
+    try:
+        return pd.Timestamp(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{option} must be a date such as 2024-01-01, got {value!r}"
+        ) from exc
+
+
+def filter_eval_window(df: pd.DataFrame, start=None, end=None) -> pd.DataFrame:
+    """Restrict ``df`` to the rows dated within ``[start, end]``, inclusive.
+
+    This is the seam a holdout needs: the caller names the first and last day to
+    evaluate and only those rows reach the simulation.  Nothing is computed over
+    the full history first, so a window cannot leak rows from outside itself
+    into the run (Task 3.3 builds the cutoff on it).
+
+    Args:
+        df: The feature frame, indexed by date.  It may carry many tickers, in
+            which case the index repeats — the mask is positional, so repeated
+            dates are filtered identically.
+        start: First date to evaluate, inclusive.  ``None`` leaves the beginning
+            unbounded.
+        end: Last date to evaluate, inclusive.  ``None`` leaves the end
+            unbounded.  A date-only ``end`` includes that whole day, because
+            this artefact is daily and its rows sit at midnight.
+
+    Returns:
+        The selected rows, in their original order.
+
+    Raises:
+        ValueError: a bound cannot be parsed, or the window selects **no rows**.
+            An empty window is refused rather than simulated: an empty result is
+            indistinguishable from a strategy that never traded, which is
+            exactly the silence this backtest has to end.  The message names the
+            requested window and the range the frame does cover.
+    """
+    start_at = _window_bound(start, "start")
+    end_at = _window_bound(end, "end")
+    if start_at is None and end_at is None:
+        return df
+
+    dates = df.index
+    mask = np.ones(len(df), dtype=bool)
+    if start_at is not None:
+        mask &= dates >= start_at
+    if end_at is not None:
+        mask &= dates <= end_at
+
+    bounded = df.loc[mask]
+    named = ", ".join(
+        f"{option}={value.date()}"
+        for option, value in (("start", start_at), ("end", end_at))
+        if value is not None
+    )
+    if bounded.empty:
+        covered = (
+            "the frame is empty"
+            if len(df) == 0
+            else f"the frame covers {df.index.min()} to {df.index.max()}"
+        )
+        raise ValueError(
+            f"the requested evaluation window ({named}) selects no rows: "
+            f"{covered} ({len(df)} row(s)) — refusing to simulate zero trades "
+            f"on an empty window"
+        )
+
+    logger.info(
+        "Evaluation window (%s): %d of %d row(s) kept", named, len(bounded), len(df)
+    )
+    return bounded
+
+
+def load_eval_frame(start=None, end=None) -> pd.DataFrame:
+    """Load the feature artefact **training** used, bounded to the window.
+
+    Training reads ``config.DATA_PROCESSED_PATH``: the full-mode parquet that
+    ``build_feature_set(mode="full")`` writes, carrying 193 columns including the
+    ``vp_*``, news-sentiment and Google-Trends families.  The backtest used to
+    read ``config.DATA_PROCESSED_CSV_PATH`` — the CI-mode artefact
+    ``build_feature_set(mode="ci")`` writes, which omits three families (174
+    columns) — and 12 of BBCA.JK's 60 contract columns were in that difference.
+    A backtest that cannot build its model's own features measures nothing, so
+    it reads the artefact the fleet was trained on.
+
+    Args:
+        start: First date to evaluate, inclusive (see :func:`filter_eval_window`).
+        end: Last date to evaluate, inclusive.
+
+    Returns:
+        The feature frame, restricted to the requested window.
+
+    Raises:
+        ValueError: the window selects no rows — refused, not simulated.
+        FileNotFoundError: the artefact is missing (``load_features``' own).
+    """
+    df = load_features(DATA_PROCESSED_PATH)
+    logger.info("Loaded features: %s from %s", df.shape, DATA_PROCESSED_PATH)
+    return filter_eval_window(df, start, end)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # CORE: BACKTEST A SINGLE TICKER
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -138,8 +263,16 @@ def backtest_ticker(ticker: str, df_features: pd.DataFrame,
         logger.warning("Skipping %s — only %d rows", ticker, len(ticker_df))
         return None
 
-    X, y = prepare_xy(ticker_df)
-    X = prune_features(X, verbose=False)
+    # ── The model's own contract, and nothing else ──────────────────────
+    # Training computed pruning ONCE over the whole panel and persisted the
+    # result as this model's ``feature_schema.json``.  The call that stood here
+    # re-ran ``prune_features`` on a *single ticker's* frame, which dropped 10-17
+    # of the 60 contracted columns — so ``align_to_schema`` raised and the ticker
+    # was skipped.  It also divided by zero on this ticker's all-NaN columns
+    # (``debt_to_equity`` for a bank), a warning that is an error under the
+    # suite's policy.  The contract is the model's, not the backtest's: prune
+    # nothing, align, and let the schema say what the model needs.
+    X, _ = prepare_xy(ticker_df)
 
     if X.shape[0] == 0 or X.shape[1] == 0:
         return None
@@ -361,7 +494,7 @@ def backtest_ticker(ticker: str, df_features: pd.DataFrame,
 
 def run_backtest(tickers: list = None, confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
                  trade_size: float = DEFAULT_TRADE_SIZE, slippage_bps: int = 0,
-                 plot: bool = False) -> pd.DataFrame:
+                 plot: bool = False, start=None, end=None) -> pd.DataFrame:
     """Run backtest on multiple tickers and log results to MLflow.
 
     Args:
@@ -370,15 +503,23 @@ def run_backtest(tickers: list = None, confidence_threshold: float = DEFAULT_CON
         trade_size: Fraction of capital per trade
         slippage_bps: Slippage in basis points, charged per side
         plot: Generate equity curve plots
+        start: First date to evaluate, inclusive (``YYYY-MM-DD``).  ``None``
+            starts at the beginning of the feature history.
+        end: Last date to evaluate, inclusive.
 
     Returns:
-        DataFrame of backtest results per ticker
+        DataFrame of backtest results per ticker.  Empty when no ticker could
+        be backtested; the summary says how many ran and how many were skipped,
+        so an empty result is never mistaken for a flat one.
+
+    Raises:
+        ValueError: the requested window contains no rows (see
+            :func:`filter_eval_window`).
     """
     if tickers is None:
         tickers = TICKERS
 
-    df = load_features(DATA_PROCESSED_CSV_PATH)
-    logger.info("Loaded features: %s", df.shape)
+    df = load_eval_frame(start=start, end=end)
 
     mlflow.set_experiment(BACKTEST_EXPERIMENT)
     all_results = []
@@ -406,6 +547,10 @@ def run_backtest(tickers: list = None, confidence_threshold: float = DEFAULT_CON
                 "trade_size": trade_size,
                 "initial_capital": DEFAULT_INITIAL_CAPITAL,
                 "slippage_bps": slippage_bps,
+                # The window is part of what the run measured, so a logged run
+                # can be reproduced without guessing which rows it saw.
+                "eval_start": "history" if start is None else str(start),
+                "eval_end": "history" if end is None else str(end),
             })
             mlflow.log_metrics({
                 "total_return": metrics["total_return"],
@@ -431,10 +576,15 @@ def run_backtest(tickers: list = None, confidence_threshold: float = DEFAULT_CON
 
     # Summary
     results_df = pd.DataFrame(all_results)
+    skipped = len(tickers) - len(results_df)
     if len(results_df) > 0:
         logger.info("\n" + "=" * 70)
         logger.info("BACKTEST SUMMARY")
         logger.info("=" * 70)
+        # A run and a skip are different answers, and "0 of 45 ran" used to look
+        # exactly like "45 ran and the strategy did nothing".  The counts are
+        # logged before any average so the number below is read against them.
+        logger.info("Tickers run: %d/%d (%d skipped)", len(results_df), len(tickers), skipped)
         logger.info("Avg Return: %.2f%% | Avg Sharpe: %.2f | Avg MaxDD: %.2f%% | Avg Win Rate: %.1f%%",
                     results_df["total_return_pct"].mean(),
                     results_df["sharpe_ratio"].mean(),
@@ -455,6 +605,15 @@ def run_backtest(tickers: list = None, confidence_threshold: float = DEFAULT_CON
                 "n_profitable_tickers": (results_df["total_return"] > 0).sum(),
             })
 
+    else:
+        # 0 of 45 run is not a flat strategy: it is no measurement at all, and
+        # it must not leave the process looking successful.
+        logger.warning(
+            "No ticker produced a backtest: 0 of %d ran (%d skipped) — no trade "
+            "was simulated, so there is no return to report",
+            len(tickers), skipped,
+        )
+
     return results_df
 
 
@@ -466,27 +625,41 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Walk-Forward Backtesting Engine")
-    parser.add_argument("--ticker", type=str, default=None, help="Single ticker to test")
+    parser.add_argument("--ticker", type=str, action="append", default=None,
+                        help="Ticker to test; repeat the flag for several (default: all tickers)")
     parser.add_argument("--threshold", type=float, default=DEFAULT_CONFIDENCE_THRESHOLD,
                         help=f"Min confidence to trade (default: {DEFAULT_CONFIDENCE_THRESHOLD})")
     parser.add_argument("--trade-size", type=float, default=DEFAULT_TRADE_SIZE,
                         help=f"Fraction of capital per trade (default: {DEFAULT_TRADE_SIZE})")
     parser.add_argument("--slippage-bps", type=int, default=0,
                         help="Slippage in basis points, charged per side (default: 0)")
+    parser.add_argument("--start", metavar="YYYY-MM-DD", default=None,
+                        help="First date to evaluate, inclusive (default: start of the feature history)")
+    parser.add_argument("--end", metavar="YYYY-MM-DD", default=None,
+                        help="Last date to evaluate, inclusive (default: end of the feature history)")
     parser.add_argument("--plot", action="store_true", help="Generate equity curve plots")
     args = parser.parse_args()
 
-    tickers = [args.ticker] if args.ticker else TICKERS
-    logger.info("Running backtest on %d tickers (threshold=%.2f, trade_size=%.2f, slippage=%d bps)...",
-                len(tickers), args.threshold, args.trade_size, args.slippage_bps)
+    tickers = args.ticker or TICKERS
+    logger.info("Running backtest on %d tickers (threshold=%.2f, trade_size=%.2f, slippage=%d bps, "
+                "window=%s..%s)...",
+                len(tickers), args.threshold, args.trade_size, args.slippage_bps,
+                args.start or "history", args.end or "history")
 
-    results = run_backtest(
-        tickers=tickers,
-        confidence_threshold=args.threshold,
-        trade_size=args.trade_size,
-        slippage_bps=args.slippage_bps,
-        plot=args.plot,
-    )
+    try:
+        results = run_backtest(
+            tickers=tickers,
+            confidence_threshold=args.threshold,
+            trade_size=args.trade_size,
+            slippage_bps=args.slippage_bps,
+            plot=args.plot,
+            start=args.start,
+            end=args.end,
+        )
+    except ValueError as e:
+        # A window with no rows is a refused request, not a failed run: say so
+        # and exit non-zero, with no traceback and no summary of zero trades.
+        parser.error(str(e))
 
     if results is not None and len(results) > 0:
         print("\nTop Performers:")
