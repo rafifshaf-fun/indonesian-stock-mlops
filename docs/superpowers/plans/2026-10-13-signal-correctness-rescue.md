@@ -956,23 +956,98 @@ git add src/backtest.py tests/test_backtest_costs.py
 git commit -m "fix(backtest): model the IDX sell tax and slippage, not one flat fee"
 ```
 
-### Task 3.2: The honest measurement
+### Task 3.2: Make the backtest run on the model's own contract (added during execution)
+
+**Files:**
+- Modify: `src/backtest.py`
+- Test: `tests/test_backtest_contract.py`
+
+**Interfaces:**
+- Consumes: Task 3.1's cost model, Task 1.4's `align_to_schema`, Task 1.6's `load_model_for`.
+- Produces: a backtest that runs for all 45 tickers, reads the artefact the models were trained on, and evaluates only a requested date range.
+
+**Why this task exists.** Task 3.1's mandated smoke run executed in 31.6 s and **skipped its only ticker**: `frame is missing 12 of 60 schema column(s): ['ret_1d','trend_macd_signal','dividend_yield','market_breadth','market_cap','High','return_on_equity','volatility_bbh','others_cr','pe_ratio','trend_psar_up','trend_ema_slow'] (frame carries 121 columns)`. **0 of 45 tickers run, so Phase 3 measures nothing.**
+
+- [ ] **Step 1: Write the failing test**
+
+Assert that a one-ticker backtest over a bounded date range returns **at least one trade** and **zero** tickers skipped for a contract mismatch; and that the feature frame handed to the model has exactly the model's persisted schema as its columns, in its order.
+
+- [ ] **Step 2: Confirm RED**
+
+Run: `.\venv\Scripts\python.exe -m pytest tests/test_backtest_contract.py -v`, and reproduce the real failure directly:
+`.\venv\Scripts\python.exe src/backtest.py --ticker BBCA.JK --threshold 0.50`
+Expected: FAIL / 0 trades, with the `missing N of 60 schema column(s)` warning.
+
+- [ ] **Step 3: Fix the two mismatches**
+
+`src/backtest.py:142` calls `prune_features(X, verbose=False)` on a **single ticker's** frame, which drops 10–17 of the 60 columns the model's contract requires. The model already carries its contract — prune nothing and align to `trained_cols` directly. Separately, `src/backtest.py:380` reads `DATA_PROCESSED_CSV_PATH` (the **CI-mode** artefact, 174 columns) while the fleet was trained on `DATA_PROCESSED_PARQUET_PATH` (full mode, 193 columns); read the artefact training used. Add a date-range option (`--start`/`--end` or `--eval-start`) so evaluation can be bounded, and refuse loudly if the requested window contains no rows.
+
+- [ ] **Step 4: Confirm GREEN and report the run**
+
+Run the new test, then a two-ticker bounded run, and report: the command, runtime, tickers run vs skipped, trades, and total costs paid. **The number is still in-sample — this task makes it computable, not honest**; Task 3.3 supplies the holdout. Say so in the test's docstring so nobody reads the resulting return as evidence.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/backtest.py tests/test_backtest_contract.py
+git commit -m "fix(backtest): align to the model's own contract and read the training artefact"
+```
+
+### Task 3.3: Rebuild the evaluation as out-of-sample (added during execution)
+
+**Files:**
+- Modify: `src/model_store.py` (a model-root override), `src/train.py` (an as-of cutoff), `src/backtest.py`
+- Test: `tests/test_holdout_evaluation.py`
+
+**Interfaces:**
+- Consumes: Task 3.2's bounded backtest.
+- Produces: a holdout fleet trained only on rows before a cutoff, a separate model root so the production fleet is untouched, and a measurement over rows at or after the cutoff at `slippage_bps` 0, 10 and 25.
+
+**Why this task exists.** The backtest has no train/test split: it predicts on the same rows the models were fitted on. Bypassing Task 3.2's blocker produced **+545.69% at a 97% win rate with 0.78% max drawdown over 417 trades** — the signature of evaluating on training data, not an edge. Making the backtest merely *run* would produce a confident, wrong, in-sample number, which is worse than the honest zero.
+
+- [ ] **Step 1: Add the two seams**
+
+A `--as-of <date>` on `src/train.py` that trains only on rows at or before the cutoff, and a model-root override (argument or environment, defaulting to today's path) read by `model_store` so a holdout fleet can live beside the production one without displacing it. Do not change the default behaviour or the production index.
+
+- [ ] **Step 2: Choose and justify the split from the data**
+
+The committed parquet ends 2026-06-15 with ~1,422 rows per ticker. Pick a cutoff leaving a meaningful evaluation window (the final 12 months is the default to test), and report the actual dates, per-ticker row counts on each side, and why that split is long enough to be informative and short enough to leave the model enough history.
+
+- [ ] **Step 3: Train the holdout fleet into the separate root**
+
+Run the retrain with `--as-of` and the overridden root. Report the run's own summary line and the resulting index count. The production fleet at `mlruns/1/models/` must be byte-unchanged afterwards — verify and report.
+
+- [ ] **Step 4: Measure out-of-sample, three cost levels**
+
+Run the bounded backtest against the holdout fleet over the evaluation window at `slippage_bps` 0, 10 and 25. Record per-ticker and aggregate return, Sharpe, max drawdown, trade count and total costs paid.
+
+- [ ] **Step 5: Write the comparison**
+
+Report the out-of-sample result beside the in-sample one and state the difference plainly. A collapse from +545% to a small or negative figure is the expected honest finding, not a failure to fix.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/model_store.py src/train.py src/backtest.py tests/test_holdout_evaluation.py
+git commit -m "feat(backtest): evaluate on a holdout fleet the models never saw"
+```
+
+### Task 3.4: The honest measurement (revised)
 
 **Files:**
 - Create: `docs/measurement-2026-10-13.md`
 
 **Interfaces:**
-- Consumes: Tasks 2.3 and 3.1.
-- Produces: a written result: per-ticker and aggregate return, Sharpe, max drawdown, trade count, and total costs paid, at `slippage_bps` of 0, 10 and 25.
+- Consumes: Tasks 2.3, 3.1, 3.2 and 3.3.
+- Produces: a written result: per-ticker and aggregate return, Sharpe, max drawdown, trade count, and total costs paid, at `slippage_bps` of 0, 10 and 25 — **out-of-sample**, with the in-sample figures beside them for contrast.
 
-- [ ] **Step 1: Run the backtest at three cost levels**
+- [ ] **Step 1: Assemble the numbers**
 
-Run: `.\venv\Scripts\python.exe src/backtest.py --threshold 0.50 --slippage-bps 0`, then `10`, then `25`.
-Expected: three result sets. Record them verbatim.
+Use Task 3.3's three runs. Do not substitute the in-sample ones.
 
 - [ ] **Step 2: Write the report**
 
-State plainly whether the strategy survives costs, and at what turnover. Do not compute a headline number without the cost column beside it.
+State plainly whether the strategy survives costs, and at what turnover. Do not compute a headline number without the cost column beside it, and do not present an in-sample figure as evidence of an edge.
 
 - [ ] **Step 3: Commit**
 
@@ -981,7 +1056,7 @@ git add docs/measurement-2026-10-13.md
 git commit -m "docs: honest post-fix measurement at three cost levels"
 ```
 
-### Task 3.3: Decision gate (no code)
+### Task 3.5: Decision gate (no code)
 
 - [ ] **Step 1: Answer three questions in writing**
 
