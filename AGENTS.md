@@ -93,14 +93,19 @@ Python 3.11, local venv at `venv/`.
   `start.bat` calls `python src/train.py` with no `--features`, so it retrains on
   the older parquet. Pass `--features data/processed/features.csv`, which is what
   CI does.
-- **The model index maps no tickers.** `mlruns/1/models/model_index.json` in git has
-  `mapped_tickers: 0` while 45 model folders exist locally. Selection is now single-path
-  (`src/model_store.py`): an unmapped ticker raises `ModelNotFound`, which the API surfaces as a
-  404 and a startup `warning` names the remedy. The "first valid model folder" substitute — which
-  silently served another ticker's model — is deleted, along with the backtester's reverse-sorted
-  scan that made the API and the backtest disagree. Rebuild with
-  `python scripts/build_model_index.py`, or let training write it (training is now its single
-  writer). Until the index is populated, every prediction fails loudly by design.
+- **Model selection is single-path and raises.** `mlruns/1/models/model_index.json` maps all
+  45 tickers. Selection goes through `src/model_store.py`: an unmapped ticker raises
+  `ModelNotFound`, which the API surfaces as a 404 and a startup `warning` names the remedy. The
+  "first valid model folder" substitute — which silently served another ticker's model — is
+  deleted, along with the backtester's reverse-sorted scan that made the API and the backtest
+  disagree. Training is the index's single writer; `python scripts/build_model_index.py`
+  rebuilds it by hand. An empty or partial index fails loudly by design.
+- **The current signal does not survive IDX costs.** Out-of-sample (holdout fleet trained with
+  `train.py --as-of 2025-06-12` into `mlruns/holdout-2025-06-12/`, evaluated 2025-06-16..2026-06-12)
+  the strategy returns +3.88% at 0 bps slippage and −1.13% at 25 bps, over 1,789 trades.
+  In-sample figures on the same window (+76%, 98% win rate) are memorisation and must never be
+  quoted as an edge. See `docs/measurement-2026-10-13.md`. Any model change is judged by the
+  holdout path, not by `src/backtest.py` against the production fleet.
 - Each model carries a `feature_schema.json` beside its `MLmodel`
   (`mlruns/1/models/<model_id>/artifacts/`), written by training and enforced at load through
   `features.schema.align_to_schema`. A model whose schema names a column the serving builder
@@ -115,6 +120,14 @@ Python 3.11, local venv at `venv/`.
   omission warning at all and `degraded` stays `[]`. The omission warning fires only when a caller
   leaves the argument out entirely (the `_NOT_SUPPLIED` sentinel), which is the forgotten-family
   degradation; before the sentinel, serving's two standing omissions warned on every request.
+- **`test_no_all_nan_model_feature` moves with the data.** Its `WINDOW_ALL_NAN_BY_TICKER` map
+  (`tests/test_audit_regressions.py`) is measured on the last 250 calendar days of the local
+  `data/raw/stocks.csv`, so a `src/ingest.py` run can change which tickers it names. The cause is
+  real: `ob_nearest_bearish_distance` is NaN at serving when the request window holds no bearish
+  order block (the deferred `src/features/ict.py` fix). After an ingest, re-measure the table
+  above the map and replace the map; do not widen it.
+- `src/ingest.py` prints emoji, so on Windows it crashes with `UnicodeEncodeError` before saving
+  when its output is piped or redirected. Set `PYTHONUTF8=1` for scripted runs.
 - Rebuilding the index is mandatory after every retrain, and the API loads it
   once at startup — restart the container (`--force-recreate api`) to pick it up.
 - Training all 45 tickers takes ~15-20 min with `--parallel`. `--tune` covers only
