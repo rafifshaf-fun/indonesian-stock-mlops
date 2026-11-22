@@ -109,10 +109,9 @@ Manifests
 ``requirements.txt`` declares ``holidays`` and ``tzdata``.  ``tzdata`` is not
 optional: :data:`WIB` reads the IANA database, which Windows does not ship, so
 without the package the import above fails outright.  ``requirements-docker.txt``
-is an independent list and carries **neither**.  That is harmless today because
-nothing on the serving path imports this module; the moment Phase 4 imports it
-from ``serve.py``, the api container fails at import until both are added there.
-Nothing compares the two files, so that is Phase 4's edit to make.
+is an independent list; it carries both at the same pins, so the api container
+can import this module once ``serve.py`` does.  Nothing compares the two files,
+so a pin bump must be made in both.
 
 Why the predicate is not inverted
 ---------------------------------

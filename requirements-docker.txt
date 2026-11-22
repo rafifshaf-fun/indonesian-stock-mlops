@@ -20,3 +20,6 @@ nltk  # unpinned: not installed in the development venv, so no version is verifi
 shap==0.51.0
 lightgbm==4.6.0
 aiohttp==3.14.1
+# read by src/market_calendar.py; kept in step with requirements.txt
+holidays==0.106
+tzdata==2026.2

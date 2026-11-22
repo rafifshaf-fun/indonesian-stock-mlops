@@ -31,6 +31,5 @@ holidays==0.106
 # A hard requirement, not a transitive one: Windows ships no system tz database,
 # so without this package that import raises ZoneInfoNotFoundError. Until now it
 # reached the venv only via kombu/pandas/tzlocal. requirements-docker.txt is an
-# independent list and carries neither this nor holidays; putting market_calendar
-# on the serving path means adding both there (see the module's Manifests note).
+# independent list; it carries both this and holidays at the same pins.
 tzdata==2026.2
